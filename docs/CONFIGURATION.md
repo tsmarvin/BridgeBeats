@@ -47,6 +47,8 @@ The ATProto OAuth signing key is supplied separately as the `atproto_oauth_key` 
 
 Bluesky sign-in uses `idunno.Bluesky.AspNet.Authentication` with the SQLite identity and correlation stores in the existing Identity database. Its credentials and pending-login secrets are encrypted with the shared ASP.NET Data Protection key ring. Keep both the database and `DataProtectionKeyPath` persistent across restarts. Access tokens are refreshed by the authentication handler as requests arrive, with SQLite refresh locks coordinating concurrent requests and instances.
 
+The protected browser ticket binds the DID to the local user ID and Identity security stamp. Each request validates that binding before restoring local account claims. Deleting and recreating an account, or changing its security stamp, invalidates earlier tickets. Cookies issued without these bindings require a new Bluesky sign-in.
+
 The requested permissions are `atproto repo:link.bridgebeats.playlist`. The required `atproto` scope identifies the account by its stable DID; BridgeBeats maps that DID to its existing local user ID, so changes to a handle retain the same account and API keys. The playlist scope permits records in the BridgeBeats playlist collection. Profile permissions and broad Bluesky app permissions are not requested.
 
 The SDK publishes generated client metadata at `/.well-known/client-metadata.json`, including public signing keys inline in `jwks` for confidential clients. This replaces the former separate `/.well-known/jwks.json` endpoint. The callback remains `/account/atproto-callback`.

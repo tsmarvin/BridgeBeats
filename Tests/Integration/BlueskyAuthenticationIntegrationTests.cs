@@ -1,8 +1,10 @@
+using System.Collections.Concurrent;
 using System.IdentityModel.Tokens.Jwt;
 using System.Net;
 using System.Text;
 using System.Net.Http.Json;
 using System.Security.Claims;
+using System.Security.Cryptography;
 using System.Text.Json;
 using BridgeBeats.Core.Infrastructure.Extensions;
 using BridgeBeats.Core.Infrastructure.Identity;
@@ -19,6 +21,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -56,10 +59,20 @@ public class BlueskyAuthenticationIntegrationTests {
         _authorizationServer = authorizationBuilder.Build( );
         _authorizationServer.Run( async context => {
             using HttpMessageInvoker invoker = new( _oauth, disposeHandler: false );
-            using HttpResponseMessage response = await invoker.SendAsync(
-                new HttpRequestMessage( new HttpMethod( context.Request.Method ), _service + context.Request.Path ), context.RequestAborted );
+            using HttpRequestMessage request = new( new HttpMethod( context.Request.Method ), _service + context.Request.Path + context.Request.QueryString );
+            if (context.Request.ContentLength > 0) {
+                request.Content = new StreamContent( context.Request.Body );
+                _ = request.Content.Headers.TryAddWithoutValidation( "Content-Type", context.Request.ContentType );
+            }
+            foreach (KeyValuePair<string, Microsoft.Extensions.Primitives.StringValues> header in context.Request.Headers) {
+                _ = request.Headers.TryAddWithoutValidation( header.Key, header.Value.ToArray( ) );
+            }
+            using HttpResponseMessage response = await invoker.SendAsync( request, context.RequestAborted );
             context.Response.StatusCode = (int)response.StatusCode;
-            context.Response.ContentType = "application/json";
+            foreach (KeyValuePair<string, IEnumerable<string>> header in response.Headers) {
+                context.Response.Headers[header.Key] = header.Value.ToArray( );
+            }
+            context.Response.ContentType = response.Content.Headers.ContentType?.ToString( );
             await context.Response.WriteAsync( await response.Content.ReadAsStringAsync( context.RequestAborted ), context.RequestAborted );
         } );
         await _authorizationServer.StartAsync( TestContext.CancellationToken );
@@ -105,7 +118,8 @@ public class BlueskyAuthenticationIntegrationTests {
         _ = _app.UseBlueskyOAuthClientMetadata( );
         // Metadata is generated from the production URLs above. The SDK's discovery development mode
         // additionally requires an HTTP callback when talking to the local HTTP authorization server.
-        _app.Services.GetRequiredService<IOptionsMonitor<BlueskyAgentOptions>>( ).CurrentValue.OAuthOptions!.ReturnUri = new Uri( _service + "/callback" );
+        _app.Services.GetRequiredService<IOptionsMonitor<BlueskyAgentOptions>>( ).CurrentValue.OAuthOptions!.ReturnUri = new Uri( _service + "/account/atproto-callback" );
+        _app.Services.GetRequiredService<IOptions<BlueskyAgentOptions>>( ).Value.OAuthOptions!.ReturnUri = new Uri( _service + "/account/atproto-callback" );
         _ = _app.UseAuthentication( );
         _ = _app.UseAuthorization( );
         _app.MapPost( "/test/signin", async ( HttpContext context ) => {
@@ -152,11 +166,15 @@ public class BlueskyAuthenticationIntegrationTests {
         AuthenticationTicket ticket = options.TicketDataFormat.Unprotect( value )!;
         Assert.HasCount( 1, ticket.Principal.Claims );
         Assert.AreEqual( AtProtoClaims.Did, ticket.Principal.Claims.Single( ).Type );
+        Assert.AreEqual( id, ticket.Properties.GetString( BlueskyAccountEvents.UserIdProperty ) );
         Assert.IsTrue( cookie.Contains( "secure", StringComparison.OrdinalIgnoreCase ) );
         Assert.IsTrue( cookie.Contains( "httponly", StringComparison.OrdinalIgnoreCase ) );
         Assert.IsFalse( cookie.Contains( "expires=", StringComparison.OrdinalIgnoreCase ), "Login remains a browser session cookie." );
         await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
         ApplicationDbContext db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>( );
+        ApplicationUser savedUser = await db.Users.SingleAsync( TestContext.CancellationToken );
+        Assert.IsNotNull( savedUser.SecurityStamp );
+        Assert.AreEqual( savedUser.SecurityStamp, ticket.Properties.GetString( BlueskyAccountEvents.SecurityStampProperty ) );
         await db.Database.OpenConnectionAsync( TestContext.CancellationToken );
         using System.Data.Common.DbCommand command = db.Database.GetDbConnection( ).CreateCommand( );
         command.CommandText = "SELECT Identity FROM idunno_bluesky_identities";
@@ -216,6 +234,70 @@ public class BlueskyAuthenticationIntegrationTests {
     }
 
     [TestMethod]
+    [DataRow( false )]
+    [DataRow( true )]
+    public async Task LoginStartAndCallback_CompleteOAuthAndConsumeSqliteCorrelationState( bool existingAccount ) {
+        string? existingId = null;
+        if (existingAccount) {
+            await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
+            ApplicationUser user = new( ) { UserName = "existing-bluesky-user", AtProtoDid = DidValue, ApiKeyHash = "existing-api-key-hash" };
+            Assert.IsTrue( (await scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>( ).CreateAsync( user )).Succeeded );
+            existingId = user.Id;
+        }
+        await AddAntiforgeryHeaderAsync( );
+        using HttpResponseMessage start = await _client.PostAsJsonAsync( "/account/login-atproto",
+            new { handle = " @first.example " }, TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.OK, start.StatusCode, await start.Content.ReadAsStringAsync( TestContext.CancellationToken ) );
+        JsonElement data = await start.Content.ReadFromJsonAsync<JsonElement>( TestContext.CancellationToken );
+        Uri authorizationUri = new( data.GetProperty( "authorizationUrl" ).GetString( )! );
+        Assert.AreEqual( _service + "/authorize", authorizationUri.GetLeftPart( UriPartial.Path ) );
+        Assert.AreEqual( 1, _oauth.PushedAuthorizations );
+        Assert.AreEqual( "first.example", _oauth.LoginHint );
+        Assert.AreEqual( 1L, await CorrelationStateCountAsync( ) );
+        string correlationCookie = start.Headers.GetValues( "Set-Cookie" )
+            .Single( c => c.StartsWith( Options( ).CorrelationCookie.Name + ".", StringComparison.Ordinal ) ).Split( ';' )[0];
+        string requestCookies = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( ) + "; " + correlationCookie;
+        _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", requestCookies );
+
+        using HttpClient browser = new( new HttpClientHandler { AllowAutoRedirect = false } );
+        using HttpResponseMessage authorization = await browser.GetAsync( authorizationUri, TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.Redirect, authorization.StatusCode );
+        // Route the loopback provider's callback through the real application controller in TestServer.
+        string callback = authorization.Headers.Location!.PathAndQuery;
+        using HttpResponseMessage result = await _client.GetAsync( callback, TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.Redirect, result.StatusCode );
+        Assert.AreEqual( "/", result.Headers.Location?.ToString( ) );
+        Assert.AreEqual( 1, _oauth.CodeExchanges, "The provider must validate the single-use code and PKCE verifier." );
+        Assert.AreEqual( 0L, await CorrelationStateCountAsync( ) );
+        string cookie = result.Headers.GetValues( "Set-Cookie" )
+            .Single( c => c.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=", StringComparison.Ordinal ) ).Split( ';' )[0];
+        string id = await LocalUserIdAsync( );
+        if (existingAccount) {
+            Assert.AreEqual( existingId, id );
+            await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
+            ApplicationUser saved = (await scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>( ).FindByIdAsync( id ))!;
+            Assert.AreEqual( "existing-api-key-hash", saved.ApiKeyHash );
+        }
+        _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", cookie );
+        JsonElement who = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( who.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.AreEqual( id, who.GetProperty( "userId" ).GetString( ) );
+        Assert.AreEqual( DidValue, who.GetProperty( "did" ).GetString( ) );
+        Assert.IsTrue( who.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+        Assert.IsNotNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+
+        // Even a saved copy of the original correlation cookie cannot reuse consumed login state.
+        _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", requestCookies );
+        using HttpResponseMessage replay = await _client.GetAsync( callback, TestContext.CancellationToken );
+        Assert.AreNotEqual( "/", replay.Headers.Location?.ToString( ) );
+        Assert.AreEqual( 1, _oauth.CodeExchanges );
+        Assert.AreEqual( id, await LocalUserIdAsync( ) );
+    }
+
+    [TestMethod]
     public async Task Metadata_DeclaresIdentityAndOnlyPlaylistPermissions( ) {
         JsonElement metadata = await _client.GetFromJsonAsync<JsonElement>( "/.well-known/client-metadata.json", TestContext.CancellationToken );
         Assert.AreEqual( "atproto repo:link.bridgebeats.playlist", metadata.GetProperty( "scope" ).GetString( ) );
@@ -235,6 +317,107 @@ public class BlueskyAuthenticationIntegrationTests {
         JsonElement who = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
         Assert.IsFalse( who.GetProperty( "authenticated" ).GetBoolean( ) );
         Assert.IsNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+    }
+
+    [TestMethod]
+    public async Task DeletedAndRecreatedAccount_RejectsOldCookieWithoutRevokingReplacementSession( ) {
+        using HttpResponseMessage originalLogin = await SignInAsync( );
+        string oldCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        string originalId = await LocalUserIdAsync( );
+        await AddAntiforgeryHeaderAsync( );
+        using HttpResponseMessage deletion = await _client.PostAsync( "/account/delete", null, TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.OK, deletion.StatusCode );
+        _client.DefaultRequestHeaders.Remove( "Cookie" );
+
+        using HttpResponseMessage replacementLogin = await SignInAsync( );
+        string replacementCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        string replacementId = await LocalUserIdAsync( );
+        Assert.AreNotEqual( originalId, replacementId );
+        int revocations = _oauth.Revocations;
+
+        _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", oldCookie );
+        JsonElement replay = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsFalse( replay.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.IsNull( replay.GetProperty( "userId" ).GetString( ) );
+        Assert.IsFalse( replay.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+        Assert.AreEqual( revocations, _oauth.Revocations, "An obsolete cookie must not revoke the replacement account's credentials." );
+        Assert.IsNotNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+
+        _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", replacementCookie );
+        JsonElement replacement = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( replacement.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.AreEqual( replacementId, replacement.GetProperty( "userId" ).GetString( ) );
+    }
+
+    [TestMethod]
+    public async Task ChangedSecurityStamp_RejectsOldCookieAndAllowsFreshSignIn( ) {
+        using HttpResponseMessage originalLogin = await SignInAsync( );
+        string id = await LocalUserIdAsync( );
+        await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
+            UserManager<ApplicationUser> users = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>( );
+            ApplicationUser user = (await users.FindByIdAsync( id ))!;
+            Assert.IsTrue( (await users.UpdateSecurityStampAsync( user )).Succeeded );
+        }
+        JsonElement replay = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsFalse( replay.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.IsFalse( replay.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+
+        using HttpResponseMessage freshLogin = await SignInAsync( );
+        JsonElement current = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( current.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.AreEqual( id, current.GetProperty( "userId" ).GetString( ) );
+    }
+
+    [TestMethod]
+    [DataRow( "BridgeBeats.UserId", null )]
+    [DataRow( "BridgeBeats.UserId", "another-user" )]
+    [DataRow( "BridgeBeats.SecurityStamp", null )]
+    [DataRow( "BridgeBeats.SecurityStamp", "obsolete-stamp" )]
+    public async Task MissingOrMismatchedBinding_RejectsAndClearsCookieWithoutRenewing( string property, string? value ) {
+        using HttpResponseMessage login = await SignInAsync( );
+        string cookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        AuthenticationTicket ticket = Options( ).TicketDataFormat.Unprotect( cookie.Split( '=', 2 )[1] )!;
+        ticket.Properties.SetString( property, value );
+        ticket.Properties.IssuedUtc = DateTimeOffset.UtcNow.AddDays( -5 );
+        ticket.Properties.ExpiresUtc = DateTimeOffset.UtcNow.AddDays( 2 );
+        _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket ) );
+        using HttpResponseMessage result = await _client.GetAsync( "/test/who", TestContext.CancellationToken );
+        JsonElement who = await result.Content.ReadFromJsonAsync<JsonElement>( TestContext.CancellationToken );
+        Assert.IsFalse( who.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.IsFalse( who.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+        string expired = result.Headers.GetValues( "Set-Cookie" )
+            .Single( c => c.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=", StringComparison.Ordinal ) );
+        Assert.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=;", expired );
+        Assert.AreEqual( 0, _oauth.Revocations );
+        Assert.IsNotNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+    }
+
+    [TestMethod]
+    public async Task SlidingCookieRenewal_PreservesCurrentAccountBinding( ) {
+        using HttpResponseMessage login = await SignInAsync( );
+        string cookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        AuthenticationTicket original = Options( ).TicketDataFormat.Unprotect( cookie.Split( '=', 2 )[1] )!;
+        original.Properties.IssuedUtc = DateTimeOffset.UtcNow.AddDays( -5 );
+        original.Properties.ExpiresUtc = DateTimeOffset.UtcNow.AddDays( 2 );
+        _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( original ) );
+        using HttpResponseMessage result = await _client.GetAsync( "/test/who", TestContext.CancellationToken );
+        JsonElement who = await result.Content.ReadFromJsonAsync<JsonElement>( TestContext.CancellationToken );
+        Assert.IsTrue( who.GetProperty( "authenticated" ).GetBoolean( ) );
+        string renewedCookie = result.Headers.GetValues( "Set-Cookie" )
+            .Single( c => c.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=", StringComparison.Ordinal ) ).Split( ';' )[0];
+        AuthenticationTicket renewed = Options( ).TicketDataFormat.Unprotect( renewedCookie.Split( '=', 2 )[1] )!;
+        Assert.AreEqual( original.Properties.GetString( BlueskyAccountEvents.UserIdProperty ), renewed.Properties.GetString( BlueskyAccountEvents.UserIdProperty ) );
+        Assert.AreEqual( original.Properties.GetString( BlueskyAccountEvents.SecurityStampProperty ), renewed.Properties.GetString( BlueskyAccountEvents.SecurityStampProperty ) );
+        Assert.IsGreaterThan( original.Properties.IssuedUtc!.Value, renewed.Properties.IssuedUtc!.Value );
+        _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", renewedCookie );
+        JsonElement current = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( current.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.AreEqual( who.GetProperty( "userId" ).GetString( ), current.GetProperty( "userId" ).GetString( ) );
     }
 
     [TestMethod]
@@ -423,6 +606,14 @@ public class BlueskyAuthenticationIntegrationTests {
     }
 
     private BlueskyAuthenticationOptions Options( ) => _app.Services.GetRequiredService<IOptionsMonitor<BlueskyAuthenticationOptions>>( ).Get( s_scheme );
+    private async Task<long> CorrelationStateCountAsync( ) {
+        await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
+        ApplicationDbContext db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>( );
+        await db.Database.OpenConnectionAsync( TestContext.CancellationToken );
+        using System.Data.Common.DbCommand command = db.Database.GetDbConnection( ).CreateCommand( );
+        command.CommandText = "SELECT count(*) FROM idunno_bluesky_correlation_states";
+        return (long)(await command.ExecuteScalarAsync( TestContext.CancellationToken ))!;
+    }
     private async Task<string> LocalUserIdAsync( ) {
         await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
         return (await scope.ServiceProvider.GetRequiredService<ApplicationDbContext>( ).Users.SingleAsync( TestContext.CancellationToken )).Id;
@@ -430,7 +621,7 @@ public class BlueskyAuthenticationIntegrationTests {
     private async Task<HttpResponseMessage> SignInAsync( ) {
         HttpResponseMessage response = await _client.PostAsync( "/test/signin", null, TestContext.CancellationToken );
         response.EnsureSuccessStatusCode( );
-        string cookie = response.Headers.GetValues( "Set-Cookie" ).Single( c => c.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=", StringComparison.Ordinal ) ).Split( ';' )[0];
+        string cookie = response.Headers.GetValues( "Set-Cookie" ).Last( c => c.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=", StringComparison.Ordinal ) ).Split( ';' )[0];
         _client.DefaultRequestHeaders.Remove( "Cookie" );
         _client.DefaultRequestHeaders.Add( "Cookie", cookie );
         return response;
@@ -445,32 +636,101 @@ public class BlueskyAuthenticationIntegrationTests {
         public HttpClient CreateClient( string name ) => new( handler, disposeHandler: false );
     }
     private sealed class OAuthHandler : HttpMessageHandler {
+        private readonly ConcurrentDictionary<string, Dictionary<string, string>> _authorizations = new( );
+        private readonly ConcurrentDictionary<string, Dictionary<string, string>> _codes = new( );
         public string Service = null!;
         public Func<string> TokenFactory { get; set; } = null!;
         public int Refreshes;
         public int Revocations;
+        public int PushedAuthorizations;
+        public int CodeExchanges;
+        public string? LoginHint;
         public bool RevocationFails;
-        protected override Task<HttpResponseMessage> SendAsync( HttpRequestMessage request, CancellationToken cancellationToken ) {
+        protected override async Task<HttpResponseMessage> SendAsync( HttpRequestMessage request, CancellationToken cancellationToken ) {
             string path = request.RequestUri!.AbsolutePath;
             object body;
-            if (path == "/token") {
-                _ = Interlocked.Increment( ref Refreshes );
+            if (path == "/.well-known/atproto-did") {
+                return new HttpResponseMessage( HttpStatusCode.OK ) { Content = new StringContent( DidValue ) };
+            } else if (path == "/" + DidValue) {
+                body = new {
+                    id = DidValue,
+                    alsoKnownAs = new[] { "at://first.example" },
+                    service = new[] { new { id = "#atproto_pds", type = "AtprotoPersonalDataServer", serviceEndpoint = Service } }
+                };
+            } else if (path == "/par") {
+                Dictionary<string, string> parameters = ParseParameters( await request.Content!.ReadAsStringAsync( cancellationToken ) );
+                LoginHint = parameters["login_hint"];
+                string requestUri = "urn:ietf:params:oauth:request_uri:" + Guid.NewGuid( ).ToString( "N" );
+                _authorizations[requestUri] = parameters;
+                _ = Interlocked.Increment( ref PushedAuthorizations );
+                return new HttpResponseMessage( HttpStatusCode.Created ) {
+                    Content = JsonContent.Create( new { request_uri = requestUri, expires_in = 90 } )
+                };
+            } else if (path == "/authorize") {
+                Dictionary<string, string> query = ParseParameters( request.RequestUri.Query );
+                if (!query.TryGetValue( "request_uri", out string? requestUri ) || !_authorizations.TryRemove( requestUri, out Dictionary<string, string>? parameters )) {
+                    return new HttpResponseMessage( HttpStatusCode.BadRequest );
+                }
+                string code = Guid.NewGuid( ).ToString( "N" );
+                _codes[code] = parameters;
+                HttpResponseMessage redirect = new( HttpStatusCode.Redirect );
+                redirect.Headers.Location = new Uri( QueryHelpers.AddQueryString( parameters["redirect_uri"],
+                    new Dictionary<string, string?> { ["code"] = code, ["state"] = parameters["state"], ["iss"] = Service } ) );
+                return redirect;
+            } else if (path == "/token") {
+                Dictionary<string, string> parameters = ParseParameters( await request.Content!.ReadAsStringAsync( cancellationToken ) );
+                if (parameters["grant_type"] == "authorization_code") {
+                    if (!parameters.TryGetValue( "code", out string? code ) || !_codes.TryRemove( code, out Dictionary<string, string>? authorization ) ||
+                        !parameters.TryGetValue( "code_verifier", out string? verifier ) ||
+                        authorization["code_challenge"] != Microsoft.IdentityModel.Tokens.Base64UrlEncoder.Encode( SHA256.HashData( Encoding.ASCII.GetBytes( verifier ) ) ) ||
+                        authorization["code_challenge_method"] != "S256" || authorization["redirect_uri"] != parameters["redirect_uri"] ||
+                        authorization["client_id"] != parameters["client_id"] || !request.Headers.Contains( "DPoP" )) {
+                        return new HttpResponseMessage( HttpStatusCode.BadRequest ) { Content = JsonContent.Create( new { error = "invalid_grant" } ) };
+                    }
+                    _ = Interlocked.Increment( ref CodeExchanges );
+                } else {
+                    _ = Interlocked.Increment( ref Refreshes );
+                }
                 body = new { access_token = TokenFactory( ), refresh_token = "rotated-refresh", token_type = "DPoP", expires_in = 3600, scope = "atproto repo:link.bridgebeats.playlist", sub = DidValue };
             } else if (path == "/revoke") {
                 _ = Interlocked.Increment( ref Revocations );
                 if (RevocationFails) {
-                    return Task.FromResult( new HttpResponseMessage( HttpStatusCode.ServiceUnavailable ) { Content = JsonContent.Create( new { error = "temporarily_unavailable" } ) } );
+                    return new HttpResponseMessage( HttpStatusCode.ServiceUnavailable ) { Content = JsonContent.Create( new { error = "temporarily_unavailable" } ) };
                 }
                 body = new { };
             } else if (path.EndsWith( "oauth-protected-resource", StringComparison.Ordinal )) {
                 body = new { resource = Service, authorization_servers = new[] { Service } };
             } else if (path.EndsWith( "describeServer", StringComparison.Ordinal )) {
                 body = new { did = $"did:web:{new Uri( Service ).Host}", availableUserDomains = new[] { ".example" } };
+            } else if (path == "/jwks") {
+                body = new { keys = Array.Empty<object>( ) };
+            } else if (path.EndsWith( "oauth-authorization-server", StringComparison.Ordinal )) {
+                body = new {
+                    issuer = Service,
+                    authorization_endpoint = Service + "/authorize",
+                    token_endpoint = Service + "/token",
+                    pushed_authorization_request_endpoint = Service + "/par",
+                    require_pushed_authorization_requests = true,
+                    revocation_endpoint = Service + "/revoke",
+                    jwks_uri = Service + "/jwks",
+                    response_types_supported = new[] { "code" },
+                    grant_types_supported = new[] { "authorization_code", "refresh_token" },
+                    subject_types_supported = new[] { "public" },
+                    id_token_signing_alg_values_supported = new[] { "ES256" },
+                    token_endpoint_auth_methods_supported = new[] { "none" },
+                    code_challenge_methods_supported = new[] { "S256" },
+                    authorization_response_iss_parameter_supported = true
+                };
             } else {
-                body = new { issuer = Service, authorization_endpoint = Service + "/authorize", token_endpoint = Service + "/token", revocation_endpoint = Service + "/revoke", jwks_uri = Service + "/jwks", response_types_supported = new[] { "code" }, grant_types_supported = new[] { "authorization_code", "refresh_token" }, subject_types_supported = new[] { "public" }, id_token_signing_alg_values_supported = new[] { "ES256" } };
+                return new HttpResponseMessage( HttpStatusCode.NotFound );
             }
-            return Task.FromResult( new HttpResponseMessage( HttpStatusCode.OK ) { Content = JsonContent.Create( body ) } );
+            HttpResponseMessage response = new( HttpStatusCode.OK ) { Content = JsonContent.Create( body ) };
+            response.Headers.Add( "DPoP-Nonce", "test-nonce" );
+            return response;
         }
+
+        private static Dictionary<string, string> ParseParameters( string query ) =>
+            QueryHelpers.ParseQuery( query ).ToDictionary( item => item.Key, item => item.Value.ToString( ) );
     }
 }
 #pragma warning restore CS1591

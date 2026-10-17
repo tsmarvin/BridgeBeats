@@ -936,7 +936,7 @@ public class StaleCacheRefreshBackgroundServiceTests {
         IReadOnlyList<StaleCacheRefreshBackgroundService.RefreshLeg> legs =
             StaleCacheRefreshBackgroundService.DeriveRefreshLegs( record, [SupportedProviders.Spotify] );
 
-        Assert.HasCount( 0, legs );
+        Assert.IsEmpty( legs );
     }
 
     /// <summary>

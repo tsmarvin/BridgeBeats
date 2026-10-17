@@ -35,7 +35,7 @@ public class StatisticsAccumulatorTests {
         Assert.IsNull( snapshot.EarliestLookup );
         Assert.IsNull( snapshot.LatestLookup );
         Assert.IsNotNull( snapshot.RecentEntries );
-        Assert.HasCount( 0, snapshot.RecentEntries );
+        Assert.IsEmpty( snapshot.RecentEntries );
         Assert.IsNull( snapshot.CacheBootstrapStatus, "CacheBootstrapStatus must be null; Web layer overlays at read time" );
     }
 

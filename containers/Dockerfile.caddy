@@ -2,12 +2,12 @@
 # This image is built with the Cloudflare DNS module for ACME DNS-01 challenges
 # Required for wildcard certificate support (*.domain.com)
 
-FROM caddy:2-builder@sha256:f2b98918658f949a3c533f2c73bd0806e3f2576ccf8eb182c8b1690c977007ea AS builder
+FROM caddy:2.11.7-builder@sha256:d842facfd63b960922e57444ff76fd8f0793a66dfdcf481af8026e1f4e6a39b4 AS builder
 
 # Build Caddy with Cloudflare DNS plugin
-RUN xcaddy build --with github.com/caddy-dns/cloudflare
+RUN xcaddy build v2.11.7 --with github.com/caddy-dns/cloudflare@v0.2.4
 
-FROM caddy:2@sha256:cb9d71ad83182011b79355cd57692686374bd78d6fe327efe0ff8507da03ab13
+FROM caddy:2.11.7@sha256:685ae3d7c34d9b5f8caeddc5d14051db7bbd88ff1f5a2fa0c16bd8ca328fb7af
 
 # Copy custom Caddy binary with Cloudflare plugin
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy

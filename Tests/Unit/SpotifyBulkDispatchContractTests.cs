@@ -1049,7 +1049,7 @@ public class SpotifyBulkDispatchContractTests {
             await helper.DequeueTrackIdBatchAsync( cancellationToken: TestContext.CancellationToken );
 
         // Assert — no messages returned (poison was discarded)
-        Assert.HasCount( 0, messages, "Poison entry must be discarded, not returned" );
+        Assert.IsEmpty( messages, "Poison entry must be discarded, not returned" );
 
         VerifyAtomicRemoval( TrackStream, Times.Once( ) );
     }
@@ -1087,7 +1087,7 @@ public class SpotifyBulkDispatchContractTests {
             await helper.DequeueTrackIdBatchAsync( cancellationToken: TestContext.CancellationToken );
 
         // Assert — no messages returned (poison was discarded)
-        Assert.HasCount( 0, messages, "Null-JSON-payload poison entry must be discarded, not returned" );
+        Assert.IsEmpty( messages, "Null-JSON-payload poison entry must be discarded, not returned" );
 
         VerifyAtomicRemoval( TrackStream, Times.Once( ) );
     }

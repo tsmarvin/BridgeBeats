@@ -4,6 +4,8 @@ using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
 using BridgeBeats.Worker.JetStreamWatcher;
 using BridgeBeats.Worker.JetStreamWatcher.Logging;
+using idunno.AtProto;
+using idunno.AtProto.Jetstream;
 using idunno.Bluesky;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -82,7 +84,7 @@ public class JetStreamWatcherServiceTests {
         using BlueskyAgent agent = new( );
 
         // Act: must not throw
-        await service.HandleCommitRecordAsync( record, "app.bsky.feed.repost", agent, TestContext.CancellationToken );
+        await service.HandleCommitRecordAsync( record.RootElement, "app.bsky.feed.repost", agent, TestContext.CancellationToken );
 
         // Assert: nothing enqueued — skipped cleanly
         _queueMock.Verify(
@@ -113,7 +115,7 @@ public class JetStreamWatcherServiceTests {
         using BlueskyAgent agent = new( );
 
         // Act
-        await service.HandleCommitRecordAsync( record, "app.bsky.feed.repost", agent, TestContext.CancellationToken );
+        await service.HandleCommitRecordAsync( record.RootElement, "app.bsky.feed.repost", agent, TestContext.CancellationToken );
 
         // Assert: nothing enqueued
         _queueMock.Verify(
@@ -144,7 +146,7 @@ public class JetStreamWatcherServiceTests {
         using BlueskyAgent agent = new( );
 
         // Act
-        await service.HandleCommitRecordAsync( record, "app.bsky.feed.post", agent, TestContext.CancellationToken );
+        await service.HandleCommitRecordAsync( record.RootElement, "app.bsky.feed.post", agent, TestContext.CancellationToken );
 
         // Assert: nothing enqueued
         _queueMock.Verify(
@@ -175,7 +177,7 @@ public class JetStreamWatcherServiceTests {
         using BlueskyAgent agent = new( );
 
         // Act
-        await service.HandleCommitRecordAsync( record, "app.bsky.graph.follow", agent, TestContext.CancellationToken );
+        await service.HandleCommitRecordAsync( record.RootElement, "app.bsky.graph.follow", agent, TestContext.CancellationToken );
 
         // Assert
         _queueMock.Verify(
@@ -193,37 +195,22 @@ public class JetStreamWatcherServiceTests {
     }
 
     /// <summary>
-    /// A post record containing a facet with an empty <c>features</c> array is skipped silently
-    /// without firing <c>LogRecordProcessingError</c>. The <see cref="idunno.Bluesky.RichText.Facet"/>
-    /// constructor enforces <c>features.Count &gt;= 1</c> and throws
-    /// <see cref="ArgumentOutOfRangeException"/> when this constraint is violated; that message
-    /// starts with <c>"features.Count"</c>, which the <c>IsExpectedParsingError</c> allowlist
-    /// matches, so the exception is swallowed rather than promoted to a Warning. This confirms
-    /// that the floor-lift from Debug to Warning does not affect benign-allowlisted errors.
-    /// The discriminating property: if <c>IsExpectedParsingError</c> were removed or its allowlist
-    /// did not cover <c>"features.Count"</c>, the <see cref="ArgumentOutOfRangeException"/> would
-    /// reach <c>LogRecordProcessingError</c> and the <c>Times.Never</c> assertion below would fail.
+    /// A valid post containing a facet with an empty <c>features</c> array has no links to enqueue
+    /// and produces no processing warning. The current Bluesky library accepts empty features.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task HandleRecord_WithExpectedBenignParserError_ShouldSkipSilentlyWithoutErrorLog( ) {
-        // Arrange: a post with a facet whose features array is empty. The Facet JsonConstructor
-        // calls ArgumentOutOfRangeException.ThrowIfZero(features.Count, "features.Count"), which
-        // throws a non-JsonException with a message starting with "features.Count". System.Text.Json
-        // does not wrap this in JsonException, so it propagates to the catch (Exception ex) block
-        // in HandleCommitRecordAsync, where IsExpectedParsingError returns true and suppresses it.
+    public async Task HandleRecord_WithEmptyFacetFeatures_ShouldSkipSilentlyWithoutErrorLog( ) {
         JsonDocument record = JsonDocument.Parse(
-            """{"$type":"app.bsky.feed.post","text":"hello","facets":[{"index":{"byteStart":0,"byteEnd":5},"features":[]}]}""" );
+            """{"$type":"app.bsky.feed.post","text":"hello","createdAt":"2026-10-16T00:00:00Z","facets":[{"index":{"byteStart":0,"byteEnd":5},"features":[]}]}""" );
         JetStreamWatcherService service = CreateService( );
         using BlueskyAgent agent = new( );
 
-        // Act — must not propagate; the service must remain operational after the benign error
-        await service.HandleCommitRecordAsync( record, "app.bsky.feed.post", agent, TestContext.CancellationToken );
+        await service.HandleCommitRecordAsync( record.RootElement, "app.bsky.feed.post", agent, TestContext.CancellationToken );
 
-        // Assert: the Warning RecordProcessingError must NOT fire for benign/expected errors.
-        // The IsEnabled(true) stub in Initialize() ensures this is a discriminating check:
-        // if IsExpectedParsingError did not suppress this ArgumentOutOfRangeException, Log()
-        // would be called and Times.Never would fail.
+        _queueMock.Verify(
+            q => q.EnqueueAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ),
+            Times.Never );
         _loggerMock.Verify(
             l => l.Log(
                 LogLevel.Warning,
@@ -249,7 +236,7 @@ public class JetStreamWatcherServiceTests {
         using BlueskyAgent agent = new( );
 
         // Act: must not throw
-        await service.HandleCommitRecordAsync( record, "app.bsky.feed.repost", agent, TestContext.CancellationToken );
+        await service.HandleCommitRecordAsync( record.RootElement, "app.bsky.feed.repost", agent, TestContext.CancellationToken );
 
         // Assert: nothing enqueued — skipped cleanly
         _queueMock.Verify(
@@ -284,7 +271,7 @@ public class JetStreamWatcherServiceTests {
         using BlueskyAgent agent = new( );
 
         // Act: must not throw
-        await service.HandleCommitRecordAsync( record, "app.bsky.feed.repost", agent, TestContext.CancellationToken );
+        await service.HandleCommitRecordAsync( record.RootElement, "app.bsky.feed.repost", agent, TestContext.CancellationToken );
 
         // Assert: nothing enqueued — skipped cleanly
         _queueMock.Verify(
@@ -302,6 +289,58 @@ public class JetStreamWatcherServiceTests {
                 It.IsAny<Exception?>( ),
                 It.IsAny<Func<It.IsAnyType, Exception?, string>>( ) ),
             Times.Never );
+    }
+
+    [TestMethod]
+    [DataRow( "create", true, 1 )]
+    [DataRow( "create", false, 0 )]
+    [DataRow( "update", true, 0 )]
+    [DataRow( "delete", true, 0 )]
+    [DataRow( "unknown", true, 0 )]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task HandleCommitEvent_OnlyCreatedRecordsEnqueueMusicLinks(
+        string operation,
+        bool includeRecord,
+        int expectedEnqueues
+    ) {
+        const string post = """
+            {
+              "$type": "app.bsky.feed.post",
+              "text": "music",
+              "createdAt": "2026-10-16T00:00:00Z",
+              "facets": [{
+                "index": { "byteStart": 0, "byteEnd": 5 },
+                "features": [{
+                  "$type": "app.bsky.richtext.facet#link",
+                  "uri": "https://open.spotify.com/track/3n3Ppam7vgaVa1iaRUc9Lp"
+                }]
+              }]
+            }
+            """;
+        string payload = $$"""
+            {
+              "did": "did:plc:ragtjsm2j2vknwkz3zp4oxrd",
+              "time_us": 1792108800000000,
+              "kind": "commit",
+              "commit": {
+                "rev": "3lqro2x5vfs2b",
+                "operation": "{{operation}}",
+                "collection": "app.bsky.feed.post",
+                "rkey": "3lqro2x5vfs2b",
+                "record": {{(includeRecord ? post : "null")}}
+              }
+            }
+            """;
+        JetstreamCommitEvent? commitEvent = JsonSerializer.Deserialize<JetstreamCommitEvent>(
+            payload, AtProtoJsonSerializerOptions.Default );
+        Assert.IsNotNull( commitEvent );
+        using BlueskyAgent agent = new( );
+
+        await CreateService( ).HandleCommitEventAsync( commitEvent, agent, TestContext.CancellationToken );
+
+        _queueMock.Verify(
+            q => q.EnqueueAsync( It.IsAny<QueuedLookupRequest>( ), QueuePriority.Bulk, It.IsAny<CancellationToken>( ) ),
+            Times.Exactly( expectedEnqueues ) );
     }
 
     /// <summary>

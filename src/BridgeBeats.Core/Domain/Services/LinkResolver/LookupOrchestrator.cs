@@ -32,8 +32,7 @@ namespace BridgeBeats.Services.LinkResolver;
 /// <param name="cache">Repository checked first for a fresh cached result.</param>
 /// <param name="deduplicator">Coordinates concurrent identical lookups via an acquire/wait/signal protocol.</param>
 /// <param name="sagaManager">Creates and reads the durable saga that tracks the lookup across providers.</param>
-/// <param name="dispatchOutbox">Atomically stages and publishes initial provider-leg queue deliveries.</param>
-/// <param name="queueResolver">Resolves the per-provider request queue to enqueue work onto.</param>
+/// <param name="dispatchOutbox">Atomically stages, publishes, and promotes provider deliveries.</param>
 /// <param name="atProtoStorage">Reads stored partial/final results by their ATProto record URI.</param>
 /// <param name="enabledProviders">The set of providers a metadata/ISRC/UPC lookup fans out to.</param>
 /// <param name="logger">The logger for orchestration diagnostics.</param>
@@ -43,7 +42,6 @@ public sealed partial class LookupOrchestrator(
     IRequestDeduplicator deduplicator,
     ISagaStateManager sagaManager,
     ILookupDispatchOutbox dispatchOutbox,
-    IProviderQueueResolver<QueuedLookupRequest> queueResolver,
     IATProtoStorageService atProtoStorage,
     HashSet<SupportedProviders> enabledProviders,
     ILogger<LookupOrchestrator> logger,
@@ -61,9 +59,6 @@ public sealed partial class LookupOrchestrator(
     /// <summary>Transactional outbox used for initial provider dispatch.</summary>
     private readonly ILookupDispatchOutbox _dispatchOutbox = dispatchOutbox
         ?? throw new ArgumentNullException( nameof( dispatchOutbox ) );
-    /// <summary>Resolves the per-provider request queue to enqueue work onto.</summary>
-    private readonly IProviderQueueResolver<QueuedLookupRequest> _queueResolver = queueResolver
-                                                                                ?? throw new ArgumentNullException( nameof( queueResolver ) );
     /// <summary>Reads stored partial/final results by their ATProto record URI.</summary>
     private readonly IATProtoStorageService _atProtoStorage = atProtoStorage
                                                             ?? throw new ArgumentNullException( nameof( atProtoStorage ) );
@@ -354,14 +349,7 @@ public sealed partial class LookupOrchestrator(
             // and time budget (during a rate-limit window no publish would ever arrive)
             LookupSagaState? inFlightSaga = await _sagaManager.GetAsync( inFlightSagaId );
             if (inFlightSaga is not null) {
-                await PromotePendingSagaAsync(
-                    inFlightSaga,
-                    lookupType,
-                    lookupValue,
-                    isAlbum,
-                    title,
-                    artist,
-                    initialProvider );
+                await PromotePendingSagaAsync( inFlightSaga );
             }
             string? storedResultUri = inFlightSaga?.FinalResultUri ?? inFlightSaga?.PartialResultUri;
             if (!string.IsNullOrEmpty( storedResultUri )) {
@@ -489,46 +477,17 @@ public sealed partial class LookupOrchestrator(
     }
 
     /// <summary>
-    /// Atomically promotes an existing maintenance generation and publishes interactive copies of
-    /// its unfinished provider legs. Only the caller that changes the persisted priority publishes,
-    /// so concurrent manual lookups cannot create an interactive fan-out storm.
+    /// Atomically promotes an existing maintenance generation and moves each unclaimed unfinished
+    /// delivery to the interactive lane without duplicating work already owned by a worker.
     /// </summary>
-    private async Task PromotePendingSagaAsync(
-        LookupSagaState saga,
-        LookupRequestType lookupType,
-        string lookupValue,
-        bool isAlbum,
-        string? title,
-        string? artist,
-        SupportedProviders? initialProvider
-    ) {
-        if (string.IsNullOrWhiteSpace( saga.InstanceToken )
-            || !await _sagaManager.TryPromoteToInteractiveAsync( saga.SagaId, saga.InstanceToken )) {
+    private async Task PromotePendingSagaAsync( LookupSagaState saga ) {
+        if (string.IsNullOrWhiteSpace( saga.InstanceToken )) {
             return;
         }
-
-        IEnumerable<SupportedProviders> candidates = initialProvider.HasValue
-            ? [initialProvider.Value]
-            : _enabledProviders;
-        foreach (SupportedProviders provider in candidates) {
-            if (saga.ProviderStates.TryGetValue( provider, out ProviderLookupState? state ) && state.IsComplete) {
-                continue;
-            }
-
-            IRequestQueue<QueuedLookupRequest> queue = _queueResolver.GetQueue( provider );
-            await queue.EnqueueAsync( new QueuedLookupRequest {
-                RequestId = Guid.NewGuid( ).ToString( "N" ),
-                Provider = provider,
-                LookupType = lookupType,
-                LookupValue = lookupValue,
-                SagaId = saga.SagaId,
-                SagaInstanceToken = saga.InstanceToken,
-                IsAlbum = isAlbum,
-                Title = title,
-                Artist = artist,
-                OriginPriority = QueuePriority.Interactive
-            }, QueuePriority.Interactive );
-        }
+        _ = await _dispatchOutbox.PromoteToInteractiveAsync(
+            saga.SagaId,
+            saga.InstanceToken,
+            [.. saga.PendingProviders] );
     }
 
     /// <summary>

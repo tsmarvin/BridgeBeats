@@ -26,6 +26,9 @@ public sealed partial class SpotifyBatchQueueHelper : IQueueWorkSignal {
     /// <summary>Redis connection multiplexer used for all stream operations.</summary>
     private readonly IConnectionMultiplexer _redis;
 
+    /// <summary>Atomic delivery replacement and acknowledgement transactions.</summary>
+    private readonly RedisQueueDeliveryTransitions _deliveryTransitions;
+
     /// <summary>Logger for this helper's structured log events.</summary>
     private readonly ILogger<SpotifyBatchQueueHelper> _logger;
 
@@ -66,48 +69,6 @@ public sealed partial class SpotifyBatchQueueHelper : IQueueWorkSignal {
     private const int AutoClaimMinIdleMs = 15 * 60 * 1000;
 
     /// <summary>
-    /// Atomically forwards one live bulk delivery to the appropriate generic single-item stream,
-    /// wakes its consumer, and removes the source. Source existence makes redelivery idempotent.
-    /// </summary>
-    private const string ForwardToSingleItemScript = """
-        local source = redis.call('XRANGE', KEYS[1], ARGV[1], ARGV[1], 'COUNT', 1)
-        if #source == 0 then return false end
-        local groupExists = false
-        local groups = redis.call('XINFO', 'GROUPS', KEYS[1])
-        for _, group in ipairs(groups) do
-            for i = 1, #group, 2 do
-                if group[i] == 'name' and group[i + 1] == ARGV[6] then
-                    groupExists = true
-                    break
-                end
-            end
-            if groupExists then break end
-        end
-        if not groupExists then return redis.error_reply('NOGROUP source consumer group is missing') end
-        local replacement = redis.call('XADD', KEYS[2], '*', ARGV[2], ARGV[3], ARGV[4], ARGV[5])
-        redis.call('PUBLISH', ARGV[7], replacement)
-        redis.call('XACK', KEYS[1], ARGV[6], ARGV[1])
-        redis.call('XDEL', KEYS[1], ARGV[1])
-        return replacement
-        """;
-
-    private const string RequeueDeliveryScript = """
-        local source = redis.call('XRANGE', KEYS[1], ARGV[1], ARGV[1], 'COUNT', 1)
-        if #source == 0 then return false end
-        local replacement = redis.call(
-            'XADD', KEYS[1], '*', ARGV[3], ARGV[4], ARGV[5], ARGV[6])
-        redis.call('XACK', KEYS[1], ARGV[2], ARGV[1])
-        redis.call('XDEL', KEYS[1], ARGV[1])
-        redis.call('PUBLISH', ARGV[7], replacement)
-        return replacement
-        """;
-
-    private const string RemoveDeliveryScript = """
-        redis.call('XACK', KEYS[1], ARGV[2], ARGV[1])
-        return redis.call('XDEL', KEYS[1], ARGV[1])
-        """;
-
-    /// <summary>
     /// Initializes the helper, deriving this process instance's consumer id.
     /// </summary>
     /// <param name="redis">The Redis connection multiplexer.</param>
@@ -120,6 +81,7 @@ public sealed partial class SpotifyBatchQueueHelper : IQueueWorkSignal {
         string? keyPrefix = null
     ) {
         _redis = redis ?? throw new ArgumentNullException( nameof( redis ) );
+        _deliveryTransitions = new RedisQueueDeliveryTransitions( _redis );
         _logger = logger ?? throw new ArgumentNullException( nameof( logger ) );
         _bulkTrackStream = QueueStreamKeys.SpotifyBulkFor( isTrack: true, keyPrefix );
         _bulkAlbumStream = QueueStreamKeys.SpotifyBulkFor( isTrack: false, keyPrefix );
@@ -494,7 +456,7 @@ public sealed partial class SpotifyBatchQueueHelper : IQueueWorkSignal {
             string? payload = entry[QueueStreamFieldNames.Payload];
             string? enqueuedAtStr = entry[QueueStreamFieldNames.EnqueuedAt];
             if (string.IsNullOrEmpty( payload )) {
-                await AckAndDeletePoisonEntryAsync( db, stream, entry.Id.ToString( ) );
+                await AckAndDeletePoisonEntryAsync( stream, entry.Id.ToString( ) );
                 if (recordPelOutcome) {
                     QueueMetrics.PelScanEntries.Add( 1,
                         new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ),
@@ -506,7 +468,7 @@ public sealed partial class SpotifyBatchQueueHelper : IQueueWorkSignal {
             try {
                 QueuedLookupRequest? request = JsonSerializer.Deserialize<QueuedLookupRequest>( payload, _jsonOptions );
                 if (request is null) {
-                    await AckAndDeletePoisonEntryAsync( db, stream, entry.Id.ToString( ) );
+                    await AckAndDeletePoisonEntryAsync( stream, entry.Id.ToString( ) );
                     if (recordPelOutcome) {
                         QueueMetrics.PelScanEntries.Add( 1,
                             new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ),
@@ -533,7 +495,7 @@ public sealed partial class SpotifyBatchQueueHelper : IQueueWorkSignal {
                 remainingCount--;
             } catch (JsonException ex) {
                 LogDeserializationError( _logger, ex, entry.Id.ToString( ), stream );
-                await AckAndDeletePoisonEntryAsync( db, stream, entry.Id.ToString( ) );
+                await AckAndDeletePoisonEntryAsync( stream, entry.Id.ToString( ) );
                 if (recordPelOutcome) {
                     QueueMetrics.PelScanEntries.Add( 1,
                         new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ),
@@ -556,16 +518,12 @@ public sealed partial class SpotifyBatchQueueHelper : IQueueWorkSignal {
     /// Acknowledges and deletes a single poison entry (missing or unparseable payload) so it is
     /// never re-read.
     /// </summary>
-    /// <param name="db">The Redis database to operate on.</param>
     /// <param name="stream">The stream the entry belongs to.</param>
     /// <param name="id">The Redis entry id to acknowledge and delete.</param>
     /// <returns>A task that completes once the entry is removed (Redis errors are logged and swallowed).</returns>
-    private async Task AckAndDeletePoisonEntryAsync( IDatabase db, string stream, string id ) {
+    private async Task AckAndDeletePoisonEntryAsync( string stream, string id ) {
         try {
-            _ = await db.ScriptEvaluateAsync(
-                RemoveDeliveryScript,
-                [stream],
-                [id, ConsumerGroup] );
+            _ = await _deliveryTransitions.AcknowledgeAsync( stream, id, ConsumerGroup );
             QueueMetrics.RecordDeliveryRemoved( SupportedProviders.Spotify, QueuePriority.Bulk );
             QueueMetrics.RecordTerminalOutcome( SupportedProviders.Spotify, QueuePriority.Bulk, "poison_deleted" );
         } catch (RedisServerException ex) {
@@ -589,11 +547,7 @@ public sealed partial class SpotifyBatchQueueHelper : IQueueWorkSignal {
     public async Task AcknowledgeAsync( string messageId ) {
         (string stream, string id) = ParseMessageId( messageId );
 
-        IDatabase db = _redis.GetDatabase( );
-        _ = await db.ScriptEvaluateAsync(
-            RemoveDeliveryScript,
-            [stream],
-            [id, ConsumerGroup] );
+        _ = await _deliveryTransitions.AcknowledgeAsync( stream, id, ConsumerGroup );
         QueueMetrics.RecordDeliveryRemoved( SupportedProviders.Spotify, QueuePriority.Bulk );
 
         LogMessageAcknowledged( _logger, id, stream );
@@ -624,29 +578,31 @@ public sealed partial class SpotifyBatchQueueHelper : IQueueWorkSignal {
             BypassBulkRouting = true
         };
         string payload = JsonSerializer.Serialize( requeued, _jsonOptions );
-        string enqueuedAt = DateTimeOffset.UtcNow.ToString( "O" );
-
+        DateTimeOffset now = DateTimeOffset.UtcNow;
         QueuePriority destinationPriority = message.Payload.OriginPriority == QueuePriority.Interactive
             ? QueuePriority.Interactive
             : QueuePriority.Background;
         string destinationStream = destinationPriority == QueuePriority.Interactive
             ? _interactiveStream
             : _backgroundStream;
-
-        RedisResult result = await _redis.GetDatabase( ).ScriptEvaluateAsync(
-            ForwardToSingleItemScript,
-            keys: [stream, destinationStream],
-            values: [
-                id,
-                QueueStreamFieldNames.Payload,
-                payload,
-                QueueStreamFieldNames.EnqueuedAt,
-                enqueuedAt,
-                ConsumerGroup,
-                _workSignalChannel
-            ] );
-        RedisValue replacementId = (RedisValue)result;
-        if (!replacementId.HasValue) {
+        DeliveryReplacementOutcome outcome = await _deliveryTransitions.ReplaceAsync(
+            stream,
+            destinationStream,
+            id,
+            ConsumerGroup,
+            payload,
+            now,
+            _workSignalChannel,
+            requeued.SagaInstanceToken ?? string.Empty,
+            requeued.NotBefore,
+            destinationPriority,
+            QueueEnqueueOrigin.Requeue,
+            cancellationToken );
+        if (outcome == DeliveryReplacementOutcome.RecoveryRecordMissing) {
+            throw new InvalidOperationException(
+                $"Recovery record is missing for active delivery '{message.MessageId}'. The source was preserved." );
+        }
+        if (outcome != DeliveryReplacementOutcome.Replaced) {
             return false;
         }
 
@@ -745,10 +701,8 @@ public sealed partial class SpotifyBatchQueueHelper : IQueueWorkSignal {
             // Payload could not be deserialized — cannot safely increment AttemptCount.
             // Drop the message and signal CapReached so the caller writes failed saga state.
             LogPoisonPayloadDiscarded( _logger, id, sagaId );
-            _ = await db.ScriptEvaluateAsync(
-                RemoveDeliveryScript,
-                [stream],
-                [id, ConsumerGroup] );
+            _ = await _deliveryTransitions.AcknowledgeAsync(
+                stream, id, ConsumerGroup, cancellationToken );
             QueueMetrics.RecordDeliveryRemoved( SupportedProviders.Spotify, QueuePriority.Bulk );
             QueueMetrics.RecordTerminalOutcome( SupportedProviders.Spotify, QueuePriority.Bulk, "poison_deleted" );
             return RequeueOutcome.CapReached;
@@ -765,26 +719,26 @@ public sealed partial class SpotifyBatchQueueHelper : IQueueWorkSignal {
         };
 
         string newPayload = JsonSerializer.Serialize( requeuedRequest, _jsonOptions );
+        DateTimeOffset now = DateTimeOffset.UtcNow;
 
-        NameValueEntry[] fields = [
-            new NameValueEntry( QueueStreamFieldNames.Payload, newPayload ),
-            new NameValueEntry( QueueStreamFieldNames.EnqueuedAt, DateTimeOffset.UtcNow.ToString( "O" ) )
-        ];
-
-        RedisResult moveResult = await db.ScriptEvaluateAsync(
-            RequeueDeliveryScript,
-            [stream],
-            [
-                id,
-                ConsumerGroup,
-                QueueStreamFieldNames.Payload,
-                fields[0].Value,
-                QueueStreamFieldNames.EnqueuedAt,
-                fields[1].Value,
-                _bulkWorkSignalChannel
-            ] );
-        RedisValue replacementId = (RedisValue)moveResult;
-        if (!replacementId.HasValue) {
+        DeliveryReplacementOutcome outcome = await _deliveryTransitions.ReplaceAsync(
+            stream,
+            stream,
+            id,
+            ConsumerGroup,
+            newPayload,
+            now,
+            _bulkWorkSignalChannel,
+            requeuedRequest.SagaInstanceToken ?? string.Empty,
+            requeuedRequest.NotBefore,
+            QueuePriority.Bulk,
+            QueueEnqueueOrigin.Requeue,
+            cancellationToken );
+        if (outcome == DeliveryReplacementOutcome.RecoveryRecordMissing) {
+            throw new InvalidOperationException(
+                $"Recovery record is missing for active delivery '{messageId}'. The source was preserved." );
+        }
+        if (outcome != DeliveryReplacementOutcome.Replaced) {
             LogMessageNotFound( _logger, id, stream );
             return RequeueOutcome.NotFound;
         }

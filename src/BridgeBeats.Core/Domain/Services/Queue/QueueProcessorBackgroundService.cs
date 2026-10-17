@@ -739,11 +739,18 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
         };
 
         QueuePriority requeuePriority = request.OriginPriority;
-        await _queue.EnqueueAsync( requeuedRequest, requeuePriority, ct );
+        DeliveryReplacementOutcome replacementOutcome = await _queue.ReplaceAsync(
+            message.MessageId, requeuedRequest, requeuePriority, ct );
+        if (replacementOutcome == DeliveryReplacementOutcome.RecoveryRecordMissing) {
+            throw new InvalidOperationException(
+                $"Recovery record is missing for active delivery '{message.MessageId}'. The source was preserved." );
+        }
+        if (replacementOutcome != DeliveryReplacementOutcome.Replaced) {
+            return;
+        }
         if (requeuePriority == QueuePriority.Interactive) {
             QueueMetrics.RecordInteractiveRetry( _provider, endpoint );
         }
-        await _queue.AcknowledgeAsync( message.MessageId, ct );
 
         LogSagaMarkedPartial( _logger, request.SagaId, endpoint, _provider, retryAfter );
     }

@@ -83,7 +83,7 @@ public sealed partial class RedisSagaStateManager(
     private const string FieldRateLimitInfo = "rateLimitInfo";
 
     /// <summary>Core hash field: the priority the lookup originated at. Literal: <c>"originPriority"</c>.</summary>
-    private const string FieldOriginPriority = "originPriority";
+    internal const string FieldOriginPriority = "originPriority";
 
     /// <summary>Core hash field: single-winner marker that secondary lookups were queued. Literal: <c>"secondariesQueued"</c>.</summary>
     private const string FieldSecondariesQueued = "secondariesQueued";

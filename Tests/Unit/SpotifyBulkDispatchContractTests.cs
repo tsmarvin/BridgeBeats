@@ -236,11 +236,11 @@ public class SpotifyBulkDispatchContractTests {
                 It.IsAny<CommandFlags>( ) ) )
             .ReturnsAsync( (RedisValue)"9999999999-0" );
 
-        // Atomic bulk-rejection transfer returns the interactive replacement id.
+        // Queue-delivery transitions report a typed numeric outcome.
         _ = _dbMock.Setup( d => d.ScriptEvaluateAsync(
                 It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ) )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999999999-1" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         // Subscriber PublishAsync succeeds
         _ = _subscriberMock.Setup( s => s.PublishAsync(
@@ -389,11 +389,11 @@ public class SpotifyBulkDispatchContractTests {
         _ = _dbMock.Setup( database => database.ScriptEvaluateAsync(
                 It.IsAny<string>( ),
                 It.IsAny<RedisKey[]?>( ),
-                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 7 ),
+                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 15 ),
                 It.IsAny<CommandFlags>( ) ) )
             .Callback( ( string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _ ) =>
                 capturedArguments = arguments )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999999999-2" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         await CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
 
@@ -459,11 +459,11 @@ public class SpotifyBulkDispatchContractTests {
         _ = _dbMock.Setup( database => database.ScriptEvaluateAsync(
                 It.IsAny<string>( ),
                 It.IsAny<RedisKey[]?>( ),
-                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 7 ),
+                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 15 ),
                 It.IsAny<CommandFlags>( ) ) )
             .Callback( ( string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _ ) =>
                 capturedArguments = arguments )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999999999-3" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         await CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
 
@@ -613,8 +613,8 @@ public class SpotifyBulkDispatchContractTests {
             .ReturnsAsync( false );
         _ = _dbMock.Setup( database => database.ScriptEvaluateAsync(
                 It.IsAny<string>( ),
-                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == TrackStream ),
-                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 2 ),
+                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 3 && keys[0] == TrackStream ),
+                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 3 ),
                 It.IsAny<CommandFlags>( ) ) )
             .ThrowsAsync( new RedisServerException( "atomic acknowledgement unavailable" ) );
 
@@ -656,8 +656,8 @@ public class SpotifyBulkDispatchContractTests {
             .ReturnsAsync( true );
         _ = _dbMock.Setup( database => database.ScriptEvaluateAsync(
                 It.IsAny<string>( ),
-                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == TrackStream ),
-                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 2 ),
+                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 3 && keys[0] == TrackStream ),
+                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 3 ),
                 It.IsAny<CommandFlags>( ) ) )
             .ThrowsAsync( new RedisServerException( "atomic acknowledgement unavailable" ) );
 
@@ -799,7 +799,7 @@ public class SpotifyBulkDispatchContractTests {
                 It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ) )
             .Callback( ( string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _ ) => capturedArguments = arguments )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999-0" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         SpotifyBatchQueueHelper helper = CreateHelper( );
         string compositeId = $"{TrackStream}:1234567890-0";
@@ -872,8 +872,8 @@ public class SpotifyBulkDispatchContractTests {
 
         _dbMock.Verify( d => d.ScriptEvaluateAsync(
             It.IsAny<string>( ),
-            It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == TrackStream ),
-            It.Is<RedisValue[]?>( args => args != null && args.Length == 2 ),
+            It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 3 && keys[0] == TrackStream ),
+            It.Is<RedisValue[]?>( args => args != null && args.Length == 3 ),
             It.IsAny<CommandFlags>( ) ), Times.Never );
     }
 
@@ -892,7 +892,7 @@ public class SpotifyBulkDispatchContractTests {
                 It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ) )
             .Callback( ( string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _ ) => capturedArguments = arguments )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999-0" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         RequeueOutcome outcome = await CreateHelper( ).RequeueAsync(
             $"{TrackStream}:1234567890-0",
@@ -942,7 +942,7 @@ public class SpotifyBulkDispatchContractTests {
                 It.IsAny<CommandFlags>( ) ) )
             .Callback( ( string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _ ) =>
                 capturedArguments = arguments )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999-0" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         RequeueOutcome outcome = await CreateHelper( ).RequeueAsync(
             $"{TrackStream}:1234567890-0",
@@ -973,7 +973,7 @@ public class SpotifyBulkDispatchContractTests {
                 It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ) )
             .Callback( ( string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _ ) => capturedArguments = arguments )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999-0" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         RequeueOutcome outcome = await CreateHelper( ).RequeueAsync(
             $"{TrackStream}:1234567890-0", TestSagaId,
@@ -1156,7 +1156,7 @@ public class SpotifyBulkDispatchContractTests {
                 It.IsAny<CommandFlags>( ) ) )
             .Callback( ( string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _ ) =>
                 requeueArguments = arguments )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999999999-1" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         _ = _rateLimitTrackerMock.Setup( t => t.SetRateLimitedAsync(
                 It.IsAny<SupportedProviders>( ),
@@ -1226,7 +1226,7 @@ public class SpotifyBulkDispatchContractTests {
                 It.IsAny<CommandFlags>( ) ) )
             .Callback( (string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _) =>
                 requeueArguments = arguments )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999999999-1" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
         DateTimeOffset beforeDeferral = DateTimeOffset.UtcNow;
 
         await CreateService( ).HandleBulkRateLimitAsync(
@@ -1938,7 +1938,7 @@ public class SpotifyBulkDispatchContractTests {
                 capturedKeys.Add( keys );
                 capturedValues.Add( values );
             } )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999999999-1" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         SpotifyBulkProcessorService service = CreateService( );
 
@@ -1958,7 +1958,7 @@ public class SpotifyBulkDispatchContractTests {
         Assert.HasCount( ExpectedCount, capturedKeys );
         Assert.HasCount( ExpectedCount, capturedValues );
         QueuedLookupRequest? forwarded = JsonSerializer.Deserialize<QueuedLookupRequest>(
-            capturedValues[0]![2].ToString( ), s_jsonOptions );
+            capturedValues[0]![3].ToString( ), s_jsonOptions );
         Assert.AreEqual( QueueEnqueueOrigin.Requeue, forwarded!.EnqueueOrigin );
         Assert.IsTrue( forwarded.BypassBulkRouting );
         _requestQueueMock.Verify( q => q.EnqueueAsync(
@@ -2087,7 +2087,7 @@ public class SpotifyBulkDispatchContractTests {
                 It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ) )
             .Callback( ( string _, RedisKey[]? _, RedisValue[]? values, CommandFlags _ ) => capturedValues = values )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999999999-1" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         SpotifyBulkProcessorService service = CreateService( );
 
@@ -2097,7 +2097,7 @@ public class SpotifyBulkDispatchContractTests {
         // Assert — AttemptCount carried unchanged
         Assert.IsNotNull( capturedValues, "The atomic transfer script must receive the re-enqueued payload" );
         QueuedLookupRequest? capturedRequest = JsonSerializer.Deserialize<QueuedLookupRequest>(
-            capturedValues[2].ToString( ), s_jsonOptions );
+            capturedValues[3].ToString( ), s_jsonOptions );
         Assert.IsNotNull( capturedRequest );
         Assert.AreEqual(
             OriginalAttemptCount,
@@ -2135,14 +2135,14 @@ public class SpotifyBulkDispatchContractTests {
     private void VerifyAtomicRequeue( string stream, Times times ) =>
         _dbMock.Verify( database => database.ScriptEvaluateAsync(
             It.IsAny<string>( ),
-            It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == stream ),
-            It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 7 ),
+            It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 4 && keys[0] == stream && keys[1] == stream ),
+            It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 15 ),
             It.IsAny<CommandFlags>( ) ), times );
 
     private void VerifyAtomicRemoval( string stream, Times times ) =>
         _dbMock.Verify( database => database.ScriptEvaluateAsync(
             It.IsAny<string>( ),
-            It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == stream ),
-            It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 2 ),
+            It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 3 && keys[0] == stream ),
+            It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 3 ),
             It.IsAny<CommandFlags>( ) ), times );
 }

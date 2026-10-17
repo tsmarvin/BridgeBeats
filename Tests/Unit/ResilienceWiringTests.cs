@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using BridgeBeats.Contracts.Constants;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Exceptions;
+using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
 using BridgeBeats.Contracts.Records.WorkerApi;
 using BridgeBeats.Core.Domain.Extensions;
@@ -206,6 +207,7 @@ public class ResilienceWiringTests {
         ServiceCollection services = new( );
         _ = services.AddLogging( );
         _ = services.Configure<QueueSettings>( _ => { } );
+        _ = services.AddSingleton( new Mock<IRateLimitTracker>( ).Object );
         _ = services.ConfigureHttpClientDefaults( builder =>
             builder.AddStandardResilienceHandler( options => {
                 options.Retry.MaxRetryAttempts = 3;
@@ -231,6 +233,21 @@ public class ResilienceWiringTests {
         Assert.AreEqual( TimeSpan.FromSeconds( 30 ), exception.RetryAfterValue );
         Assert.AreEqual( SupportedProviders.Spotify, exception.Provider );
         Assert.AreEqual( "tracks/:id", exception.Endpoint );
+    }
+
+    /// <summary>The direct provider client remains resolvable when shared Redis tracking is absent.</summary>
+    [TestMethod]
+    public void SpotifyApiHttpClient_WithoutRateLimitTracker_StillResolves( ) {
+        ServiceCollection services = new( );
+        _ = services.AddLogging( );
+        _ = services.Configure<QueueSettings>( _ => { } );
+        _ = services.AddSpotifyServices( "client", "secret", [] );
+
+        using ServiceProvider provider = services.BuildServiceProvider( );
+        using HttpClient client = provider.GetRequiredService<IHttpClientFactory>( )
+            .CreateClient( "spotify-api" );
+
+        Assert.IsNotNull( client );
     }
 
     /// <summary>

@@ -111,6 +111,10 @@ public class QueueProcessorBackgroundServiceTests {
         _ = _sagaManagerMock.Setup( s => s.TrySetRateLimitInfoAsync(
                 It.IsAny<string>( ), It.IsAny<List<ProviderRateLimitInfo>>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( true );
+        _ = _queueMock.Setup( q => q.ReplaceAsync(
+                It.IsAny<string>( ), It.IsAny<QueuedLookupRequest>( ),
+                It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( DeliveryReplacementOutcome.Replaced );
 
         _ = _redisMock.Setup( r => r.GetSubscriber( It.IsAny<object>( ) ) ).Returns( _subscriberMock.Object );
     }
@@ -1251,13 +1255,10 @@ public class QueueProcessorBackgroundServiceTests {
         await cts.CancelAsync( );
         await service.StopAsync( CancellationToken.None );
 
-        // Assert - Should acknowledge original and re-enqueue (rate-limit-aware dequeue will skip until limit expires)
+        // Assert - the original is atomically replaced (rate-limit-aware dequeue will skip until limit expires)
         _queueMock.Verify(
-            q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ),
-            Times.Once
-        );
-        _queueMock.Verify(
-            q => q.EnqueueAsync(
+            q => q.ReplaceAsync(
+                message.MessageId,
                 It.Is<QueuedLookupRequest>( r =>
                     r.LookupType == request.LookupType &&
                     r.LookupValue == request.LookupValue &&
@@ -1289,13 +1290,14 @@ public class QueueProcessorBackgroundServiceTests {
                 new Uri( "https://api.spotify.com/v1/tracks" ),
                 SupportedProviders.Spotify,
                 ProviderEndpointConstants.Tracks ) );
-        _ = _queueMock.Setup( queue => queue.EnqueueAsync(
+        _ = _queueMock.Setup( queue => queue.ReplaceAsync(
+                message.MessageId,
                 It.IsAny<QueuedLookupRequest>( ),
                 It.IsAny<QueuePriority>( ),
                 It.IsAny<CancellationToken>( ) ) )
-            .Callback( (QueuedLookupRequest queued, QueuePriority _, CancellationToken _) =>
+            .Callback( (string _, QueuedLookupRequest queued, QueuePriority _, CancellationToken _) =>
                 requeued = queued )
-            .Returns( Task.CompletedTask );
+            .ReturnsAsync( DeliveryReplacementOutcome.Replaced );
         int callCount = 0;
         _ = _queueMock.Setup( queue => queue.DequeueAsync(
                 It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
@@ -1647,13 +1649,10 @@ public class QueueProcessorBackgroundServiceTests {
         await cts.CancelAsync( );
         await service.StopAsync( CancellationToken.None );
 
-        // Assert — enqueue precedes acknowledgement at Background priority.
+        // Assert — the delivery is atomically replaced on its interactive lane.
         _queueMock.Verify(
-            q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ),
-            Times.Once
-        );
-        _queueMock.Verify(
-            q => q.EnqueueAsync(
+            q => q.ReplaceAsync(
+                message.MessageId,
                 It.Is<QueuedLookupRequest>( r =>
                     r.LookupType == request.LookupType &&
                     r.AttemptCount == request.AttemptCount &&
@@ -1696,7 +1695,8 @@ public class QueueProcessorBackgroundServiceTests {
             .ThrowsAsync( new RetryAfterExceededException(
                 TimeSpan.FromSeconds( 60 ), TimeSpan.FromSeconds( 30 ),
                 new Uri( "https://api.spotify.com/v1/tracks" ), SupportedProviders.Spotify ) );
-        _ = _queueMock.Setup( q => q.EnqueueAsync(
+        _ = _queueMock.Setup( q => q.ReplaceAsync(
+                message.MessageId,
                 It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ) )
             .ThrowsAsync( new RedisServerException( "XADD failed" ) );
         int calls = 0;
@@ -1721,7 +1721,11 @@ public class QueueProcessorBackgroundServiceTests {
         await service.StopAsync( CancellationToken.None );
 
         _queueMock.Verify( q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ), Times.Never );
-        _queueMock.Verify( q => q.EnqueueAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( q => q.ReplaceAsync(
+            message.MessageId,
+            It.IsAny<QueuedLookupRequest>( ),
+            It.IsAny<QueuePriority>( ),
+            It.IsAny<CancellationToken>( ) ), Times.Once );
         _loggerMock.Verify( l => l.Log(
             LogLevel.Warning,
             new EventId( LogEventIds.Services.Queue.InteractiveDeferredToBackground ),
@@ -1772,13 +1776,10 @@ public class QueueProcessorBackgroundServiceTests {
         await cts.CancelAsync( );
         await service.StopAsync( CancellationToken.None );
 
-        // Assert — same requeue-at-Background path; no divergence from background-origin behavior
+        // Assert — same atomic replacement at Background priority.
         _queueMock.Verify(
-            q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ),
-            Times.Once
-        );
-        _queueMock.Verify(
-            q => q.EnqueueAsync(
+            q => q.ReplaceAsync(
+                message.MessageId,
                 It.Is<QueuedLookupRequest>( r =>
                     r.LookupType == request.LookupType &&
                     r.AttemptCount == request.AttemptCount
@@ -2576,6 +2577,7 @@ public class QueueProcessorBackgroundServiceTests {
         public Task<QueuedMessage<QueuedLookupRequest>?> DequeueAsync( IRateLimitTracker tracker, CancellationToken cancellationToken = default ) => DequeueRate( cancellationToken );
         public Task AcknowledgeAsync( string messageId, CancellationToken cancellationToken = default ) => Task.CompletedTask;
         public Task RequeueAsync( string messageId, TimeSpan? delay = null, CancellationToken cancellationToken = default ) => Task.CompletedTask;
+        public Task<DeliveryReplacementOutcome> ReplaceAsync( string messageId, QueuedLookupRequest replacement, QueuePriority priority, CancellationToken cancellationToken = default ) => Task.FromResult( DeliveryReplacementOutcome.Replaced );
         public Task<QueueDepth> GetDepthAsync( CancellationToken cancellationToken = default ) => Task.FromResult( new QueueDepth( 0, 0, 0, 0 ) );
         public Task<IReadOnlyList<QueuedMessage<QueuedLookupRequest>>> GetDlqMessagesAsync( int limit, CancellationToken cancellationToken = default ) => Task.FromResult<IReadOnlyList<QueuedMessage<QueuedLookupRequest>>>( [] );
         public Task RequeueFromDlqAsync( string messageId, QueuePriority priority, CancellationToken cancellationToken = default ) => Task.CompletedTask;

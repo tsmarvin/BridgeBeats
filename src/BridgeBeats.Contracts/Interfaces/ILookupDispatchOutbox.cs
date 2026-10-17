@@ -43,6 +43,18 @@ public interface ILookupDispatchOutbox {
         SupportedProviders provider,
         CancellationToken cancellationToken = default );
 
+    /// <summary>
+    /// Promotes a saga and its unfinished, unclaimed provider deliveries to the interactive lane.
+    /// Already-claimed deliveries remain with their active workers so promotion cannot duplicate
+    /// provider calls. Any recorded eligibility delay is preserved.
+    /// </summary>
+    /// <returns><see langword="true"/> when the supplied saga generation still owns the promotion.</returns>
+    Task<bool> PromoteToInteractiveAsync(
+        string sagaId,
+        string instanceToken,
+        IReadOnlyCollection<SupportedProviders> pendingProviders,
+        CancellationToken cancellationToken = default );
+
     /// <summary>Fairly relays a bounded batch of due pending items and published-delivery recovery checks.</summary>
     Task<int> DispatchPendingAsync( int limit, CancellationToken cancellationToken = default );
 }

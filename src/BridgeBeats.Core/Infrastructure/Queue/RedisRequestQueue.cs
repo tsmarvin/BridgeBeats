@@ -55,6 +55,9 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T>, IConsumerGr
     /// <summary>Redis connection used for all stream operations.</summary>
     private readonly IConnectionMultiplexer _redis;
 
+    /// <summary>Atomic delivery replacement and acknowledgement transactions.</summary>
+    private readonly RedisQueueDeliveryTransitions _deliveryTransitions;
+
     /// <summary>Logger for queue diagnostics.</summary>
     private readonly ILogger<RedisRequestQueue<T>> _logger;
 
@@ -126,12 +129,15 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T>, IConsumerGr
     private const string DlqOriginalStreamField = "originalStream";
     private const int AutoClaimMinIdleMs = 15 * 60 * 1000;
     private const string EnqueueDeliveryScript = """
-        local messageId = redis.call(
-            'XADD', KEYS[1], '*', ARGV[1], ARGV[2], ARGV[3], ARGV[4])
-        if ARGV[6] == '1'
+        local outboxKey = ''
+        local tracksOutbox = ARGV[6] == '1'
             and redis.call('EXISTS', KEYS[3]) == 1
             and redis.call('HGET', KEYS[3], 'instanceToken') == ARGV[7]
-            and redis.call('HGET', KEYS[2], ARGV[8]) == ARGV[9] then
+            and redis.call('HGET', KEYS[2], ARGV[8]) == ARGV[9]
+        if tracksOutbox then outboxKey = KEYS[3] end
+        local messageId = redis.call(
+            'XADD', KEYS[1], '*', ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[17], outboxKey)
+        if tracksOutbox then
             redis.call('HSET', KEYS[3],
                 'payload', ARGV[2],
                 'targetStream', KEYS[1],
@@ -151,36 +157,6 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T>, IConsumerGr
         redis.call('PUBLISH', ARGV[5], messageId)
         return messageId
         """;
-    private const string RequeueDeliveryScript = """
-        local source = redis.call('XRANGE', KEYS[1], ARGV[1], ARGV[1], 'COUNT', 1)
-        if #source == 0 then return false end
-        local replacement = redis.call(
-            'XADD', KEYS[1], '*', ARGV[3], ARGV[4], ARGV[5], ARGV[6])
-        if ARGV[8] == '1'
-            and redis.call('EXISTS', KEYS[3]) == 1
-            and redis.call('HGET', KEYS[3], 'instanceToken') == ARGV[9]
-            and redis.call('HGET', KEYS[2], ARGV[10]) == ARGV[11] then
-            redis.call('HSET', KEYS[3],
-                'payload', ARGV[4],
-                'targetStream', KEYS[1],
-                'workChannel', ARGV[15],
-                'priority', ARGV[14],
-                'enqueueOrigin', ARGV[16],
-                'currentMessageId', replacement)
-            if ARGV[12] == '' then
-                redis.call('HDEL', KEYS[3], 'notBefore')
-            else
-                redis.call('HSET', KEYS[3], 'notBefore', ARGV[12])
-            end
-            redis.call('HSET', KEYS[2], ARGV[13], ARGV[17])
-            redis.call('ZREM', KEYS[4], KEYS[3])
-            redis.call('ZADD', KEYS[5], ARGV[18], KEYS[3])
-        end
-        redis.call('XACK', KEYS[1], ARGV[2], ARGV[1])
-        redis.call('XDEL', KEYS[1], ARGV[1])
-        redis.call('PUBLISH', ARGV[7], replacement)
-        return replacement
-        """;
     private const string RequeueDlqDeliveryScript = """
         local source = redis.call('XRANGE', KEYS[1], ARGV[1], ARGV[1], 'COUNT', 1)
         if #source == 0 then return false end
@@ -190,45 +166,8 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T>, IConsumerGr
         redis.call('PUBLISH', ARGV[6], replacement)
         return replacement
         """;
-    private const string MoveToDlqDeliveryScript = """
-        local source = redis.call('XRANGE', KEYS[1], ARGV[1], ARGV[1], 'COUNT', 1)
-        if #source == 0 then return false end
-        local values = source[1][2]
-        local payload = false
-        local enqueuedAt = false
-        for i = 1, #values, 2 do
-            if values[i] == ARGV[3] then payload = values[i + 1] end
-            if values[i] == ARGV[4] then enqueuedAt = values[i + 1] end
-        end
-        if not payload or not enqueuedAt then return false end
-        local replacement = redis.call(
-            'XADD', KEYS[2], '*', ARGV[3], payload, ARGV[4], enqueuedAt,
-            ARGV[5], KEYS[1], ARGV[6], ARGV[7], ARGV[8], ARGV[9])
-        redis.call('XACK', KEYS[1], ARGV[2], ARGV[1])
-        redis.call('XDEL', KEYS[1], ARGV[1])
-        return replacement
-        """;
-    private const string RemoveDeliveryScript = """
-        redis.call('XACK', KEYS[1], ARGV[2], ARGV[1])
-        return redis.call('XDEL', KEYS[1], ARGV[1])
-        """;
-    private const string MovePoisonToDlqScript = """
-        local source = redis.call('XRANGE', KEYS[1], ARGV[1], ARGV[1], 'COUNT', 1)
-        if #source == 0 then return false end
-        local values = source[1][2]
-        local payload = ''
-        local enqueuedAt = ARGV[9]
-        for i = 1, #values, 2 do
-            if values[i] == ARGV[3] then payload = values[i + 1] end
-            if values[i] == ARGV[4] then enqueuedAt = values[i + 1] end
-        end
-        local replacement = redis.call(
-            'XADD', KEYS[2], '*', ARGV[3], payload, ARGV[4], enqueuedAt,
-            ARGV[5], KEYS[1], ARGV[6], ARGV[7], ARGV[8], ARGV[9])
-        redis.call('XACK', KEYS[1], ARGV[2], ARGV[1])
-        redis.call('XDEL', KEYS[1], ARGV[1])
-        return replacement
-        """;
+    private const string MoveToDlqDeliveryScript = RedisQueueDeliveryTransitions.MoveToDlqScript;
+    private const string MovePoisonToDlqScript = RedisQueueDeliveryTransitions.MovePoisonToDlqScript;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="RedisRequestQueue{T}"/> class for one provider,
@@ -259,6 +198,7 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T>, IConsumerGr
         string? keyPrefix = null
     ) {
         _redis = redis ?? throw new ArgumentNullException( nameof( redis ) );
+        _deliveryTransitions = new RedisQueueDeliveryTransitions( _redis );
         _logger = logger ?? throw new ArgumentNullException( nameof( logger ) );
         ArgumentNullException.ThrowIfNull( settings );
         _settings = settings.Value;
@@ -402,7 +342,8 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T>, IConsumerGr
         QueuedLookupRequest? lookupRequest = request as QueuedLookupRequest;
         bool trackOutbox = lookupRequest is not null
             && !string.IsNullOrWhiteSpace( lookupRequest.SagaInstanceToken );
-        long recoveryAt = GetRecoveryAtUnixMilliseconds( lookupRequest?.NotBefore, now );
+        long recoveryAt = RedisQueueDeliveryTransitions.GetRecoveryAtUnixMilliseconds(
+            lookupRequest?.NotBefore, now );
 
         IDatabase db = _redis.GetDatabase( );
         NameValueEntry[] fields = [
@@ -439,7 +380,8 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T>, IConsumerGr
                 _workSignalChannel.ToString( ),
                 ((int)(lookupRequest?.EnqueueOrigin ?? QueueEnqueueOrigin.New)).ToString( CultureInfo.InvariantCulture ),
                 now.ToUnixTimeMilliseconds( ),
-                recoveryAt
+                recoveryAt,
+                QueueStreamFieldNames.DispatchOutboxKey
             ] );
         RedisValue messageId = (RedisValue)enqueueResult;
         if (!messageId.HasValue) {
@@ -938,11 +880,8 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T>, IConsumerGr
 
         (string stream, string id) = ParseMessageId( messageId );
 
-        IDatabase db = _redis.GetDatabase( );
-        _ = await db.ScriptEvaluateAsync(
-            RemoveDeliveryScript,
-            [stream],
-            [id, _consumerGroup] );
+        _ = await _deliveryTransitions.AcknowledgeAsync(
+            stream, id, _consumerGroup, cancellationToken );
         ReleaseDelivery( messageId );
 
         // Record acknowledge metric
@@ -1000,49 +939,26 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T>, IConsumerGr
                 payload = JsonSerializer.Serialize( queuedLookup, _jsonOptions );
             }
         }
-        bool trackOutbox = queuedLookup is not null
-            && !string.IsNullOrWhiteSpace( queuedLookup.SagaInstanceToken );
-        long recoveryAt = GetRecoveryAtUnixMilliseconds( queuedLookup?.NotBefore, now );
-        NameValueEntry[] fields = [
-            new NameValueEntry( QueueStreamFieldNames.Payload, payload ),
-            new NameValueEntry( QueueStreamFieldNames.EnqueuedAt, now.ToString( "O" ) )
-        ];
-
-        RedisResult moveResult = await db.ScriptEvaluateAsync(
-            RequeueDeliveryScript,
-            [
-                stream,
-                trackOutbox
-                    ? RedisSagaStateManager.GetProviderKey( queuedLookup!.SagaId, queuedLookup.Provider )
-                    : stream,
-                trackOutbox
-                    ? RedisLookupDispatchOutbox.GetOutboxKey( queuedLookup!.SagaId, queuedLookup.Provider )
-                    : stream,
-                RedisLookupDispatchOutbox.PendingIndexKey,
-                RedisLookupDispatchOutbox.PublishedRecoveryIndexKey
-            ],
-            [
-                id,
-                _consumerGroup,
-                QueueStreamFieldNames.Payload,
-                payload,
-                QueueStreamFieldNames.EnqueuedAt,
-                fields[1].Value,
-                _workSignalChannel.ToString( ),
-                trackOutbox ? "1" : "0",
-                queuedLookup?.SagaInstanceToken ?? string.Empty,
-                RedisLookupDispatchOutbox.DispatchStateField,
-                RedisLookupDispatchOutbox.DispatchPublished,
-                queuedLookup?.NotBefore?.ToUnixTimeMilliseconds( ).ToString( CultureInfo.InvariantCulture ) ?? string.Empty,
-                RedisLookupDispatchOutbox.DispatchPublishedAtField,
-                ((int)GetPriorityFromStream( stream )).ToString( CultureInfo.InvariantCulture ),
-                _workSignalChannel.ToString( ),
-                ((int)QueueEnqueueOrigin.Requeue).ToString( CultureInfo.InvariantCulture ),
-                now.ToUnixTimeMilliseconds( ),
-                recoveryAt
-            ] );
-        RedisValue replacementId = (RedisValue)moveResult;
-        if (!replacementId.HasValue) {
+        DeliveryReplacementOutcome outcome = await _deliveryTransitions.ReplaceAsync(
+            stream,
+            stream,
+            id,
+            _consumerGroup,
+            payload.ToString( ),
+            now,
+            _workSignalChannel.ToString( ),
+            queuedLookup?.SagaInstanceToken ?? string.Empty,
+            queuedLookup?.NotBefore,
+            GetPriorityFromStream( stream ),
+            QueueEnqueueOrigin.Requeue,
+            cancellationToken );
+        if (outcome == DeliveryReplacementOutcome.RecoveryRecordMissing) {
+            LogRecoveryRecordMissing( _logger, id, stream );
+            ReleaseDelivery( messageId );
+            throw new InvalidOperationException(
+                $"Recovery record is missing for active delivery '{messageId}'. The source was preserved." );
+        }
+        if (outcome != DeliveryReplacementOutcome.Replaced) {
             ReleaseDelivery( messageId );
             return;
         }
@@ -1059,6 +975,51 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T>, IConsumerGr
         QueueMetrics.RecordRequeue( _provider );
 
         LogRequeued( _logger, stream );
+    }
+
+    /// <inheritdoc/>
+    public async Task<DeliveryReplacementOutcome> ReplaceAsync(
+        string messageId,
+        T replacement,
+        QueuePriority priority,
+        CancellationToken cancellationToken = default
+    ) {
+        ArgumentException.ThrowIfNullOrWhiteSpace( messageId );
+        ArgumentNullException.ThrowIfNull( replacement );
+        cancellationToken.ThrowIfCancellationRequested( );
+
+        (string sourceStream, string id) = ParseMessageId( messageId );
+        string destinationStream = GetStreamForPriority( priority );
+        string payload = JsonSerializer.Serialize( replacement, _jsonOptions );
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        QueuedLookupRequest? lookupRequest = replacement as QueuedLookupRequest;
+        DeliveryReplacementOutcome outcome = await _deliveryTransitions.ReplaceAsync(
+            sourceStream,
+            destinationStream,
+            id,
+            _consumerGroup,
+            payload,
+            now,
+            _workSignalChannel.ToString( ),
+            lookupRequest?.SagaInstanceToken ?? string.Empty,
+            lookupRequest?.NotBefore,
+            priority,
+            lookupRequest?.EnqueueOrigin ?? QueueEnqueueOrigin.Requeue,
+            cancellationToken );
+        ReleaseDelivery( messageId );
+        if (outcome == DeliveryReplacementOutcome.RecoveryRecordMissing) {
+            LogRecoveryRecordMissing( _logger, id, sourceStream );
+        }
+        if (outcome != DeliveryReplacementOutcome.Replaced) return outcome;
+
+        NotifyWorkAvailable( );
+        QueueMetrics.RecordEnqueue(
+            _provider,
+            priority,
+            lookupRequest?.EnqueueOrigin ?? QueueEnqueueOrigin.Requeue );
+        QueueMetrics.RecordDeliveryRemoved( _provider, GetPriorityFromStream( sourceStream ) );
+        QueueMetrics.RecordRequeue( _provider );
+        return outcome;
     }
 
     /// <summary>
@@ -1190,12 +1151,18 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T>, IConsumerGr
 
         RedisResult moveResult = await db.ScriptEvaluateAsync(
             MoveToDlqDeliveryScript,
-            [stream, _dlqStream],
+            [
+                stream,
+                _dlqStream,
+                RedisLookupDispatchOutbox.PendingIndexKey,
+                RedisLookupDispatchOutbox.PublishedRecoveryIndexKey
+            ],
             [
                 id,
                 _consumerGroup,
                 QueueStreamFieldNames.Payload,
                 QueueStreamFieldNames.EnqueuedAt,
+                QueueStreamFieldNames.DispatchOutboxKey,
                 DlqOriginalStreamField,
                 DlqReasonField,
                 reason,
@@ -1250,15 +1217,6 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T>, IConsumerGr
         QueuePriority.Bulk => _bulkStream,
         _ => throw new ArgumentOutOfRangeException( nameof( priority ) )
     };
-
-    private static long GetRecoveryAtUnixMilliseconds(
-        DateTimeOffset? notBefore,
-        DateTimeOffset now
-    ) {
-        DateTimeOffset ordinaryRecovery = now.Add( RedisLookupDispatchOutbox.RedriveAfter );
-        return (notBefore > ordinaryRecovery ? notBefore.Value : ordinaryRecovery)
-            .ToUnixTimeMilliseconds( );
-    }
 
     /// <summary>Maps a stream key back to its priority, defaulting to background for unknown streams.</summary>
     /// <param name="stream">The stream key to map.</param>
@@ -1387,12 +1345,18 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T>, IConsumerGr
     private async Task MovePoisonEntryToDlqAsync( IDatabase db, string stream, RedisValue id ) {
         RedisResult result = await db.ScriptEvaluateAsync(
             MovePoisonToDlqScript,
-            [stream, _dlqStream],
+            [
+                stream,
+                _dlqStream,
+                RedisLookupDispatchOutbox.PendingIndexKey,
+                RedisLookupDispatchOutbox.PublishedRecoveryIndexKey
+            ],
             [
                 id,
                 _consumerGroup,
                 QueueStreamFieldNames.Payload,
                 QueueStreamFieldNames.EnqueuedAt,
+                QueueStreamFieldNames.DispatchOutboxKey,
                 DlqOriginalStreamField,
                 DlqReasonField,
                 "Unreadable queue payload.",
@@ -1668,6 +1632,16 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T>, IConsumerGr
         Level = LogLevel.Warning,
         Message = "InteractiveAgingInterval {ConfiguredValue} is ≤ 1 (misconfiguration); falling back to default {DefaultValue}" )]
     internal static partial void LogAgingIntervalMisconfigured( ILogger logger, int configuredValue, int defaultValue );
+
+    /// <summary>Logs that replacement preserved a delivery whose recovery record was missing.</summary>
+    /// <param name="logger">The logger to write to.</param>
+    /// <param name="messageId">The source Redis message id.</param>
+    /// <param name="stream">The stream containing the preserved delivery.</param>
+    [LoggerMessage(
+        EventId = LogEventIds.Infrastructure.Queue.RedisRequestQueueRecoveryRecordMissing,
+        Level = LogLevel.Error,
+        Message = "Recovery record missing for active message {MessageId} in {Stream}; preserving source delivery" )]
+    internal static partial void LogRecoveryRecordMissing( ILogger logger, string messageId, string stream );
 
     #endregion
 }

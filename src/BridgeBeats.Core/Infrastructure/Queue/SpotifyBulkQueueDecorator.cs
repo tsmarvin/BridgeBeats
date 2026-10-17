@@ -28,12 +28,15 @@ namespace BridgeBeats.Core.Infrastructure.Queue;
 public sealed partial class SpotifyBulkQueueDecorator : IRequestQueue<QueuedLookupRequest>, IConsumerGroupAssurance, IQueueDeliveryTracker, IQueueWorkSignal {
 
     private const string EnqueueBulkDeliveryScript = """
-        local messageId = redis.call(
-            'XADD', KEYS[1], '*', ARGV[1], ARGV[2], ARGV[3], ARGV[4])
-        if ARGV[6] == '1'
+        local outboxKey = ''
+        local tracksOutbox = ARGV[6] == '1'
             and redis.call('EXISTS', KEYS[3]) == 1
             and redis.call('HGET', KEYS[3], 'instanceToken') == ARGV[7]
-            and redis.call('HGET', KEYS[2], ARGV[8]) == ARGV[9] then
+            and redis.call('HGET', KEYS[2], ARGV[8]) == ARGV[9]
+        if tracksOutbox then outboxKey = KEYS[3] end
+        local messageId = redis.call(
+            'XADD', KEYS[1], '*', ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[17], outboxKey)
+        if tracksOutbox then
             redis.call('HSET', KEYS[3],
                 'payload', ARGV[2],
                 'targetStream', KEYS[1],
@@ -132,11 +135,8 @@ public sealed partial class SpotifyBulkQueueDecorator : IRequestQueue<QueuedLook
             string payload = JsonSerializer.Serialize( request, _jsonOptions );
             DateTimeOffset now = DateTimeOffset.UtcNow;
             bool trackOutbox = !string.IsNullOrWhiteSpace( request.SagaInstanceToken );
-            DateTimeOffset ordinaryRecovery = now.Add( RedisLookupDispatchOutbox.RedriveAfter );
-            long recoveryAt = (request.NotBefore > ordinaryRecovery
-                    ? request.NotBefore.Value
-                    : ordinaryRecovery)
-                .ToUnixTimeMilliseconds( );
+            long recoveryAt = RedisQueueDeliveryTransitions.GetRecoveryAtUnixMilliseconds(
+                request.NotBefore, now );
 
             IDatabase db = _redis.GetDatabase( );
             NameValueEntry[] fields = [
@@ -173,7 +173,8 @@ public sealed partial class SpotifyBulkQueueDecorator : IRequestQueue<QueuedLook
                     _bulkWorkSignalChannel,
                     ((int)request.EnqueueOrigin).ToString( CultureInfo.InvariantCulture ),
                     now.ToUnixTimeMilliseconds( ),
-                    recoveryAt
+                    recoveryAt,
+                    QueueFieldNames.DispatchOutboxKey
                 ] );
             RedisValue messageId = (RedisValue)enqueueResult;
             if (!messageId.HasValue) {
@@ -221,6 +222,14 @@ public sealed partial class SpotifyBulkQueueDecorator : IRequestQueue<QueuedLook
     /// <returns>A task that completes when the message is requeued.</returns>
     public Task RequeueAsync( string messageId, TimeSpan? delay = null, CancellationToken cancellationToken = default )
         => _inner.RequeueAsync( messageId, delay, cancellationToken );
+
+    /// <inheritdoc/>
+    public Task<DeliveryReplacementOutcome> ReplaceAsync(
+        string messageId,
+        QueuedLookupRequest replacement,
+        QueuePriority priority,
+        CancellationToken cancellationToken = default
+    ) => _inner.ReplaceAsync( messageId, replacement, priority, cancellationToken );
 
     /// <summary>Delegates to the inner queue to read current per-lane depths.</summary>
     /// <param name="cancellationToken">Token forwarded to the inner queue.</param>

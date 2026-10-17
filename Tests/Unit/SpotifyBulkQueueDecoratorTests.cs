@@ -472,9 +472,10 @@ public class SpotifyBulkQueueDecoratorTests {
     /// <param name="workChannel">Expected bulk work notification channel.</param>
     /// <returns>True when the argument count, channel, and tracking flag are correct.</returns>
     private static bool HasExpectedBulkArguments( RedisValue[]? arguments, string workChannel ) =>
-        arguments is { Length: 16 }
+        arguments is { Length: 17 }
         && arguments[4] == workChannel
-        && arguments[5] == "0";
+        && arguments[5] == "0"
+        && arguments[16] == QueueStreamFieldNames.DispatchOutboxKey;
 
     /// <summary>
     /// Builds a Spotify <c>QueuedLookupRequest</c> of the given type and value, with a fresh request

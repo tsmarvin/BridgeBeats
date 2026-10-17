@@ -123,7 +123,11 @@ public sealed partial class RedisLookupDispatchOutbox(
             redis.call('zrem', KEYS[5], KEYS[3])
             return false
         end
-        if redis.call('exists', KEYS[1]) == 0 or redis.call('hget', KEYS[1], ARGV[1]) ~= ARGV[2] then
+        local outboxToken = redis.call('hget', KEYS[3], 'instanceToken')
+        if outboxToken ~= ARGV[2] or redis.call('hget', KEYS[3], 'targetStream') ~= KEYS[6] then
+            return false
+        end
+        if redis.call('exists', KEYS[1]) == 0 or redis.call('hget', KEYS[1], ARGV[1]) ~= outboxToken then
             redis.call('del', KEYS[3])
             redis.call('zrem', KEYS[4], KEYS[3])
             redis.call('zrem', KEYS[5], KEYS[3])
@@ -137,7 +141,15 @@ public sealed partial class RedisLookupDispatchOutbox(
             redis.call('zrem', KEYS[5], KEYS[3])
             return false
         end
-        if redis.call('hget', KEYS[2], ARGV[3]) ~= ARGV[12] then
+        local dispatchState = redis.call('hget', KEYS[2], ARGV[3])
+        if dispatchState ~= ARGV[12] then
+            redis.call('zrem', KEYS[4], KEYS[3])
+            if dispatchState == ARGV[4] then
+                redis.call('zadd', KEYS[5], tonumber(ARGV[13]), KEYS[3])
+            else
+                redis.call('del', KEYS[3])
+                redis.call('zrem', KEYS[5], KEYS[3])
+            end
             return false
         end
         local payload = redis.call('hget', KEYS[3], 'payload')
@@ -147,7 +159,8 @@ public sealed partial class RedisLookupDispatchOutbox(
             redis.call('zrem', KEYS[5], KEYS[3])
             return false
         end
-        local messageId = redis.call('xadd', KEYS[6], '*', ARGV[5], payload, ARGV[6], ARGV[7])
+        local messageId = redis.call(
+            'xadd', KEYS[6], '*', ARGV[5], payload, ARGV[6], ARGV[7], ARGV[14], KEYS[3])
         redis.call('hset', KEYS[2], ARGV[3], ARGV[4], ARGV[10], ARGV[11])
         redis.call('hset', KEYS[3], '{{CurrentMessageIdField}}', messageId)
         redis.call('hdel', KEYS[3], '{{NotBeforeField}}')
@@ -164,7 +177,11 @@ public sealed partial class RedisLookupDispatchOutbox(
             redis.call('zrem', KEYS[4], KEYS[3])
             return false
         end
-        if redis.call('exists', KEYS[1]) == 0 or redis.call('hget', KEYS[1], ARGV[1]) ~= ARGV[2] then
+        local outboxToken = redis.call('hget', KEYS[3], 'instanceToken')
+        if outboxToken ~= ARGV[2] then
+            return false
+        end
+        if redis.call('exists', KEYS[1]) == 0 or redis.call('hget', KEYS[1], ARGV[1]) ~= outboxToken then
             redis.call('del', KEYS[3])
             redis.call('zrem', KEYS[4], KEYS[3])
             return false
@@ -180,6 +197,7 @@ public sealed partial class RedisLookupDispatchOutbox(
             return false
         end
         if redis.call('hget', KEYS[3], 'targetStream') ~= KEYS[5] then
+            redis.call('zadd', KEYS[4], tonumber(ARGV[12]), KEYS[3])
             return false
         end
         local currentMessageId = redis.call('hget', KEYS[3], '{{CurrentMessageIdField}}')
@@ -201,7 +219,8 @@ public sealed partial class RedisLookupDispatchOutbox(
             redis.call('zrem', KEYS[4], KEYS[3])
             return false
         end
-        local messageId = redis.call('xadd', KEYS[5], '*', ARGV[6], payload, ARGV[7], ARGV[8])
+        local messageId = redis.call(
+            'xadd', KEYS[5], '*', ARGV[6], payload, ARGV[7], ARGV[8], ARGV[13], KEYS[3])
         redis.call('hset', KEYS[2], ARGV[5], ARGV[9])
         redis.call('hset', KEYS[3], '{{CurrentMessageIdField}}', messageId)
         redis.call('hdel', KEYS[3], '{{NotBeforeField}}')
@@ -210,6 +229,104 @@ public sealed partial class RedisLookupDispatchOutbox(
         redis.call('zadd', KEYS[4], tonumber(ARGV[12]), KEYS[3])
         redis.call('publish', ARGV[11], messageId)
         return messageId
+        """;
+
+    private static readonly string s_promoteScript = $$"""
+        local count = tonumber(ARGV[1])
+        if redis.call('EXISTS', KEYS[1]) == 0
+            or redis.call('HGET', KEYS[1], '{{RedisSagaStateManager.FieldInstanceToken}}') ~= ARGV[2] then
+            return {0, 0}
+        end
+
+        redis.call('HSET', KEYS[1], '{{RedisSagaStateManager.FieldOriginPriority}}', ARGV[3])
+        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[8]))
+        local moved = 0
+
+        for i = 1, count do
+            local keyOffset = 3 + ((i - 1) * 3)
+            local argOffset = 9 + ((i - 1) * 2)
+            local providerKey = KEYS[keyOffset + 1]
+            local recoveryKey = KEYS[keyOffset + 2]
+            local interactiveStream = KEYS[keyOffset + 3]
+            local consumerGroup = ARGV[argOffset]
+            local workChannel = ARGV[argOffset + 1]
+
+            local complete = redis.call('HGET', providerKey, '{{RedisSagaStateManager.FieldIsComplete}}')
+            local recoveryToken = redis.call('HGET', recoveryKey, 'instanceToken')
+            if complete ~= 'True' and complete ~= 'true' and recoveryToken == ARGV[2] then
+                local payload = redis.call('HGET', recoveryKey, 'payload')
+                local payloadOk, request = pcall(cjson.decode, payload or '')
+                if payloadOk and type(request) == 'table' then
+                    request['originPriority'] = tonumber(ARGV[4])
+                    payload = cjson.encode(request)
+                    local dispatchState = redis.call('HGET', providerKey, '{{DispatchStateField}}')
+
+                    if dispatchState == '{{DispatchPending}}' then
+                        redis.call('HSET', recoveryKey,
+                            'payload', payload,
+                            'targetStream', interactiveStream,
+                            'workChannel', workChannel,
+                            'priority', ARGV[4])
+                        redis.call('ZADD', KEYS[2], tonumber(ARGV[6]), recoveryKey)
+                        redis.call('ZREM', KEYS[3], recoveryKey)
+                    elseif dispatchState == '{{DispatchPublished}}' then
+                        local currentMessageId = redis.call('HGET', recoveryKey, '{{CurrentMessageIdField}}')
+                        local sourceStream = redis.call('HGET', recoveryKey, 'targetStream')
+                        local claimed = false
+                        local currentExists = false
+
+                        if currentMessageId and sourceStream then
+                            local rangeOk, current = pcall(
+                                redis.call, 'XRANGE', sourceStream,
+                                currentMessageId, currentMessageId, 'COUNT', 1)
+                            if not rangeOk then
+                                claimed = true
+                            elseif #current > 0 then
+                                currentExists = true
+                                local pendingOk, pending = pcall(
+                                    redis.call, 'XPENDING', sourceStream, consumerGroup,
+                                    currentMessageId, currentMessageId, 1)
+                                if pendingOk and #pending > 0 then claimed = true end
+                            end
+                        end
+
+                        if sourceStream == interactiveStream and currentExists then
+                            local due = tonumber(ARGV[7])
+                            local notBefore = tonumber(redis.call('HGET', recoveryKey, '{{NotBeforeField}}') or '')
+                            if notBefore and notBefore > due then due = notBefore end
+                            redis.call('HSET', recoveryKey, 'payload', payload, 'priority', ARGV[4])
+                            redis.call('ZADD', KEYS[3], due, recoveryKey)
+                        elseif not claimed then
+                            local replacement = redis.call(
+                                'XADD', interactiveStream, '*',
+                                '{{QueueStreamFieldNames.Payload}}', payload,
+                                '{{QueueStreamFieldNames.EnqueuedAt}}', ARGV[5],
+                                '{{QueueStreamFieldNames.DispatchOutboxKey}}', recoveryKey)
+                            if currentExists then
+                                redis.call('XDEL', sourceStream, currentMessageId)
+                            end
+                            redis.call('HSET', recoveryKey,
+                                'payload', payload,
+                                'targetStream', interactiveStream,
+                                'workChannel', workChannel,
+                                'priority', ARGV[4],
+                                'currentMessageId', replacement,
+                                '{{DispatchPublishedAtField}}', ARGV[6])
+                            local due = tonumber(ARGV[7])
+                            local notBefore = tonumber(redis.call('HGET', recoveryKey, '{{NotBeforeField}}') or '')
+                            if notBefore and notBefore > due then due = notBefore end
+                            redis.call('ZREM', KEYS[2], recoveryKey)
+                            redis.call('ZADD', KEYS[3], due, recoveryKey)
+                            redis.call('PUBLISH', workChannel, replacement)
+                            moved = moved + 1
+                        end
+                    end
+                    redis.call('EXPIRE', providerKey, tonumber(ARGV[8]))
+                    redis.call('EXPIRE', recoveryKey, tonumber(ARGV[8]))
+                end
+            end
+        end
+        return {1, moved}
         """;
 
     private readonly IConnectionMultiplexer _redis = redis
@@ -362,6 +479,53 @@ public sealed partial class RedisLookupDispatchOutbox(
     }
 
     /// <inheritdoc/>
+    public async Task<bool> PromoteToInteractiveAsync(
+        string sagaId,
+        string instanceToken,
+        IReadOnlyCollection<SupportedProviders> pendingProviders,
+        CancellationToken cancellationToken = default
+    ) {
+        ArgumentException.ThrowIfNullOrWhiteSpace( sagaId );
+        ArgumentException.ThrowIfNullOrWhiteSpace( instanceToken );
+        ArgumentNullException.ThrowIfNull( pendingProviders );
+        cancellationToken.ThrowIfCancellationRequested( );
+
+        SupportedProviders[] providers = [.. pendingProviders.Distinct( )];
+        List<RedisKey> keys = [
+            RedisSagaStateManager.GetSagaKey( sagaId ),
+            PendingIndexKey,
+            PublishedRecoveryIndexKey
+        ];
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        long ttlSeconds = (long)TimeSpan.FromMinutes( _settings.JobExpirationMinutes ).TotalSeconds;
+        List<RedisValue> values = [
+            providers.Length,
+            instanceToken,
+            QueuePriority.Interactive.ToString( ),
+            ((int)QueuePriority.Interactive).ToString( CultureInfo.InvariantCulture ),
+            now.ToString( "O", CultureInfo.InvariantCulture ),
+            now.ToUnixTimeMilliseconds( ),
+            now.Add( RedriveAfter ).ToUnixTimeMilliseconds( ),
+            ttlSeconds
+        ];
+
+        foreach (SupportedProviders provider in providers) {
+            keys.Add( RedisSagaStateManager.GetProviderKey( sagaId, provider ) );
+            keys.Add( GetOutboxKey( sagaId, provider ) );
+            keys.Add( QueueStreamKeys.For( provider, QueuePriority.Interactive ) );
+            values.Add( provider == SupportedProviders.Spotify
+                ? SpotifyConstants.ConsumerGroup
+                : $"{provider.ToString( ).ToLowerInvariant( )}-workers" );
+            values.Add( QueueStreamKeys.WorkSignalFor( provider ) );
+        }
+
+        RedisResult result = await _redis.GetDatabase( ).ScriptEvaluateAsync(
+            s_promoteScript, [.. keys], [.. values] );
+        RedisResult[] outcome = (RedisResult[])result!;
+        return outcome.Length == 2 && (int)outcome[0] == 1;
+    }
+
+    /// <inheritdoc/>
     public async Task<int> DispatchPendingAsync( int limit, CancellationToken cancellationToken = default ) {
         if (limit <= 0) {
             throw new ArgumentOutOfRangeException( nameof( limit ) );
@@ -471,7 +635,8 @@ public sealed partial class RedisLookupDispatchOutbox(
                 DispatchPublishedAtField,
                 now.ToUnixTimeMilliseconds( ),
                 DispatchPending,
-                now.Add( RedriveAfter ).ToUnixTimeMilliseconds( )
+                now.Add( RedriveAfter ).ToUnixTimeMilliseconds( ),
+                QueueStreamFieldNames.DispatchOutboxKey
             ] );
         RedisValue messageId = (RedisValue)result;
         if (!messageId.HasValue) {
@@ -521,7 +686,8 @@ public sealed partial class RedisLookupDispatchOutbox(
                 now.ToUnixTimeMilliseconds( ),
                 ttlSeconds,
                 metadata.WorkChannel,
-                now.Add( RedriveAfter ).ToUnixTimeMilliseconds( )
+                now.Add( RedriveAfter ).ToUnixTimeMilliseconds( ),
+                QueueStreamFieldNames.DispatchOutboxKey
             ] );
         RedisValue messageId = (RedisValue)result;
         if (!messageId.HasValue) {

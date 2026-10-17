@@ -302,13 +302,14 @@ public sealed class WorkerEndpointContractIntegrationTests {
                 }
             } )
             .ReturnsAsync( true );
-        _ = queue.Setup( value => value.EnqueueAsync(
-                It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ) )
+        _ = queue.Setup( value => value.ReplaceAsync(
+                It.IsAny<string>( ), It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ) )
             .Callback( ( ) => {
                 if (expectedAction == "requeue") {
                     _ = terminalAction.TrySetResult( true );
                 }
-            } );
+            } )
+            .ReturnsAsync( DeliveryReplacementOutcome.Replaced );
         _ = queue.Setup( value => value.RequeueAsync(
                 It.IsAny<string>( ), It.IsAny<TimeSpan?>( ), It.IsAny<CancellationToken>( ) ) )
             .Callback( ( ) => { } );
@@ -340,7 +341,8 @@ public sealed class WorkerEndpointContractIntegrationTests {
                     It.IsAny<CancellationToken>( ) ), Times.Once );
                 break;
             case "requeue":
-                queue.Verify( value => value.EnqueueAsync(
+                queue.Verify( value => value.ReplaceAsync(
+                    "contract-message",
                     It.Is<QueuedLookupRequest>( value => value.AttemptCount == 0 && value.EnqueueOrigin == QueueEnqueueOrigin.Requeue ),
                     QueuePriority.Background, It.IsAny<CancellationToken>( ) ), Times.Once );
                 break;

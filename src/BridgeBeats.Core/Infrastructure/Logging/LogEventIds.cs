@@ -413,6 +413,11 @@ public static class LogEventIds {
             /// </summary>
             public const int RedisRequestQueueAgingIntervalMisconfigured = 1273;
 
+            /// <summary>
+            /// EventId for <see cref="RedisRequestQueue.LogRecoveryRecordMissing"/>.
+            /// </summary>
+            public const int RedisRequestQueueRecoveryRecordMissing = 1274;
+
             // RedisSagaStateManager (1300-1349)
 
             /// <summary>

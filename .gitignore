@@ -92,6 +92,7 @@ aspire-output/
 
 # Secrets directory
 secrets/
+keys/
 
 /data/
 .claude/

@@ -32,7 +32,7 @@ namespace BridgeBeats.Services.LinkResolver;
 /// <param name="cache">Repository checked first for a fresh cached result.</param>
 /// <param name="deduplicator">Coordinates concurrent identical lookups via an acquire/wait/signal protocol.</param>
 /// <param name="sagaManager">Creates and reads the durable saga that tracks the lookup across providers.</param>
-/// <param name="queueResolver">Resolves the per-provider request queue to enqueue work onto.</param>
+/// <param name="dispatchOutbox">Atomically stages, publishes, and promotes provider deliveries.</param>
 /// <param name="atProtoStorage">Reads stored partial/final results by their ATProto record URI.</param>
 /// <param name="enabledProviders">The set of providers a metadata/ISRC/UPC lookup fans out to.</param>
 /// <param name="logger">The logger for orchestration diagnostics.</param>
@@ -41,7 +41,7 @@ public sealed partial class LookupOrchestrator(
     IMediaLinkCacheRepository cache,
     IRequestDeduplicator deduplicator,
     ISagaStateManager sagaManager,
-    IProviderQueueResolver<QueuedLookupRequest> queueResolver,
+    ILookupDispatchOutbox dispatchOutbox,
     IATProtoStorageService atProtoStorage,
     HashSet<SupportedProviders> enabledProviders,
     ILogger<LookupOrchestrator> logger,
@@ -56,9 +56,9 @@ public sealed partial class LookupOrchestrator(
     /// <summary>Creates and reads the durable saga tracking the lookup across providers.</summary>
     private readonly ISagaStateManager _sagaManager = sagaManager
                                                     ?? throw new ArgumentNullException( nameof( sagaManager ) );
-    /// <summary>Resolves the per-provider request queue to enqueue work onto.</summary>
-    private readonly IProviderQueueResolver<QueuedLookupRequest> _queueResolver = queueResolver
-                                                                                ?? throw new ArgumentNullException( nameof( queueResolver ) );
+    /// <summary>Transactional outbox used for initial provider dispatch.</summary>
+    private readonly ILookupDispatchOutbox _dispatchOutbox = dispatchOutbox
+        ?? throw new ArgumentNullException( nameof( dispatchOutbox ) );
     /// <summary>Reads stored partial/final results by their ATProto record URI.</summary>
     private readonly IATProtoStorageService _atProtoStorage = atProtoStorage
                                                             ?? throw new ArgumentNullException( nameof( atProtoStorage ) );
@@ -349,14 +349,7 @@ public sealed partial class LookupOrchestrator(
             // and time budget (during a rate-limit window no publish would ever arrive)
             LookupSagaState? inFlightSaga = await _sagaManager.GetAsync( inFlightSagaId );
             if (inFlightSaga is not null) {
-                await PromotePendingSagaAsync(
-                    inFlightSaga,
-                    lookupType,
-                    lookupValue,
-                    isAlbum,
-                    title,
-                    artist,
-                    initialProvider );
+                await PromotePendingSagaAsync( inFlightSaga );
             }
             string? storedResultUri = inFlightSaga?.FinalResultUri ?? inFlightSaga?.PartialResultUri;
             if (!string.IsNullOrEmpty( storedResultUri )) {
@@ -366,6 +359,23 @@ public sealed partial class LookupOrchestrator(
 
             // Wait for the other instance to complete
             string? resultUri = await _deduplicator.WaitForCompletionAsync( lookupKey, waitTimeout );
+
+            if (resultUri == LookupConstants.StateChangedSentinel) {
+                TimeSpan remaining = deadline - DateTimeOffset.UtcNow;
+                if (remaining <= TimeSpan.Zero) {
+                    return new LookupResult { Result = null };
+                }
+                return await PerformLookupAsync(
+                    lookupKey,
+                    lookupType,
+                    lookupValue,
+                    cacheCheck,
+                    isAlbum,
+                    title,
+                    artist,
+                    initialProvider,
+                    remaining );
+            }
 
             // Check for rate-limited sentinel - return any stored partial data
             // alongside the rate-limit info instead of dropping it
@@ -377,6 +387,22 @@ public sealed partial class LookupOrchestrator(
                 // The published result may be partial (secondary lookups pending) -
                 // keep waiting for the final with the remaining time budget
                 return await WaitForFinalResultAsync( lookupKey, inFlightSagaId, resultUri, deadline );
+            }
+
+            // A publisher can complete after the first saga read but before this caller's
+            // subscription becomes active. Refresh durable saga state before treating a null
+            // notification as a timeout or no-result outcome.
+            LookupSagaState? completedSaga = await _sagaManager.GetAsync( inFlightSagaId );
+            string? completedResultUri = completedSaga?.FinalResultUri ?? completedSaga?.PartialResultUri;
+            if (!string.IsNullOrEmpty( completedResultUri )) {
+                return await WaitForFinalResultAsync(
+                    lookupKey,
+                    inFlightSagaId,
+                    completedResultUri,
+                    deadline );
+            }
+            if (GetActiveRateLimits( completedSaga ) is { Count: > 0 }) {
+                return await BuildRateLimitedPartialAsync( inFlightSagaId );
             }
 
             // Timeout or failure - check cache again, might have been populated.
@@ -392,9 +418,13 @@ public sealed partial class LookupOrchestrator(
             return new LookupResult { Result = null };
         }
 
+        bool releaseTerminal = false;
+        bool releaseForStateRecheck = false;
+        string? terminalResultUri = null;
+        string sagaId = ISagaStateManager.GenerateSagaId( lookupKey );
         try {
             // Create saga and queue initial lookup
-            return await CreateSagaAndQueueLookupAsync(
+            LookupResult result = await CreateSagaAndQueueLookupAsync(
                 lookupKey,
                 lookupType,
                 lookupValue,
@@ -404,65 +434,67 @@ public sealed partial class LookupOrchestrator(
                 initialProvider,
                 waitTimeout
             );
+            try {
+                LookupSagaState? releaseSaga = await _sagaManager.GetAsync( sagaId );
+                releaseTerminal = !string.IsNullOrEmpty( releaseSaga?.FinalResultUri )
+                    || releaseSaga is { IsComplete: true, IsPartial: false };
+                terminalResultUri = releaseSaga?.FinalResultUri ?? releaseSaga?.PartialResultUri;
+            } catch (Exception stateException) {
+                // A final state read is cleanup bookkeeping. Never replace a successfully resolved
+                // caller result with a Redis read failure; the bounded lease remains the fallback.
+                LogDedupReleaseStateReadError( _logger, stateException, lookupKey );
+            }
+            return result;
         } catch (Exception ex) {
             LogLookupError( _logger, ex, lookupKey );
-
-            // Release the lock on error
-            await _deduplicator.ReleaseAsync( lookupKey, null );
-
+            try {
+                LookupSagaState? failedSaga = await _sagaManager.GetAsync( sagaId );
+                releaseForStateRecheck = failedSaga is null || failedSaga.ProviderStates.Count == 0;
+            } catch (Exception stateException) {
+                LogDedupReleaseStateReadError( _logger, stateException, lookupKey );
+            }
             throw;
+        } finally {
+            // Pending sagas retain the bounded lease so a caller timeout cannot collapse the
+            // single-flight window. Only durable terminal state or a failure before any provider
+            // dispatch releases ownership.
+            if (!string.IsNullOrWhiteSpace( dedup.LeaseToken )) {
+                try {
+                    if (releaseTerminal) {
+                        _ = await _deduplicator.ReleaseOwnedAsync(
+                            lookupKey, dedup.LeaseToken, terminalResultUri );
+                    } else if (releaseForStateRecheck) {
+                        _ = await _deduplicator.ReleaseOwnedForStateRecheckAsync(
+                            lookupKey, dedup.LeaseToken );
+                    }
+                } catch (Exception releaseException) {
+                    // Cleanup failure must not replace a successful lookup result or mask the
+                    // original provider exception. The bounded Redis lease remains the fallback.
+                    LogDedupReleaseError( _logger, releaseException, lookupKey );
+                }
+            }
         }
     }
 
     /// <summary>
-    /// Atomically promotes an existing maintenance generation and publishes interactive copies of
-    /// its unfinished provider legs. Only the caller that changes the persisted priority publishes,
-    /// so concurrent manual lookups cannot create an interactive fan-out storm.
+    /// Atomically promotes an existing maintenance generation and moves each unclaimed unfinished
+    /// delivery to the interactive lane without duplicating work already owned by a worker.
     /// </summary>
-    private async Task PromotePendingSagaAsync(
-        LookupSagaState saga,
-        LookupRequestType lookupType,
-        string lookupValue,
-        bool isAlbum,
-        string? title,
-        string? artist,
-        SupportedProviders? initialProvider
-    ) {
-        if (string.IsNullOrWhiteSpace( saga.InstanceToken )
-            || !await _sagaManager.TryPromoteToInteractiveAsync( saga.SagaId, saga.InstanceToken )) {
+    private async Task PromotePendingSagaAsync( LookupSagaState saga ) {
+        if (string.IsNullOrWhiteSpace( saga.InstanceToken )) {
             return;
         }
-
-        IEnumerable<SupportedProviders> candidates = initialProvider.HasValue
-            ? [initialProvider.Value]
-            : _enabledProviders;
-        foreach (SupportedProviders provider in candidates) {
-            if (saga.ProviderStates.TryGetValue( provider, out ProviderLookupState? state ) && state.IsComplete) {
-                continue;
-            }
-
-            IRequestQueue<QueuedLookupRequest> queue = _queueResolver.GetQueue( provider );
-            await queue.EnqueueAsync( new QueuedLookupRequest {
-                RequestId = Guid.NewGuid( ).ToString( "N" ),
-                Provider = provider,
-                LookupType = lookupType,
-                LookupValue = lookupValue,
-                SagaId = saga.SagaId,
-                SagaInstanceToken = saga.InstanceToken,
-                IsAlbum = isAlbum,
-                Title = title,
-                Artist = artist,
-                OriginPriority = QueuePriority.Interactive
-            }, QueuePriority.Interactive );
-        }
+        _ = await _dispatchOutbox.PromoteToInteractiveAsync(
+            saga.SagaId,
+            saga.InstanceToken,
+            [.. saga.PendingProviders] );
     }
 
     /// <summary>
     /// Creates (or resumes) the saga for an acquired lookup and drives it to a result. Generates the
-    /// saga id from the lookup key, gets-or-creates the saga, and — if it already carries a stored
-    /// result — releases the dedup lock with that URI and waits for the final result. Otherwise it
-    /// initializes provider states (all enabled providers, or just the initial provider for
-    /// URL/provider-id lookups), enqueues the first provider's request at interactive priority, waits
+    /// saga id from the lookup key, gets-or-creates the saga, and resolves an already stored result
+    /// directly. Otherwise it atomically stages provider state and queue payloads in the dispatch
+    /// outbox, relays those entries to the interactive provider streams, waits
     /// up to the timeout for completion (honoring the rate-limited sentinel), and resolves the final
     /// or partial result by reading the saga and fetching the stored result from ATProto storage.
     /// </summary>
@@ -499,12 +531,6 @@ public sealed partial class LookupOrchestrator(
         if (!string.IsNullOrEmpty( knownResultUri )) {
             LogSagaResumedWithResult( _logger, sagaId );
 
-            // Release the just-acquired in-flight lock before waiting: this path enqueues
-            // no work, so nothing else would release it (the coordinator runs in another
-            // process and its release is ownership-checked). Publishing the known URI
-            // hands the stored result to callers already blocked in WaitForCompletionAsync.
-            await _deduplicator.ReleaseAsync( lookupKey, knownResultUri );
-
             return await WaitForFinalResultAsync( lookupKey, sagaId, knownResultUri, deadline );
         }
 
@@ -522,9 +548,8 @@ public sealed partial class LookupOrchestrator(
             ? [firstProvider]
             : [.. _enabledProviders];
 
-        if (string.IsNullOrWhiteSpace( saga.InstanceToken )
-            || !await _sagaManager.TryInitializeProviderStatesAsync( sagaId, providersToInitialize, saga.InstanceToken )) {
-            throw new InvalidOperationException( $"Saga instance was replaced before provider initialization for {sagaId}." );
+        if (string.IsNullOrWhiteSpace( saga.InstanceToken )) {
+            throw new InvalidOperationException( $"Saga instance is missing before provider dispatch for {sagaId}." );
         }
 
         // If we have an initial provider (from URL lookup), set it
@@ -536,12 +561,12 @@ public sealed partial class LookupOrchestrator(
 
         // Direct external-id lookups own one independent leg per enabled provider. URL lookups
         // intentionally start with only the URL's provider and let the coordinator derive
-        // secondary identifiers. When a maintenance saga is promoted, enqueue an interactive copy
-        // for every still-pending direct leg; the generation fence makes the old bulk copy stale
-        // after the first successful commit.
+        // secondary identifiers. Stage the complete expected provider set in one Redis transaction
+        // so the saga can never appear complete while a sibling leg is still unstaged.
         IReadOnlyList<SupportedProviders> providersToEnqueue = initialProvider.HasValue
             ? [firstProvider]
             : providersToInitialize;
+        List<QueuedLookupRequest> requestsToStage = [];
         foreach (SupportedProviders provider in providersToEnqueue) {
             bool providerMissing = !saga.ProviderStates.TryGetValue(
                 provider, out ProviderLookupState? queuedProviderState );
@@ -549,7 +574,7 @@ public sealed partial class LookupOrchestrator(
                 continue;
             }
 
-            QueuedLookupRequest request = new( ) {
+            requestsToStage.Add( new QueuedLookupRequest {
                 RequestId = Guid.NewGuid( ).ToString( "N" ),
                 Provider = provider,
                 LookupType = lookupType,
@@ -562,12 +587,40 @@ public sealed partial class LookupOrchestrator(
                 // Interactive origin is persisted into the saga so secondary lookups
                 // spawned by the coordinator inherit the caller's urgency
                 OriginPriority = QueuePriority.Interactive
-            };
+            } );
+        }
 
-            IRequestQueue<QueuedLookupRequest> queue = _queueResolver.GetQueue( provider );
-            await queue.EnqueueAsync( request, QueuePriority.Interactive );
+        IReadOnlyDictionary<SupportedProviders, ProviderDispatchStageOutcome> stageOutcomes =
+            requestsToStage.Count == 0
+                ? new Dictionary<SupportedProviders, ProviderDispatchStageOutcome>( )
+                : requestsToStage.Count == 1
+                    ? new Dictionary<SupportedProviders, ProviderDispatchStageOutcome> {
+                        [requestsToStage[0].Provider] = await _dispatchOutbox.StageAsync(
+                            requestsToStage[0], QueuePriority.Interactive )
+                    }
+                    : await _dispatchOutbox.StageBatchAsync(
+                        requestsToStage, QueuePriority.Interactive );
+        if (stageOutcomes.Values.Any(
+            outcome => outcome == ProviderDispatchStageOutcome.SagaInstanceMismatch )) {
+            throw new InvalidOperationException(
+                $"Saga instance was replaced before provider dispatch staging for {sagaId}." );
+        }
 
+        List<SupportedProviders> stagedProviders = [.. stageOutcomes
+            .Where( pair => pair.Value == ProviderDispatchStageOutcome.Staged )
+            .Select( pair => pair.Key )];
+        foreach (SupportedProviders provider in providersToEnqueue) {
             LogSagaCreated( _logger, sagaId, provider, lookupType, lookupValue );
+        }
+
+        // All expected legs and their outbox records are durable before any best-effort immediate
+        // relay. The hosted relay retries entries left behind by caller interruption.
+        foreach (SupportedProviders provider in stagedProviders) {
+            try {
+                _ = await _dispatchOutbox.DispatchAsync( sagaId, provider );
+            } catch (Exception dispatchException) {
+                LogOutboxImmediateDispatchError( _logger, dispatchException, sagaId, provider );
+            }
         }
 
         // Wait for initial result via deduplicator subscription
@@ -688,6 +741,10 @@ public sealed partial class LookupOrchestrator(
 
             if (nextUri == LookupConstants.RateLimitedSentinel) {
                 return await BuildRateLimitedPartialAsync( sagaId, result );
+            }
+
+            if (nextUri == LookupConstants.StateChangedSentinel) {
+                continue;
             }
 
             if (string.IsNullOrEmpty( nextUri )) {
@@ -827,7 +884,7 @@ public sealed partial class LookupOrchestrator(
         Message = "Request {LookupKey} already in-flight, waiting for completion" )]
     private static partial void LogRequestAlreadyInFlight( ILogger logger, string lookupKey );
 
-    /// <summary>Logs (Error) that performing a lookup failed; the dedup lock is released before rethrow.</summary>
+    /// <summary>Logs (Error) that performing a lookup failed.</summary>
     /// <param name="logger">The logger to write to.</param>
     /// <param name="ex">The exception raised during the lookup.</param>
     /// <param name="lookupKey">The lookup key that failed.</param>
@@ -836,6 +893,40 @@ public sealed partial class LookupOrchestrator(
         Level = LogLevel.Error,
         Message = "Error performing lookup for {LookupKey}" )]
     private static partial void LogLookupError( ILogger logger, Exception ex, string lookupKey );
+
+    /// <summary>Logs that caller-owned lease cleanup failed and the bounded TTL must recover it.</summary>
+    /// <param name="logger">The logger to write to.</param>
+    /// <param name="exception">The Redis cleanup failure.</param>
+    /// <param name="lookupKey">The lookup key whose lease remains bounded by its TTL.</param>
+    [LoggerMessage(
+        EventId = LogEventIds.Services.LinkResolver.OrchestratorDedupReleaseError,
+        Level = LogLevel.Error,
+        Message = "Failed to release caller-owned lookup lease for {LookupKey}; relying on lease expiration" )]
+    private static partial void LogDedupReleaseError(
+        ILogger logger,
+        Exception exception,
+        string lookupKey );
+
+    /// <summary>Logs that terminality could not be checked while handling a lookup failure.</summary>
+    [LoggerMessage(
+        EventId = LogEventIds.Services.LinkResolver.OrchestratorDedupReleaseStateReadError,
+        Level = LogLevel.Warning,
+        Message = "Failed to inspect saga state before releasing lookup lease for {LookupKey}; retaining the bounded lease" )]
+    private static partial void LogDedupReleaseStateReadError(
+        ILogger logger,
+        Exception exception,
+        string lookupKey );
+
+    /// <summary>Logs a failed best-effort relay; the durable outbox background relay will retry it.</summary>
+    [LoggerMessage(
+        EventId = LogEventIds.Services.LinkResolver.OrchestratorOutboxImmediateDispatchError,
+        Level = LogLevel.Warning,
+        Message = "Immediate lookup outbox relay failed for saga {SagaId}, provider {Provider}; background relay will retry" )]
+    private static partial void LogOutboxImmediateDispatchError(
+        ILogger logger,
+        Exception exception,
+        string sagaId,
+        SupportedProviders provider );
 
     /// <summary>Logs (Information) that a saga was created and the first provider's lookup queued.</summary>
     /// <param name="logger">The logger to write to.</param>

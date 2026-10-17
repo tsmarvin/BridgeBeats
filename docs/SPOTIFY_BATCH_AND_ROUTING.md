@@ -119,8 +119,10 @@ Redis streams are time-ordered, so the first entry is the oldest
 (`SpotifyBatchQueueHelper.GetOldestEnqueuedAtAsync`). A malformed `enqueuedAt` field is
 logged and treated as absent so a bad timestamp cannot wedge the age decision.
 
-A flush is also suppressed when the relevant bulk endpoint is rate-limited or the stream
-is in request-failure cooldown (see Reliability).
+A flush is also suppressed when the relevant bulk operation's in-process lane is rate-limited
+or the stream is in request-failure cooldown (see Reliability). The local lane distinction lets
+track and album batching recover independently; the shared Redis cooldown described below is
+provider-wide for Spotify data requests.
 
 ### The linger default and saga-TTL reconciliation
 
@@ -258,14 +260,23 @@ Active rate-limit discovery uses a per-provider sorted-set index rather than sca
 keyspace. A short in-process cache further removes repeated Redis reads from the hot dequeue path;
 set and clear operations invalidate it immediately.
 
+Spotify data-request limits are tracked as one provider-wide window because Spotify applies the
+relevant quota across endpoints. Authentication remains a distinct `auth` window. Tidal and Apple
+Music retain endpoint-level windows. The outbound HTTP handler owns publication of these shared
+Redis windows from `Retry-After`; queue and batch workers consume that common policy when deciding
+whether work is eligible.
+
 ### Requeue cap and finalization
 
-Requeue is bounded by `LookupConstants.MaxQueueRetryAttempts` (5), the same cap the generic
-queue processor enforces. `SpotifyBatchQueueHelper.RequeueAsync` handles replacement and
-terminal-discard paths separately:
+Ordinary request failures are bounded by `LookupConstants.MaxQueueRetryAttempts` (5), the same cap
+the generic queue processor enforces. Rate-limit requeues are deferrals rather than failed attempts:
+they preserve `AttemptCount` and remain bounded by the job's absolute
+`QueueSettings.JobExpirationMinutes` deadline. `SpotifyBatchQueueHelper.RequeueAsync` handles
+replacement and terminal-discard paths separately:
 
-- if the current attempt count is below the cap, it re-adds a fresh entry with a new
-  `enqueuedAt` and `AttemptCount + 1`. Once Redis accepts that replacement with `XADD`, the
+- for an ordinary retry below the cap, it re-adds a fresh entry with a new `enqueuedAt` and
+  `AttemptCount + 1`; for a rate-limit deferral, it keeps the current attempt count. Once Redis
+  accepts that replacement with `XADD`, the
   enqueue acceptance metric is incremented, then the original delivery is acknowledged and deleted
   (`XACK` + `XDEL`), and the helper returns `Requeued`;
 - if the cap is reached, or the payload cannot be deserialized to read its attempt count,
@@ -307,10 +318,11 @@ is also the boundary used by enqueue telemetry.
 
 The processor distinguishes three failure shapes when resolving a batch:
 
-- A rate limit (`RetryAfterExceededException`) records the endpoint rate limit, marks each
-  affected saga partial, merges a rate-limit info entry for Spotify into the saga, publishes
+- A rate limit (`RetryAfterExceededException`) has already caused the outbound HTTP handler to
+  record the provider-wide Spotify data cooldown. The processor marks each affected saga partial,
+  merges a rate-limit info entry for Spotify into the saga, publishes
   the `RATE_LIMITED` sentinel (`LookupConstants.RateLimitedSentinel`) so synchronous waiters
-  are not left hanging on a 429, and requeues the whole batch.
+  are not left hanging on a 429, and requeues the whole batch without consuming an attempt.
 - An empty result dictionary is treated as a request-level failure (network or auth error).
   No saga state is written; the whole batch is requeued and the stream's request-failure
   cooldown is armed.

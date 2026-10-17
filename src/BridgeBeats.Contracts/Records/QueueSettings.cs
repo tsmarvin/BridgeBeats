@@ -10,12 +10,32 @@ namespace BridgeBeats.Contracts.Records;
 /// </summary>
 public sealed record QueueSettings {
 
+    /// <summary>Default fallback delay for provider responses without retry metadata.</summary>
+    public static readonly TimeSpan DefaultRateLimitRetryAfter = TimeSpan.FromMinutes( 1 );
+
+    /// <summary>Default minimum durable rate-limit deferral.</summary>
+    public static readonly TimeSpan DefaultMinimumRateLimitRetryAfter = TimeSpan.FromSeconds( 5 );
+
+    /// <summary>Default upper bound for provider-controlled durable deferrals.</summary>
+    public static readonly TimeSpan DefaultMaximumRateLimitRetryAfter = TimeSpan.FromHours( 1 );
+
+    /// <summary>Default absolute job expiration in minutes.</summary>
+    public const int DefaultJobExpirationMinutes = 2880;
+
+    /// <summary>Fallback delay used when a 429 response omits <c>Retry-After</c>.</summary>
+    [JsonPropertyName( "rateLimitDefaultRetryAfter" )]
+    public TimeSpan RateLimitDefaultRetryAfter { get; init; } = DefaultRateLimitRetryAfter;
+
+    /// <summary>Minimum durable deferral applied to an expired or implausibly short retry window.</summary>
+    [JsonPropertyName( "rateLimitMinimumRetryAfter" )]
+    public TimeSpan RateLimitMinimumRetryAfter { get; init; } = DefaultMinimumRateLimitRetryAfter;
+
     /// <summary>
-    /// The threshold for re-queuing rate-limited requests. If a Retry-After value exceeds this
-    /// threshold, the request is queued for later processing. Defaults to 2 minutes.
+    /// Maximum provider-controlled delay that may be written to shared cooldown state or a queued
+    /// message. Longer provider values are retained only in diagnostics and clamped operationally.
     /// </summary>
-    [JsonPropertyName( "rateLimitRetryThreshold" )]
-    public TimeSpan RateLimitRetryThreshold { get; init; } = TimeSpan.FromMinutes( 2 );
+    [JsonPropertyName( "rateLimitMaximumRetryAfter" )]
+    public TimeSpan RateLimitMaximumRetryAfter { get; init; } = DefaultMaximumRateLimitRetryAfter;
 
     /// <summary>
     /// The number of minutes before an incomplete job or saga expires. Defaults to <c>2880</c>
@@ -29,7 +49,7 @@ public sealed record QueueSettings {
     /// for the trade-off.
     /// </remarks>
     [JsonPropertyName( "jobExpirationMinutes" )]
-    public int JobExpirationMinutes { get; init; } = 2880;
+    public int JobExpirationMinutes { get; init; } = DefaultJobExpirationMinutes;
 
     /// <summary>
     /// The total time budget (in seconds) an interactive caller waits for a complete lookup
@@ -106,5 +126,84 @@ public sealed record QueueSettings {
             ? value
             : DefaultProviderConcurrency;
         return Math.Clamp( configured, 1, 32 );
+    }
+
+    /// <summary>Returns whether a job has reached its absolute configured expiration.</summary>
+    public bool IsPastAbsoluteDeadline( DateTimeOffset createdAt, DateTimeOffset now ) =>
+        createdAt <= now
+        && now - createdAt >= TimeSpan.FromMinutes( JobExpirationMinutes );
+
+    /// <summary>Clamps a provider-controlled retry duration to the configured durable bounds.</summary>
+    public TimeSpan ClampRateLimitRetryAfter( TimeSpan requested ) {
+        TimeSpan minimumApplied = requested >= RateLimitMinimumRetryAfter
+            ? requested
+            : RateLimitMinimumRetryAfter;
+        return minimumApplied <= RateLimitMaximumRetryAfter
+            ? minimumApplied
+            : RateLimitMaximumRetryAfter;
+    }
+
+    /// <summary>
+    /// Converts a provider-controlled retry duration to an absolute instant while also respecting
+    /// the originating job's absolute deadline when supplied.
+    /// </summary>
+    public DateTimeOffset GetBoundedRateLimitRetryAfter(
+        DateTimeOffset now,
+        TimeSpan requested,
+        DateTimeOffset? createdAt = null
+    ) {
+        TimeSpan bounded = ClampRateLimitRetryAfter( requested );
+        DateTimeOffset maximumByConfiguration = now.Add( bounded );
+        if (createdAt is null || createdAt > now) {
+            return maximumByConfiguration;
+        }
+
+        TimeSpan jobLifetime = TimeSpan.FromMinutes( JobExpirationMinutes );
+        TimeSpan jobAge = now - createdAt.Value;
+        if (jobAge >= jobLifetime) {
+            return now;
+        }
+
+        TimeSpan remainingJobLifetime = jobLifetime - jobAge;
+        return remainingJobLifetime < bounded
+            ? now.Add( remainingJobLifetime )
+            : maximumByConfiguration;
+    }
+
+    /// <summary>
+    /// Applies only the configured upper bounds to a retry duration that was already admitted by a
+    /// provider boundary. This preserves a shared cooldown's remaining duration as it approaches
+    /// eligibility instead of reapplying <see cref="RateLimitMinimumRetryAfter"/>.
+    /// </summary>
+    /// <param name="now">The current time used as the duration's origin.</param>
+    /// <param name="requested">The already-established remaining cooldown duration.</param>
+    /// <param name="createdAt">Optional job creation time used to enforce its absolute deadline.</param>
+    /// <returns>The requested eligibility instant limited only by configured upper bounds.</returns>
+    public DateTimeOffset GetUpperBoundedRateLimitRetryAfter(
+        DateTimeOffset now,
+        TimeSpan requested,
+        DateTimeOffset? createdAt = null
+    ) {
+        TimeSpan upperBounded = requested <= RateLimitMaximumRetryAfter
+            ? requested
+            : RateLimitMaximumRetryAfter;
+        return BoundExistingRateLimitNotBefore( now, now.Add( upperBounded ), createdAt );
+    }
+
+    /// <summary>
+    /// Applies only upper bounds to an already-established absolute eligibility instant. Unlike
+    /// <see cref="GetBoundedRateLimitRetryAfter"/>, this never reapplies the minimum delay and
+    /// therefore cannot extend a deferral as it approaches eligibility.
+    /// </summary>
+    public DateTimeOffset BoundExistingRateLimitNotBefore(
+        DateTimeOffset now,
+        DateTimeOffset notBefore,
+        DateTimeOffset? createdAt = null
+    ) {
+        DateTimeOffset upperBound = GetBoundedRateLimitRetryAfter(
+            now,
+            RateLimitMaximumRetryAfter,
+            createdAt );
+        return notBefore <= upperBound ? notBefore : upperBound;
     }
 }

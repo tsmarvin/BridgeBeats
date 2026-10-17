@@ -127,6 +127,10 @@ public static class QueueMetrics {
     public static readonly Counter<long> SagaLifecycleTotal = Meter.CreateCounter<long>(
         "bridgebeats.queue.saga.lifecycle.total", unit: "{events}",
         description: "Total saga lifecycle and fencing outcomes" );
+    /// <summary>Counts successful lookup results that could not be persisted.</summary>
+    public static readonly Counter<long> ResultNotPersistedTotal = Meter.CreateCounter<long>(
+        "bridgebeats.queue.saga.result_not_persisted.total", unit: "{results}",
+        description: "Successful saga lookup results that could not be persisted" );
     /// <summary>Counts maintenance refresh selection and disposition outcomes.</summary>
     public static readonly Counter<long> MaintenanceOutcomeTotal = Meter.CreateCounter<long>(
         "bridgebeats.queue.refresh.outcome.total", unit: "{records}",
@@ -551,6 +555,11 @@ public static class QueueMetrics {
     public static void RecordSagaLifecycleOutcome( string outcome ) =>
         SagaLifecycleTotal.Add( 1,
             new KeyValuePair<string, object?>( QueueMetricTags.Outcome, outcome ) );
+
+    /// <summary>Records a successful saga result that could not be persisted.</summary>
+    public static void RecordResultNotPersisted( string reason ) =>
+        ResultNotPersistedTotal.Add( 1,
+            new KeyValuePair<string, object?>( "reason", reason ) );
 
     /// <summary>Records one maintenance record outcome.</summary>
     public static void RecordMaintenanceOutcome( string outcome, SupportedProviders? provider = null ) {

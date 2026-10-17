@@ -37,6 +37,34 @@ public class RedisRefreshReviewStoreTests {
         database.Verify( db => db.KeyDeleteAsync( "cache:refresh:attempts:saga", It.IsAny<CommandFlags>( ) ), Times.Once );
     }
 
+    /// <summary>Target-write retries use bookkeeping independent from maintenance sweep counts.</summary>
+    [TestMethod]
+    public async Task TargetWriteAttempts_IncrementThenClear( ) {
+        Mock<IConnectionMultiplexer> redis = new( );
+        Mock<IDatabase> database = new( );
+        _ = redis.Setup( c => c.GetDatabase( It.IsAny<int>( ), It.IsAny<object>( ) ) ).Returns( database.Object );
+        _ = database.Setup( db => db.ScriptEvaluateAsync(
+                It.IsAny<string>( ),
+                It.Is<RedisKey[]>( keys => keys.Single( ) == "cache:refresh:target-write-attempts:record" ),
+                It.IsAny<RedisValue[]>( ),
+                It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)1 ) );
+        _ = database.Setup( db => db.KeyDeleteAsync(
+                "cache:refresh:target-write-attempts:record", It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( true );
+        RedisRefreshReviewStore store = new(
+            redis.Object,
+            Options.Create( new QueueSettings { JobExpirationMinutes = 60 } ),
+            Mock.Of<ILogger<RedisRefreshReviewStore>>( ) );
+
+        Assert.AreEqual( 1, await store.IncrementTargetWriteAttemptAsync(
+            "record", TestContext.CancellationToken ) );
+        await store.ClearTargetWriteAttemptsAsync( "record", TestContext.CancellationToken );
+
+        database.Verify( db => db.KeyDeleteAsync(
+            "cache:refresh:target-write-attempts:record", It.IsAny<CommandFlags>( ) ), Times.Once );
+    }
+
     /// <summary>The review list deserializes entries and returns newest failures first.</summary>
     [TestMethod]
     public async Task GetUnresolved_ReturnsNewestFirst( ) {

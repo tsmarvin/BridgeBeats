@@ -2,7 +2,9 @@ using System.Net;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
+using BridgeBeats.Contracts.Exceptions;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Core.Infrastructure.Storage;
 using idunno.AtProto.Authentication;
@@ -175,6 +177,95 @@ public sealed class ATProtoStorageServiceDeleteTests : IDisposable {
         Assert.IsNull( _handler.LastRequestUri );
     }
 
+    /// <summary>A targeted update rejects malformed AT URIs before transport.</summary>
+    [TestMethod]
+    public async Task StoreAtUri_MalformedUri_RejectsBeforeTransport( ) {
+        _ = await Assert.ThrowsExactlyAsync<InvalidTargetRecordException>( ( ) =>
+            _service.StoreMediaLinkResultAtUriAsync(
+                CreateMediaLinkResult( ), "not-an-at-uri", CancellationToken.None ) );
+
+        Assert.IsNull( _handler.LastRequestUri );
+    }
+
+    /// <summary>A targeted update cannot overwrite a record in another collection.</summary>
+    [TestMethod]
+    public async Task StoreAtUri_WrongCollection_RejectsBeforeTransport( ) {
+        _ = await Assert.ThrowsExactlyAsync<InvalidTargetRecordException>( ( ) =>
+            _service.StoreMediaLinkResultAtUriAsync(
+                CreateMediaLinkResult( ),
+                $"at://{TestDid}/app.bsky.feed.post/track:USRC12345678",
+                CancellationToken.None ) );
+
+        Assert.IsNull( _handler.LastRequestUri );
+    }
+
+    /// <summary>A targeted update cannot overwrite a similarly keyed record in another repository.</summary>
+    [TestMethod]
+    public async Task StoreAtUri_DifferentRepository_RejectsBeforeTransport( ) {
+        _ = await Assert.ThrowsExactlyAsync<InvalidTargetRecordException>( ( ) =>
+            _service.StoreMediaLinkResultAtUriAsync(
+                CreateMediaLinkResult( ),
+                "at://did:plc:someoneelse/link.bridgebeats.lookup/track:USRC12345678",
+                CancellationToken.None ) );
+
+        Assert.IsNull( _handler.LastRequestUri );
+    }
+
+    /// <summary>A valid targeted update uses the source record key rather than regenerated identity.</summary>
+    [TestMethod]
+    public async Task StoreAtUri_OwnedMediaRecord_UpdatesExactRecordKey( ) {
+        _handler.ResponseStatus = HttpStatusCode.OK;
+        _handler.ResponseBody =
+            $"{{\"uri\":\"{RecordUri}\",\"cid\":\"{ExpectedCid}\",\"commit\":{{\"cid\":\"{ExpectedCid}\",\"rev\":\"3jzfcijpj2z2a\"}}}}";
+
+        string storedUri = await _service.StoreMediaLinkResultAtUriAsync(
+            CreateMediaLinkResult( ), RecordUri, CancellationToken.None );
+
+        Assert.AreEqual( RecordUri, storedUri );
+        Assert.AreEqual( "/xrpc/com.atproto.repo.putRecord", _handler.LastRequestUri?.AbsolutePath );
+        using JsonDocument body = JsonDocument.Parse( _handler.LastRequestBody! );
+        Assert.AreEqual( TestDid, body.RootElement.GetProperty( "repo" ).GetString( ) );
+        Assert.AreEqual( "link.bridgebeats.lookup", body.RootElement.GetProperty( "collection" ).GetString( ) );
+        Assert.AreEqual( "track:USRC12345678", body.RootElement.GetProperty( "rkey" ).GetString( ) );
+    }
+
+    /// <summary>A handle-form AT URI is accepted only after it resolves to the authenticated DID.</summary>
+    [TestMethod]
+    public async Task StoreAtUri_OwnedHandleAuthority_ResolvesAndUpdatesExactRecordKey( ) {
+        _handler.ResponseFactory = request => request.RequestUri?.AbsolutePath switch {
+            "/.well-known/atproto-did" => (
+                HttpStatusCode.OK,
+                TestDid),
+            "/xrpc/com.atproto.identity.resolveHandle" => (
+                HttpStatusCode.OK,
+                $"{{\"did\":\"{TestDid}\"}}"),
+            "/xrpc/com.atproto.repo.putRecord" => (
+                HttpStatusCode.OK,
+                $"{{\"uri\":\"{RecordUri}\",\"cid\":\"{ExpectedCid}\",\"commit\":{{\"cid\":\"{ExpectedCid}\",\"rev\":\"3jzfcijpj2z2a\"}}}}"),
+            _ => (HttpStatusCode.NotFound, "{}")
+        };
+
+        string storedUri = await _service.StoreMediaLinkResultAtUriAsync(
+            CreateMediaLinkResult( ),
+            "at://test.example/link.bridgebeats.lookup/track:USRC12345678",
+            CancellationToken.None );
+
+        Assert.AreEqual( RecordUri, storedUri );
+        Assert.AreEqual( "/xrpc/com.atproto.repo.putRecord", _handler.LastRequestUri?.AbsolutePath );
+    }
+
+    private static MediaLinkResult CreateMediaLinkResult( ) => new( ) {
+        Results = {
+            [SupportedProviders.Spotify] = new MusicLookupResult {
+                ExternalId = "DIFFERENT-ID",
+                Title = "Test Song",
+                Artist = "Test Artist",
+                URL = "https://open.spotify.com/track/test",
+                IsAlbum = false
+            }
+        }
+    };
+
     private static string CreateUnsignedJwt( string did ) {
         string header = Base64UrlEncode( "{\"alg\":\"none\",\"typ\":\"JWT\"}" );
         string payload = Base64UrlEncode( JsonSerializer.Serialize( new {
@@ -195,6 +286,7 @@ public sealed class ATProtoStorageServiceDeleteTests : IDisposable {
         public string ResponseBody { get; set; } = """
             {"did":"did:plc:testuser12345","handle":"test.example","active":true}
             """;
+        public Func<HttpRequestMessage, (HttpStatusCode Status, string Body)>? ResponseFactory { get; set; }
         public Uri? LastRequestUri { get; private set; }
         public string? LastRequestBody { get; private set; }
 
@@ -211,8 +303,10 @@ public sealed class ATProtoStorageServiceDeleteTests : IDisposable {
             LastRequestBody = request.Content is null
                 ? null
                 : await request.Content.ReadAsStringAsync( cancellationToken );
-            return new HttpResponseMessage( ResponseStatus ) {
-                Content = new StringContent( ResponseBody, Encoding.UTF8, "application/json" )
+            (HttpStatusCode status, string body) = ResponseFactory?.Invoke( request )
+                ?? (ResponseStatus, ResponseBody);
+            return new HttpResponseMessage( status ) {
+                Content = new StringContent( body, Encoding.UTF8, "application/json" )
             };
         }
     }

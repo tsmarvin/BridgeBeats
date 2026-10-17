@@ -1,5 +1,6 @@
 using System.Text.Json;
 using BridgeBeats.Contracts.Enums;
+using BridgeBeats.Contracts.Records;
 using BridgeBeats.Core.Domain.Extensions;
 using BridgeBeats.Core.Domain.Providers.Tidal;
 using BridgeBeats.Core.Infrastructure.Extensions;
@@ -72,6 +73,8 @@ public static class Program {
 
         // Add Redis client from Aspire (for queue processing)
         builder.AddRedisClient( "redis" );
+
+        _ = builder.Services.AddValidatedQueueSettings( builder.Configuration );
 
         // Read and validate credentials
         (string clientId, string clientSecret, int maxRetryAfterSeconds) = ValidateConfiguration( builder );

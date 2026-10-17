@@ -4,14 +4,14 @@ using BridgeBeats.Contracts.Records;
 namespace BridgeBeats.Contracts.Interfaces;
 
 /// <summary>
-/// Tracks per-provider, per-endpoint rate-limit windows: read the current state, mark an
-/// endpoint rate-limited until an instant, clear a limit, and list a provider's active limits.
+/// Tracks provider rate-limit windows at the provider's configured granularity: read the current
+/// state, mark a tracking key limited until an instant, clear it, and list active limits.
 /// </summary>
 /// <remarks>
 /// Implemented in <c>BridgeBeats.Core</c> by <c>RedisRateLimitTracker</c>
 /// (<c>Infrastructure/Queue/RedisRateLimitTracker.cs</c>), so state is shared across all service
-/// instances. Limits are tracked independently per provider-and-endpoint combination, so one
-/// endpoint can be blocked while others on the same provider stay available. The
+/// instances. Most providers retain endpoint-level independence. Spotify data endpoints currently
+/// collapse to a provider-wide tracking key while token acquisition remains independent. The
 /// <c>retryAfter</c> values are absolute instants ("retry no earlier than"), not durations.
 /// </remarks>
 public interface IRateLimitTracker {

@@ -6,6 +6,7 @@ using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Exceptions;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
+using BridgeBeats.Core.Domain.Providers.Common;
 using BridgeBeats.Core.Infrastructure.Logging;
 using BridgeBeats.Core.Infrastructure.Queue;
 using BridgeBeats.Core.Infrastructure.Utilities;
@@ -27,17 +28,19 @@ namespace BridgeBeats.Core.Domain.Services.Queue;
 /// completion, and acknowledges. A <see cref="ProviderRateLimitException"/> (including its
 /// <see cref="RetryAfterExceededException"/> subtype) marks the saga partial,
 /// merges this provider's rate-limit window, publishes the rate-limited sentinel, and re-enqueues on
-/// the origin lane (interactive requests remain interactive). Other exceptions retry up to
-/// <see cref="LookupConstants.MaxQueueRetryAttempts"/>, then move to the DLQ.
+/// the origin lane (interactive requests remain interactive). Circuits, timeouts, network failures,
+/// HTTP 408, and HTTP 5xx consume the bounded queue retry budget after the HTTP resilience pipeline
+/// finishes. Deterministic transport configuration failures and HTTP 404 responses terminate immediately.
 /// </remarks>
 public sealed partial class QueueProcessorBackgroundService : BackgroundService {
-    private sealed class PermanentRequestException( string message ) : Exception( message );
+    private sealed class PermanentRequestException( string message, Exception? innerException = null )
+        : Exception( message, innerException );
 
     /// <summary>The Redis connection used to publish saga and lookup completion events.</summary>
     private readonly IConnectionMultiplexer _redis;
     /// <summary>This provider's request queue, drained for work.</summary>
     private readonly IRequestQueue<QueuedLookupRequest> _queue;
-    /// <summary>Tracks per-provider, per-endpoint rate-limit windows.</summary>
+    /// <summary>Tracks provider and endpoint windows according to the shared rate-limit policy.</summary>
     private readonly IRateLimitTracker _rateLimitTracker;
     /// <summary>Reads and updates the durable saga state shared with the orchestrator.</summary>
     private readonly ISagaStateManager _sagaManager;
@@ -49,13 +52,13 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
     private readonly ILogger<QueueProcessorBackgroundService> _logger;
     /// <summary>Bound on simultaneous provider calls made by this worker.</summary>
     private readonly int _maxConcurrency;
+    /// <summary>Queue deferral settings shared with the HTTP rate-limit handler.</summary>
+    private readonly QueueSettings _settings;
     /// <summary>camelCase JSON options used to serialize provider results into saga state.</summary>
     private readonly JsonSerializerOptions _jsonOptions;
 
     /// <summary>Redis pub/sub channel announcing that a whole saga has completed.</summary>
     private const string SagaCompletedChannel = "saga:completed";
-    /// <summary>Prefix for the per-lookup Redis channel (<c>complete:{lookupKey}</c>) that wakes orchestrator waiters.</summary>
-    private const string LookupCompleteChannelPrefix = "complete:";
     /// <summary>Scheduled recovery event after an unexpected loop error (1 second).</summary>
     private static readonly TimeSpan s_errorDelay = TimeSpan.FromSeconds( 1 );
     private const int MaxAcknowledgementRecoveryAttempts = 4;
@@ -66,7 +69,7 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
     /// </summary>
     /// <param name="redis">The Redis connection used to publish completion events.</param>
     /// <param name="queue">This provider's request queue.</param>
-    /// <param name="rateLimitTracker">Tracker for per-provider, per-endpoint rate-limit windows.</param>
+    /// <param name="rateLimitTracker">Tracker for provider and endpoint windows defined by shared policy.</param>
     /// <param name="sagaManager">Manager for the shared, durable saga state.</param>
     /// <param name="lookupService">The provider lookup service that performs the actual API call.</param>
     /// <param name="provider">The provider this processor serves.</param>
@@ -90,7 +93,8 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
         _lookupService = lookupService ?? throw new ArgumentNullException( nameof( lookupService ) );
         _provider = provider;
         _logger = logger ?? throw new ArgumentNullException( nameof( logger ) );
-        _maxConcurrency = (settings ?? new QueueSettings( )).GetProviderConcurrency( provider );
+        _settings = settings ?? new QueueSettings( );
+        _maxConcurrency = _settings.GetProviderConcurrency( provider );
 
         _jsonOptions = new JsonSerializerOptions {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -397,21 +401,37 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
                 await QuarantineIdentityMismatchAsync( message, request, lookupKey, authoritativeSaga, ct );
                 return;
             }
+            if (_settings.IsPastAbsoluteDeadline( request.CreatedAt, DateTimeOffset.UtcNow )) {
+                status = "failure";
+                await HandlePermanentRequestExceptionAsync(
+                    message,
+                    request,
+                    new PermanentRequestException( "Lookup job expired before provider completion." ),
+                    instanceToken,
+                    ct );
+                return;
+            }
             if (!await _sagaManager.TryInitializeProviderStatesAsync( request.SagaId, [_provider], instanceToken, ct )) {
                 status = "stale";
                 await AcknowledgeStaleDeliveryAsync( message, ct );
                 return;
             }
 
-            // Check if the endpoint for this lookup type is rate-limited
-            string endpoint = request.LookupType.ToString( );
-            RateLimitState rateLimitState = await _rateLimitTracker.GetStateAsync( _provider, endpoint, ct );
+            // A requeued request carries the exact HTTP endpoint that deferred it. New work is
+            // admitted here and performs the authoritative shared-Redis check in the HTTP handler,
+            // once the concrete provider URI is known.
+            string? endpoint = ProviderRateLimitPolicy.GetAdmissionKey(
+                _provider,
+                request.RateLimitedEndpoint );
+            RateLimitState? rateLimitState = string.IsNullOrWhiteSpace( endpoint )
+                ? null
+                : await _rateLimitTracker.GetStateAsync( _provider, endpoint, ct );
 
-            if (rateLimitState.IsRateLimited) {
+            if (rateLimitState?.IsRateLimited == true) {
                 status = "rate_limited";
                 if (_logger.IsEnabled( LogLevel.Debug )) {
                     DateTimeOffset retryAfter = rateLimitState.RetryAfter.GetValueOrDefault( );
-                    LogEndpointRateLimited( _logger, endpoint, retryAfter, message.MessageId );
+                    LogEndpointRateLimited( _logger, endpoint!, retryAfter, message.MessageId );
                 }
 
                 // Requeue with delay until rate limit expires
@@ -492,6 +512,14 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
         } catch (QueueDeliveryIdentityQuarantineException) {
             status = "failure";
             throw;
+        } catch (HttpRequestException ex) when (IsPermanentTransportFailure( ex )) {
+            status = "failure";
+            await HandlePermanentRequestExceptionAsync(
+                message,
+                request,
+                new PermanentRequestException( "Provider transport configuration is invalid.", ex ),
+                instanceToken,
+                ct );
         } catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound) {
             status = "failure";
             await HandlePermanentRequestExceptionAsync(
@@ -521,6 +549,11 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
             QueueMetrics.RecordProcessingDuration( _provider, request.LookupType, status, stopwatch.Elapsed.TotalSeconds, message.Priority );
         }
     }
+
+    private static bool IsPermanentTransportFailure( HttpRequestException exception ) =>
+        exception.HttpRequestError is
+            HttpRequestError.UserAuthenticationError
+            or HttpRequestError.ConfigurationLimitExceeded;
 
     /// <summary>
     /// Dispatches a queued request to the matching method on the provider lookup service based on its
@@ -638,7 +671,7 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
     }
 
     /// <summary>
-    /// Handles a provider rate-limit hit: records the endpoint's retry window, marks the saga partial,
+    /// Handles a provider rate-limit hit: marks the saga partial with the endpoint retry window,
     /// merges this provider's rate-limit info into the saga (replacing any prior entry for it),
     /// publishes the rate-limited sentinel to wake waiters with a partial, then re-enqueues the
     /// request before acknowledging the current message. Interactive-origin work remains on the
@@ -657,16 +690,17 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
         string instanceToken,
         CancellationToken ct
     ) {
-        // Use the LookupRequestType as the endpoint identifier
-        string endpoint = request.LookupType.ToString( );
+        string endpoint = ProviderEndpointConstants.ResolveEffective(
+            ex.Endpoint,
+            request.RateLimitedEndpoint );
 
         LogRateLimitEncountered( _logger, _provider, endpoint, ex.RetryAfterValue );
 
-        // Record the rate limit state
         DateTimeOffset now = DateTimeOffset.UtcNow;
-        TimeSpan boundedRetry = TimeSpan.FromTicks( Math.Min( ex.RetryAfterValue.Ticks, (DateTimeOffset.MaxValue - now).Ticks ) );
-        DateTimeOffset retryAfter = now.Add( boundedRetry );
-        await _rateLimitTracker.SetRateLimitedAsync( _provider, endpoint, retryAfter, ct );
+        DateTimeOffset retryAfter = _settings.GetUpperBoundedRateLimitRetryAfter(
+            now,
+            ex.RetryAfterValue,
+            request.CreatedAt );
 
         // Mark saga as partial and record rate limit info for user notification
         if (!await _sagaManager.TrySetIsPartialAsync( request.SagaId, true, instanceToken, ct )) {
@@ -674,11 +708,9 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
             return;
         }
 
-        // Merge with rate limit info recorded by other providers so no entry is lost -
-        // the orchestrator's all-pending-providers-rate-limited escape hatch depends on
-        // every rate-limited provider being present. This is a read-modify-write (the
-        // saga manager has no atomic merge); a lost update under concurrent writes only
-        // degrades to the previous overwrite behavior.
+        // Supply the latest observed entries to the saga manager's token-guarded atomic
+        // merge. Its Lua script reconciles this snapshot with concurrent provider writes,
+        // preserving every provider needed by the all-pending-rate-limited escape hatch.
         LookupSagaState? sagaForRateLimit = await _sagaManager.GetAsync( request.SagaId, ct );
         List<ProviderRateLimitInfo> mergedRateLimitInfo = sagaForRateLimit?.RateLimitInfo is not null
             ? [.. sagaForRateLimit.RateLimitInfo.Where( r => r.Provider != _provider )]
@@ -696,8 +728,9 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
         // Requeue request - it will be skipped by rate-limit-aware dequeue until rate limit expires
         // The RateLimitedEndpoint field helps track which endpoint triggered the limit
         QueuedLookupRequest requeuedRequest = request with {
-            AttemptCount = request.AttemptCount + 1,
+            AttemptCount = request.AttemptCount,
             RateLimitedEndpoint = endpoint,
+            NotBefore = retryAfter,
             EnqueueOrigin = QueueEnqueueOrigin.Requeue,
             // Interactive typed-id work must remain on the single-item lane rather than being
             // intercepted by Spotify's bulk decorator after the rate-limit window.
@@ -706,11 +739,18 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
         };
 
         QueuePriority requeuePriority = request.OriginPriority;
-        await _queue.EnqueueAsync( requeuedRequest, requeuePriority, ct );
+        DeliveryReplacementOutcome replacementOutcome = await _queue.ReplaceAsync(
+            message.MessageId, requeuedRequest, requeuePriority, ct );
+        if (replacementOutcome == DeliveryReplacementOutcome.RecoveryRecordMissing) {
+            throw new InvalidOperationException(
+                $"Recovery record is missing for active delivery '{message.MessageId}'. The source was preserved." );
+        }
+        if (replacementOutcome != DeliveryReplacementOutcome.Replaced) {
+            return;
+        }
         if (requeuePriority == QueuePriority.Interactive) {
             QueueMetrics.RecordInteractiveRetry( _provider, endpoint );
         }
-        await _queue.AcknowledgeAsync( message.MessageId, ct );
 
         LogSagaMarkedPartial( _logger, request.SagaId, endpoint, _provider, retryAfter );
     }
@@ -895,7 +935,7 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
             // Empty publishes trigger the SagaCoordinator's pattern subscription
             // while WaitForCompletionAsync skips them and waits for a real result
             string resultUri = saga.PartialResultUri ?? saga.FinalResultUri ?? string.Empty;
-            string channel = $"{LookupCompleteChannelPrefix}{saga.LookupKey}";
+            string channel = $"{LookupConstants.CompletionChannelPrefix}{saga.LookupKey}";
             ISubscriber subscriber = _redis.GetSubscriber( );
             _ = await subscriber.PublishAsync( RedisChannel.Literal( channel ), resultUri );
 
@@ -924,7 +964,7 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
             }
 
             // Publish rate-limited sentinel so waiting clients know this is a partial result
-            string channel = $"{LookupCompleteChannelPrefix}{saga.LookupKey}";
+            string channel = $"{LookupConstants.CompletionChannelPrefix}{saga.LookupKey}";
             ISubscriber subscriber = _redis.GetSubscriber( );
             _ = await subscriber.PublishAsync( RedisChannel.Literal( channel ), LookupConstants.RateLimitedSentinel );
 

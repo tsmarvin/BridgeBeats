@@ -7,6 +7,7 @@ using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Exceptions;
 using BridgeBeats.Contracts.Interfaces;
+using BridgeBeats.Contracts.Records;
 using BridgeBeats.Core.Domain.Providers.AppleMusic;
 using BridgeBeats.Core.Domain.Providers.Common;
 using BridgeBeats.Core.Domain.Providers.Tidal;
@@ -354,10 +355,13 @@ public sealed class ProviderTrackGenreCachingTests {
         );
         _ = factory.Setup( item => item.CreateClient( "tidal-api" ) )
             .Returns( ( ) => {
-                TerminalProviderRateLimitHandler terminalRateLimitHandler = new( SupportedProviders.Tidal ) {
+                RetryAfterLimitHandler rateLimitHandler = new(
+                    120,
+                    new QueueSettings( ),
+                    NullLogger<RetryAfterLimitHandler>.Instance ) {
                     InnerHandler = apiHandler
                 };
-                return new HttpClient( terminalRateLimitHandler, disposeHandler: false ) {
+                return new HttpClient( rateLimitHandler, disposeHandler: false ) {
                     BaseAddress = new Uri( "https://openapi.tidal.com/v2/" )
                 };
             } );

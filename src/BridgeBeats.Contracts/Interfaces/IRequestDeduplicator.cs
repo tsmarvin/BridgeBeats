@@ -11,9 +11,10 @@ namespace BridgeBeats.Contracts.Interfaces;
 /// Implemented in <c>BridgeBeats.Core</c> by <c>RedisRequestDeduplicator</c>
 /// (<c>Infrastructure/Queue/RedisRequestDeduplicator.cs</c>), using distributed locking (Redis
 /// SETNX with a TTL) so the coordination holds across all service instances. The winning caller
-/// acquires via <see cref="TryAcquireAsync"/>, processes the request, then publishes the result
-/// AT-URI via <see cref="ReleaseAsync"/>; waiting callers receive that AT-URI from the wait
-/// methods.
+/// acquires via <see cref="TryAcquireAsync"/>, processes the request, then uses its unique token
+/// with <see cref="ReleaseOwnedAsync"/>. Saga coordinators that do not own the caller's lease use
+/// <see cref="ReleaseAsync"/> only to publish terminal state; waiting callers receive that state
+/// from the wait methods.
 /// </remarks>
 public interface IRequestDeduplicator {
     /// <summary>
@@ -31,14 +32,41 @@ public interface IRequestDeduplicator {
     Task<DeduplicationResult> TryAcquireAsync( string requestKey, TimeSpan timeout, CancellationToken cancellationToken = default );
 
     /// <summary>
-    /// Releases the single-flight lock for a request key and publishes its result so waiting
-    /// callers can pick it up.
+    /// Publishes saga completion for a request key so waiting callers can pick it up. This method
+    /// does not delete a caller-owned lease because the publisher cannot prove lease ownership.
     /// </summary>
-    /// <param name="requestKey">The key whose lock is released; must match the acquired key.</param>
+    /// <param name="requestKey">The key whose completion is published.</param>
     /// <param name="resultUri">The AT-URI (<c>at://…</c>) of the produced result, or <see langword="null"/> when the request produced no result (for example, it failed).</param>
     /// <param name="cancellationToken">Token used to cancel the operation.</param>
-    /// <returns>A task that completes when the lock has been released and any result published.</returns>
+    /// <returns>A task that completes when the result has been published.</returns>
     Task ReleaseAsync( string requestKey, string? resultUri, CancellationToken cancellationToken = default );
+
+    /// <summary>
+    /// Releases a caller-owned single-flight lease and publishes completion only when the supplied
+    /// acquisition token still owns the current lock.
+    /// </summary>
+    Task<bool> ReleaseOwnedAsync(
+        string requestKey,
+        string leaseToken,
+        string? resultUri,
+        CancellationToken cancellationToken = default );
+
+    /// <summary>
+    /// Releases a caller-owned lease without declaring terminal lookup completion. Waiting callers
+    /// are notified to re-read durable state and continue against their own deadlines.
+    /// </summary>
+    Task<bool> ReleaseOwnedForStateRecheckAsync(
+        string requestKey,
+        string leaseToken,
+        CancellationToken cancellationToken = default );
+
+    /// <summary>
+    /// Publishes that lookup succeeded but its result could not be persisted to an accepted durable
+    /// target. It does not delete a caller-owned lease.
+    /// </summary>
+    Task ReleaseResultNotPersistedAsync(
+        string requestKey,
+        CancellationToken cancellationToken = default );
 
     /// <summary>
     /// Waits for the in-flight processor of a request key to publish a result.

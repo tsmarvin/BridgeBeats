@@ -36,6 +36,10 @@ public class SpotifyBulkQueueDecoratorTests {
     private const string BulkTrackIdStream = "queue:spotify:bulk:track-id";
     /// <summary>Redis stream key for bulk Spotify album-id lookups.</summary>
     private const string BulkAlbumIdStream = "queue:spotify:bulk:album-id";
+    /// <summary>Redis sorted set containing staged deliveries that are ready to publish.</summary>
+    private const string PendingOutboxIndex = "outbox:lookup-dispatch:pending-due";
+    /// <summary>Redis sorted set containing published deliveries awaiting recovery or completion.</summary>
+    private const string PublishedRecoveryIndex = "outbox:lookup-dispatch:published-recovery-due";
 
     /// <summary>
     /// Serialization options (camel-case, non-indented) used to deserialize the captured
@@ -134,7 +138,7 @@ public class SpotifyBulkQueueDecoratorTests {
         _databaseMock.Verify(
             d => d.ScriptEvaluateAsync(
                 It.IsAny<string>( ),
-                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == BulkTrackIdStream ),
+                It.Is<RedisKey[]?>( keys => HasExpectedBulkKeys( keys, BulkTrackIdStream ) ),
                 It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ),
             Times.Once
@@ -163,12 +167,12 @@ public class SpotifyBulkQueueDecoratorTests {
 
         _databaseMock.Verify( database => database.ScriptEvaluateAsync(
             It.IsAny<string>( ),
-            It.Is<RedisKey[]?>( keys => keys != null
-                && keys.Length == 1
-                && keys[0] == "queue:isolated:spotify:bulk:track-id" ),
-            It.Is<RedisValue[]?>( arguments => arguments != null
-                && arguments.Length == 5
-                && arguments[4] == "queue:isolated:spotify:bulk:work" ),
+            It.Is<RedisKey[]?>( keys => HasExpectedBulkKeys(
+                keys,
+                "queue:isolated:spotify:bulk:track-id" ) ),
+            It.Is<RedisValue[]?>( arguments => HasExpectedBulkArguments(
+                arguments,
+                "queue:isolated:spotify:bulk:work" ) ),
             It.IsAny<CommandFlags>( ) ), Times.Once );
         _databaseMock.Verify( database => database.ScriptEvaluateAsync(
             It.IsAny<string>( ),
@@ -194,7 +198,7 @@ public class SpotifyBulkQueueDecoratorTests {
         _databaseMock.Verify(
             d => d.ScriptEvaluateAsync(
                 It.IsAny<string>( ),
-                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == BulkAlbumIdStream ),
+                It.Is<RedisKey[]?>( keys => HasExpectedBulkKeys( keys, BulkAlbumIdStream ) ),
                 It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ),
             Times.Once
@@ -339,7 +343,7 @@ public class SpotifyBulkQueueDecoratorTests {
         _databaseMock.Verify(
             d => d.ScriptEvaluateAsync(
                 It.IsAny<string>( ),
-                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == BulkTrackIdStream ),
+                It.Is<RedisKey[]?>( keys => HasExpectedBulkKeys( keys, BulkTrackIdStream ) ),
                 It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ),
             Times.Once
@@ -368,7 +372,7 @@ public class SpotifyBulkQueueDecoratorTests {
         _databaseMock.Verify(
             d => d.ScriptEvaluateAsync(
                 It.IsAny<string>( ),
-                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == BulkAlbumIdStream ),
+                It.Is<RedisKey[]?>( keys => HasExpectedBulkKeys( keys, BulkAlbumIdStream ) ),
                 It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ),
             Times.Once
@@ -450,6 +454,28 @@ public class SpotifyBulkQueueDecoratorTests {
     #endregion
 
     #region Helpers
+
+    /// <summary>Checks the complete Redis key contract for an untracked bulk delivery.</summary>
+    /// <param name="keys">Keys supplied to the atomic enqueue script.</param>
+    /// <param name="stream">Expected bulk stream.</param>
+    /// <returns>True when the bulk and outbox keys match the expected contract.</returns>
+    private static bool HasExpectedBulkKeys( RedisKey[]? keys, string stream ) =>
+        keys is { Length: 5 }
+        && keys[0] == stream
+        && keys[1] == stream
+        && keys[2] == stream
+        && keys[3] == PendingOutboxIndex
+        && keys[4] == PublishedRecoveryIndex;
+
+    /// <summary>Checks the argument contract for an untracked bulk delivery.</summary>
+    /// <param name="arguments">Arguments supplied to the atomic enqueue script.</param>
+    /// <param name="workChannel">Expected bulk work notification channel.</param>
+    /// <returns>True when the argument count, channel, and tracking flag are correct.</returns>
+    private static bool HasExpectedBulkArguments( RedisValue[]? arguments, string workChannel ) =>
+        arguments is { Length: 17 }
+        && arguments[4] == workChannel
+        && arguments[5] == "0"
+        && arguments[16] == QueueStreamFieldNames.DispatchOutboxKey;
 
     /// <summary>
     /// Builds a Spotify <c>QueuedLookupRequest</c> of the given type and value, with a fresh request

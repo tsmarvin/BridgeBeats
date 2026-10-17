@@ -1,6 +1,10 @@
 using System.Text.Json;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Records;
+using BridgeBeats.Core.Domain.Extensions;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 
 namespace BridgeBeats.Tests.Unit;
 
@@ -588,9 +592,8 @@ public class QueueContractsTests {
     #region QueueSettings Tests
 
     /// <summary>
-    /// A default <see cref="QueueSettings"/> carries the expected defaults: a 2-minute
-    /// rate-limit retry threshold, a 2880-minute (48-hour) job expiration, and a non-null
-    /// <see cref="PriorityWeights"/>.
+    /// A default <see cref="QueueSettings"/> carries the expected 2880-minute (48-hour) job
+    /// expiration and a non-null <see cref="PriorityWeights"/>.
     /// </summary>
     [TestMethod]
     public void QueueSettings_HasExpectedDefaults( ) {
@@ -598,20 +601,35 @@ public class QueueContractsTests {
         QueueSettings settings = new( );
 
         // Assert
-        Assert.AreEqual( TimeSpan.FromMinutes( 2 ), settings.RateLimitRetryThreshold );
+        Assert.AreEqual( TimeSpan.FromMinutes( 1 ), settings.RateLimitDefaultRetryAfter );
+        Assert.AreEqual( TimeSpan.FromSeconds( 5 ), settings.RateLimitMinimumRetryAfter );
+        Assert.AreEqual( TimeSpan.FromHours( 1 ), settings.RateLimitMaximumRetryAfter );
         Assert.AreEqual( 2880, settings.JobExpirationMinutes );
         Assert.IsNotNull( settings.Weights );
     }
 
+    /// <summary>Absolute expiration uses one supplied clock instant and ignores future creation times.</summary>
+    [TestMethod]
+    public void QueueSettings_IsPastAbsoluteDeadline_UsesConfiguredLifetime( ) {
+        QueueSettings settings = new( ) { JobExpirationMinutes = 60 };
+        DateTimeOffset now = DateTimeOffset.Parse( "2026-08-09T12:00:00Z" );
+
+        Assert.IsTrue( settings.IsPastAbsoluteDeadline( now.AddMinutes( -60 ), now ) );
+        Assert.IsFalse( settings.IsPastAbsoluteDeadline( now.AddMinutes( -59 ), now ) );
+        Assert.IsFalse( settings.IsPastAbsoluteDeadline( now.AddMinutes( 1 ), now ) );
+    }
+
     /// <summary>
     /// A customized <see cref="QueueSettings"/> (including its nested <see cref="PriorityWeights"/>)
-    /// survives a JSON serialize/deserialize round trip, preserving threshold, expiration, and weights.
+    /// survives a JSON serialize/deserialize round trip, preserving expiration and weights.
     /// </summary>
     [TestMethod]
     public void QueueSettings_Serialization_RoundTripsCorrectly( ) {
         // Arrange
         QueueSettings original = new( ) {
-            RateLimitRetryThreshold = TimeSpan.FromMinutes( 5 ),
+            RateLimitDefaultRetryAfter = TimeSpan.FromMinutes( 3 ),
+            RateLimitMinimumRetryAfter = TimeSpan.FromSeconds( 15 ),
+            RateLimitMaximumRetryAfter = TimeSpan.FromMinutes( 30 ),
             JobExpirationMinutes = 120,
             Weights = new PriorityWeights {
                 Interactive = 10,
@@ -626,12 +644,123 @@ public class QueueContractsTests {
 
         // Assert
         Assert.IsNotNull( deserialized );
-        Assert.AreEqual( original.RateLimitRetryThreshold, deserialized.RateLimitRetryThreshold );
+        Assert.AreEqual( original.RateLimitDefaultRetryAfter, deserialized.RateLimitDefaultRetryAfter );
+        Assert.AreEqual( original.RateLimitMinimumRetryAfter, deserialized.RateLimitMinimumRetryAfter );
+        Assert.AreEqual( original.RateLimitMaximumRetryAfter, deserialized.RateLimitMaximumRetryAfter );
         Assert.AreEqual( original.JobExpirationMinutes, deserialized.JobExpirationMinutes );
         Assert.AreEqual( original.Weights.Interactive, deserialized.Weights.Interactive );
         Assert.AreEqual( original.Weights.Background, deserialized.Weights.Background );
         Assert.AreEqual( original.Weights.Bulk, deserialized.Weights.Bulk );
     }
+
+    /// <summary>Invalid durable-queue timing combinations are rejected by shared validation.</summary>
+    [TestMethod]
+    [DataRow( "0", "00:01:00", "00:00:05", "01:00:00" )]
+    [DataRow( "120", "00:01:00", "00:00:00", "01:00:00" )]
+    [DataRow( "120", "00:00:04", "00:00:05", "01:00:00" )]
+    [DataRow( "120", "00:10:00", "00:00:05", "00:09:59" )]
+    [DataRow( "30", "00:01:00", "00:00:05", "01:00:00" )]
+    public void QueueSettings_InvalidTimingConfiguration_ShouldFailValidation(
+        string expirationMinutes,
+        string defaultRetryAfter,
+        string minimumRetryAfter,
+        string maximumRetryAfter
+    ) {
+        IConfiguration configuration = BuildQueueConfiguration(
+            expirationMinutes, defaultRetryAfter, minimumRetryAfter, maximumRetryAfter );
+        ServiceCollection services = new( );
+        _ = services.AddValidatedQueueSettings( configuration );
+        using ServiceProvider provider = services.BuildServiceProvider( );
+
+        _ = Assert.ThrowsExactly<OptionsValidationException>( ( ) =>
+            _ = provider.GetRequiredService<IOptions<QueueSettings>>( ).Value );
+    }
+
+    /// <summary>A valid override binds all shared queue timing values.</summary>
+    [TestMethod]
+    public void QueueSettings_ValidTimingConfiguration_ShouldBindOverrides( ) {
+        IConfiguration configuration = BuildQueueConfiguration(
+            "90", "00:02:00", "00:00:10", "00:45:00" );
+        ServiceCollection services = new( );
+        _ = services.AddValidatedQueueSettings( configuration );
+        using ServiceProvider provider = services.BuildServiceProvider( );
+
+        QueueSettings settings = provider.GetRequiredService<IOptions<QueueSettings>>( ).Value;
+
+        Assert.AreEqual( 90, settings.JobExpirationMinutes );
+        Assert.AreEqual( TimeSpan.FromMinutes( 2 ), settings.RateLimitDefaultRetryAfter );
+        Assert.AreEqual( TimeSpan.FromSeconds( 10 ), settings.RateLimitMinimumRetryAfter );
+        Assert.AreEqual( TimeSpan.FromMinutes( 45 ), settings.RateLimitMaximumRetryAfter );
+    }
+
+    /// <summary>Provider retry envelopes are bounded by both the configured maximum and job lifetime.</summary>
+    [TestMethod]
+    public void QueueSettings_GetBoundedRateLimitRetryAfter_ClampsDurableDeadline( ) {
+        QueueSettings settings = new( ) {
+            RateLimitMaximumRetryAfter = TimeSpan.FromHours( 1 ),
+            JobExpirationMinutes = 120
+        };
+        DateTimeOffset now = DateTimeOffset.Parse( "2026-08-09T12:00:00Z" );
+
+        Assert.AreEqual( now.AddHours( 1 ),
+            settings.GetBoundedRateLimitRetryAfter( now, TimeSpan.MaxValue ) );
+        Assert.AreEqual( now.AddMinutes( 15 ),
+            settings.GetBoundedRateLimitRetryAfter(
+                now, TimeSpan.MaxValue, now.AddMinutes( -105 ) ) );
+        Assert.AreEqual( now,
+            settings.GetBoundedRateLimitRetryAfter(
+                now, TimeSpan.MaxValue, now.AddMinutes( -120 ) ) );
+    }
+
+    /// <summary>Rechecking an existing deferral applies upper bounds without extending it.</summary>
+    [TestMethod]
+    public void QueueSettings_BoundExistingRateLimitNotBefore_DoesNotReapplyMinimum( ) {
+        QueueSettings settings = new( ) {
+            RateLimitMinimumRetryAfter = TimeSpan.FromSeconds( 5 ),
+            RateLimitMaximumRetryAfter = TimeSpan.FromHours( 1 ),
+            JobExpirationMinutes = 120
+        };
+        DateTimeOffset now = DateTimeOffset.Parse( "2026-08-09T12:00:00Z" );
+
+        Assert.AreEqual(
+            now.AddSeconds( 2 ),
+            settings.BoundExistingRateLimitNotBefore(
+                now, now.AddSeconds( 2 ), now.AddMinutes( -10 ) ) );
+        Assert.AreEqual(
+            now.AddMinutes( 1 ),
+            settings.BoundExistingRateLimitNotBefore(
+                now, now.AddHours( 1 ), now.AddMinutes( -119 ) ) );
+    }
+
+    /// <summary>An already-admitted remaining duration is not raised back to the configured minimum.</summary>
+    [TestMethod]
+    public void QueueSettings_GetUpperBoundedRateLimitRetryAfter_DoesNotReapplyMinimum( ) {
+        QueueSettings settings = new( ) {
+            RateLimitMinimumRetryAfter = TimeSpan.FromSeconds( 5 ),
+            RateLimitMaximumRetryAfter = TimeSpan.FromHours( 1 ),
+            JobExpirationMinutes = 120
+        };
+        DateTimeOffset now = DateTimeOffset.Parse( "2026-08-09T12:00:00Z" );
+
+        Assert.AreEqual(
+            now.AddSeconds( 1 ),
+            settings.GetUpperBoundedRateLimitRetryAfter(
+                now, TimeSpan.FromSeconds( 1 ), now.AddMinutes( -10 ) ) );
+    }
+
+    private static IConfiguration BuildQueueConfiguration(
+        string expirationMinutes,
+        string defaultRetryAfter,
+        string minimumRetryAfter,
+        string maximumRetryAfter
+    ) => new ConfigurationBuilder( )
+        .AddInMemoryCollection( new Dictionary<string, string?> {
+            ["BridgeBeats:Queue:JobExpirationMinutes"] = expirationMinutes,
+            ["BridgeBeats:Queue:RateLimitDefaultRetryAfter"] = defaultRetryAfter,
+            ["BridgeBeats:Queue:RateLimitMinimumRetryAfter"] = minimumRetryAfter,
+            ["BridgeBeats:Queue:RateLimitMaximumRetryAfter"] = maximumRetryAfter
+        } )
+        .Build( );
 
     #endregion
 

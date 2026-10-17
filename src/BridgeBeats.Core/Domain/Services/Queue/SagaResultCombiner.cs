@@ -2,6 +2,7 @@ using System.Text.Json;
 using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Records;
+using BridgeBeats.Core.Domain.Services;
 using BridgeBeats.Core.Infrastructure.Logging;
 
 namespace BridgeBeats.Core.Domain.Services.Queue;
@@ -69,7 +70,11 @@ public sealed partial class SagaResultCombiner {
                 );
 
                 if (result is not null) {
-                    successfulResults.Add( (provider, result) );
+                    if (MediaLookupResultIdentity.IsPersistable( result )) {
+                        successfulResults.Add( (provider, result) );
+                    } else {
+                        LogNonPersistableResultSkipped( _logger, provider, saga.SagaId );
+                    }
                 }
             } catch (JsonException ex) {
                 LogDeserializeResultFailed( _logger, ex, provider, saga.SagaId );
@@ -183,6 +188,16 @@ public sealed partial class SagaResultCombiner {
         Level = LogLevel.Debug,
         Message = "Combined {Count} provider results for saga {SagaId}" )]
     private static partial void LogCombinedResults( ILogger logger, int count, string sagaId );
+
+    /// <summary>Logs that a nominally successful provider result had no durable identity.</summary>
+    [LoggerMessage(
+        EventId = LogEventIds.Services.Queue.NonPersistableResultSkipped,
+        Level = LogLevel.Warning,
+        Message = "Skipping non-persistable successful result for provider {Provider} in saga {SagaId}" )]
+    private static partial void LogNonPersistableResultSkipped(
+        ILogger logger,
+        SupportedProviders provider,
+        string sagaId );
 
     #endregion LoggerMessage Definitions
 }

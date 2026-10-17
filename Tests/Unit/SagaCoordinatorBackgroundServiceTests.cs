@@ -1,5 +1,6 @@
 using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
+using BridgeBeats.Contracts.Exceptions;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
 using BridgeBeats.Core.Domain.Services.Queue;
@@ -30,7 +31,7 @@ public class SagaCoordinatorBackgroundServiceTests {
     /// <summary>Mock saga state manager the service reads and updates.</summary>
     private Mock<ISagaStateManager> _sagaManagerMock = null!;
     /// <summary>Mock AT Protocol storage used to assert final and partial record writes.</summary>
-    private Mock<IATProtoStorageService> _atProtoStorageMock = null!;
+    private Mock<ITargetedATProtoStorageService> _atProtoStorageMock = null!;
     /// <summary>Mock cache repository for result caching and cached-by-ISRC lookups.</summary>
     private Mock<IMediaLinkCacheRepository> _cacheRepositoryMock = null!;
     /// <summary>Mock request deduplicator the service releases on finalization.</summary>
@@ -39,8 +40,16 @@ public class SagaCoordinatorBackgroundServiceTests {
     private Mock<ILogger<SagaResultCombiner>> _combinerLoggerMock = null!;
     /// <summary>Real result combiner the service uses to merge provider results.</summary>
     private SagaResultCombiner _resultCombiner = null!;
-    /// <summary>Mock provider-queue resolver used to assert secondary-lookup enqueues.</summary>
+    /// <summary>Mock provider-queue resolver used by the outbox adapter in enqueue assertions.</summary>
     private Mock<IProviderQueueResolver<QueuedLookupRequest>> _queueResolverMock = null!;
+    /// <summary>Mock durable dispatch outbox used to stage and relay secondary lookups.</summary>
+    private Mock<ILookupDispatchOutbox> _dispatchOutboxMock = null!;
+    /// <summary>Requests retained by the test outbox until its immediate relay runs.</summary>
+    private System.Collections.Concurrent.ConcurrentDictionary<SupportedProviders, QueuedLookupRequest>
+        _stagedRequests = null!;
+    /// <summary>Effective routing priority retained with each staged request.</summary>
+    private System.Collections.Concurrent.ConcurrentDictionary<SupportedProviders, QueuePriority>
+        _stagedPriorities = null!;
     /// <summary>The set of enabled providers (Spotify, Apple Music, Tidal) the service considers.</summary>
     private HashSet<SupportedProviders> _enabledProviders = null!;
     /// <summary>Mock logger for the background service.</summary>
@@ -67,15 +76,57 @@ public class SagaCoordinatorBackgroundServiceTests {
         _redisMock = new Mock<IConnectionMultiplexer>( );
         _subscriberMock = new Mock<ISubscriber>( );
         _sagaManagerMock = new Mock<ISagaStateManager>( );
-        _atProtoStorageMock = new Mock<IATProtoStorageService>( );
+        _atProtoStorageMock = new Mock<ITargetedATProtoStorageService>( );
         _cacheRepositoryMock = new Mock<IMediaLinkCacheRepository>( );
         _deduplicatorMock = new Mock<IRequestDeduplicator>( );
         _combinerLoggerMock = new Mock<ILogger<SagaResultCombiner>>( );
         _resultCombiner = new SagaResultCombiner( _combinerLoggerMock.Object );
         _queueResolverMock = new Mock<IProviderQueueResolver<QueuedLookupRequest>>( );
+        _dispatchOutboxMock = new Mock<ILookupDispatchOutbox>( );
+        _stagedRequests = new( );
+        _stagedPriorities = new( );
         _enabledProviders = [SupportedProviders.Spotify, SupportedProviders.AppleMusic, SupportedProviders.Tidal];
         _loggerMock = new Mock<ILogger<SagaCoordinatorBackgroundService>>( );
         _refreshReviewStoreMock = new Mock<IRefreshReviewStore>( );
+        _ = _dispatchOutboxMock
+            .Setup( outbox => outbox.StageBatchAsync(
+                It.IsAny<IReadOnlyList<QueuedLookupRequest>>( ),
+                It.IsAny<QueuePriority>( ),
+                It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( (
+                IReadOnlyList<QueuedLookupRequest> requests,
+                QueuePriority priority,
+                CancellationToken _ ) => {
+                    foreach (QueuedLookupRequest request in requests) {
+                        _stagedRequests[request.Provider] = request;
+                        _stagedPriorities[request.Provider] = priority;
+                    }
+
+                    return (IReadOnlyDictionary<SupportedProviders, ProviderDispatchStageOutcome>)
+                        requests.ToDictionary(
+                            request => request.Provider,
+                            _ => ProviderDispatchStageOutcome.Staged );
+                } );
+        _ = _dispatchOutboxMock
+            .Setup( outbox => outbox.DispatchAsync(
+                It.IsAny<string>( ),
+                It.IsAny<SupportedProviders>( ),
+                It.IsAny<CancellationToken>( ) ) )
+            .Returns( async (
+                string _,
+                SupportedProviders provider,
+                CancellationToken cancellationToken ) => {
+                    if (!_stagedRequests.TryGetValue( provider, out QueuedLookupRequest? request )) {
+                        return false;
+                    }
+
+                    await _queueResolverMock.Object.GetQueue( provider ).EnqueueAsync(
+                        request, _stagedPriorities[provider], cancellationToken );
+                    return true;
+                } );
+        _ = _refreshReviewStoreMock.Setup( store => store.GetPendingForSagaAsync(
+                It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [] );
         _ = _sagaManagerMock.Setup( s => s.GetAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( CreateCompleteSaga( ) );
         _ = _refreshReviewStoreMock.Setup( store => store.MarkUnresolvedAsync(
@@ -84,6 +135,18 @@ public class SagaCoordinatorBackgroundServiceTests {
         _ = _refreshReviewStoreMock.Setup( store => store.CompleteAsync(
                 It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
             .Returns( Task.CompletedTask );
+        _ = _refreshReviewStoreMock.Setup( store => store.ClearSweepAttemptsAsync(
+                It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Returns( Task.CompletedTask );
+        _ = _refreshReviewStoreMock.Setup( store => store.IncrementSweepAttemptAsync(
+                It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( 1 );
+        _ = _refreshReviewStoreMock.Setup( store => store.ClearTargetWriteAttemptsAsync(
+                It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Returns( Task.CompletedTask );
+        _ = _refreshReviewStoreMock.Setup( store => store.IncrementTargetWriteAttemptAsync(
+                It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( 1 );
 
         _ = _redisMock.Setup( r => r.GetSubscriber( It.IsAny<object>( ) ) ).Returns( _subscriberMock.Object );
 
@@ -161,7 +224,7 @@ public class SagaCoordinatorBackgroundServiceTests {
                 _cacheRepositoryMock.Object,
                 _deduplicatorMock.Object,
                 _resultCombiner,
-                _queueResolverMock.Object,
+                _dispatchOutboxMock.Object,
                 _enabledProviders,
                 _loggerMock.Object,
                 _refreshReviewStoreMock.Object
@@ -183,7 +246,7 @@ public class SagaCoordinatorBackgroundServiceTests {
                 _cacheRepositoryMock.Object,
                 _deduplicatorMock.Object,
                 _resultCombiner,
-                _queueResolverMock.Object,
+                _dispatchOutboxMock.Object,
                 _enabledProviders,
                 _loggerMock.Object,
                 _refreshReviewStoreMock.Object
@@ -205,7 +268,7 @@ public class SagaCoordinatorBackgroundServiceTests {
                 _cacheRepositoryMock.Object,
                 _deduplicatorMock.Object,
                 _resultCombiner,
-                _queueResolverMock.Object,
+                _dispatchOutboxMock.Object,
                 _enabledProviders,
                 _loggerMock.Object,
                 _refreshReviewStoreMock.Object
@@ -227,7 +290,7 @@ public class SagaCoordinatorBackgroundServiceTests {
                 null!,
                 _deduplicatorMock.Object,
                 _resultCombiner,
-                _queueResolverMock.Object,
+                _dispatchOutboxMock.Object,
                 _enabledProviders,
                 _loggerMock.Object,
                 _refreshReviewStoreMock.Object
@@ -249,7 +312,7 @@ public class SagaCoordinatorBackgroundServiceTests {
                 _cacheRepositoryMock.Object,
                 null!,
                 _resultCombiner,
-                _queueResolverMock.Object,
+                _dispatchOutboxMock.Object,
                 _enabledProviders,
                 _loggerMock.Object,
                 _refreshReviewStoreMock.Object
@@ -271,7 +334,7 @@ public class SagaCoordinatorBackgroundServiceTests {
                 _cacheRepositoryMock.Object,
                 _deduplicatorMock.Object,
                 null!,
-                _queueResolverMock.Object,
+                _dispatchOutboxMock.Object,
                 _enabledProviders,
                 _loggerMock.Object,
                 _refreshReviewStoreMock.Object
@@ -293,7 +356,7 @@ public class SagaCoordinatorBackgroundServiceTests {
                 _cacheRepositoryMock.Object,
                 _deduplicatorMock.Object,
                 _resultCombiner,
-                _queueResolverMock.Object,
+                _dispatchOutboxMock.Object,
                 _enabledProviders,
                 null!,
                 _refreshReviewStoreMock.Object
@@ -312,7 +375,7 @@ public class SagaCoordinatorBackgroundServiceTests {
                 _cacheRepositoryMock.Object,
                 _deduplicatorMock.Object,
                 _resultCombiner,
-                _queueResolverMock.Object,
+                _dispatchOutboxMock.Object,
                 _enabledProviders,
                 _loggerMock.Object,
                 null!
@@ -650,7 +713,7 @@ public class SagaCoordinatorBackgroundServiceTests {
             saga = saga with {
                 ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState>( saga.ProviderStates ) {
                     [SupportedProviders.AppleMusic] = new( SupportedProviders.AppleMusic, true, true,
-                        "{\"isrc\":\"USRC12345678\",\"trackName\":\"Track\",\"artistName\":\"Artist\",\"url\":\"https://example.test\"}",
+                        "{\"externalId\":\"USRC12345678\",\"title\":\"Track\",\"artist\":\"Artist\",\"url\":\"https://example.test\"}",
                         DateTimeOffset.UtcNow, null )
                 }
             };
@@ -666,27 +729,28 @@ public class SagaCoordinatorBackgroundServiceTests {
             .ReturnsAsync( [context] );
         _ = _sagaManagerMock.Setup( manager => manager.TryDeleteAsync( saga.SagaId, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( true );
-        _ = _atProtoStorageMock.Setup( storage => storage.StoreMediaLinkResultAsync(
-                It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ) )
-            .ReturnsAsync( "at://did:plc:test/link/result" );
+        _ = _atProtoStorageMock.Setup( storage => storage.StoreMediaLinkResultAtUriAsync(
+                It.IsAny<MediaLinkResult>( ), context.SourceRecordUri, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( context.SourceRecordUri );
 
         await service.InvokeFinalizeForTestAsync( saga, TestContext.CancellationToken );
 
         if (includeSuccessfulProvider) {
-            _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAsync(
+            _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAtUriAsync(
                 It.Is<MediaLinkResult>( result => result.Results.Count == 1 ),
+                context.SourceRecordUri,
                 It.IsAny<CancellationToken>( ) ), Times.Once );
             _refreshReviewStoreMock.Verify( store => store.MarkUnresolvedAsync(
                 It.IsAny<RefreshReviewEntry>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
             _refreshReviewStoreMock.Verify( store => store.CompleteAsync(
                 saga.SagaId, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Once );
             _deduplicatorMock.Verify( dedup => dedup.ReleaseAsync(
-                saga.LookupKey, "at://did:plc:test/link/result", It.IsAny<CancellationToken>( ) ), Times.Once );
+                saga.LookupKey, context.SourceRecordUri, It.IsAny<CancellationToken>( ) ), Times.Once );
             _sagaManagerMock.Verify( manager => manager.TryDeleteAsync(
                 saga.SagaId, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Never );
         } else {
-            _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAsync(
-                It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+            _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAtUriAsync(
+                It.IsAny<MediaLinkResult>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
             _refreshReviewStoreMock.Verify( store => store.MarkUnresolvedAsync(
                 context, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
             _deduplicatorMock.Verify( dedup => dedup.ReleaseAsync(
@@ -694,6 +758,341 @@ public class SagaCoordinatorBackgroundServiceTests {
             _sagaManagerMock.Verify( manager => manager.TryDeleteAsync(
                 saga.SagaId, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Once );
         }
+    }
+
+    /// <summary>A successful maintenance refresh writes the original source URI, not a drifted id key.</summary>
+    [TestMethod]
+    public async Task WriteFinalResult_RefreshWithIdentifierDrift_TargetsSourceRecordUri( ) {
+        LookupSagaState saga = CreateCompleteSaga( );
+        const string SourceRecordUri =
+            "at://did:plc:test/link.bridgebeats.lookup/album:old-identifier";
+        RefreshReviewEntry context = new( ) {
+            SourceRecordUri = SourceRecordUri,
+            SagaId = saga.SagaId,
+            InstanceToken = saga.InstanceToken,
+            LookupType = saga.LookupType,
+            LookupValue = saga.LookupValue
+        };
+        _ = _refreshReviewStoreMock.Setup( store => store.GetPendingForSagaAsync(
+                saga.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [context] );
+
+        Mock<ITargetedATProtoStorageService> targetedStorage = _atProtoStorageMock;
+        _ = targetedStorage.Setup( storage => storage.StoreMediaLinkResultAtUriAsync(
+                It.IsAny<MediaLinkResult>( ), SourceRecordUri, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( SourceRecordUri );
+
+        await CreateService( ).InvokeFinalizeForTestAsync( saga, TestContext.CancellationToken );
+
+        targetedStorage.Verify( storage => storage.StoreMediaLinkResultAtUriAsync(
+            It.IsAny<MediaLinkResult>( ), SourceRecordUri, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAsync(
+            It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( manager => manager.TrySetFinalResultUriAsync(
+            saga.SagaId, SourceRecordUri, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
+    /// <summary>A refresh-target read outage defers finalization without writing or waking waiters.</summary>
+    [TestMethod]
+    public async Task WriteFinalResult_WhenRefreshTargetsUnavailable_DefersWithoutPublishingNoResult( ) {
+        LookupSagaState saga = CreateCompleteSaga( );
+        _ = _refreshReviewStoreMock.Setup( store => store.GetPendingForSagaAsync(
+                saga.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new InvalidOperationException( "Redis unavailable" ) );
+
+        await CreateService( ).InvokeFinalizeForTestAsync( saga, TestContext.CancellationToken );
+
+        _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAsync(
+            It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAtUriAsync(
+            It.IsAny<MediaLinkResult>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _deduplicatorMock.Verify( dedup => dedup.ReleaseAsync(
+            It.IsAny<string>( ), It.IsAny<string?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( manager => manager.TryReleaseFinalizeClaimAsync(
+            saga.SagaId, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _sagaManagerMock.Verify( manager => manager.TryDeleteAsync(
+            It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>A pending refresh from an older token blocks deterministic fallback after rotation.</summary>
+    [TestMethod]
+    public async Task WriteFinalResult_WhenRefreshTargetTokenRotated_DefersWithoutDeterministicWrite( ) {
+        LookupSagaState saga = CreateCompleteSaga( );
+        RefreshReviewEntry staleTarget = new( ) {
+            SourceRecordUri = "at://did:plc:test/link.bridgebeats.lookup/track:old",
+            SagaId = saga.SagaId,
+            InstanceToken = "previous-instance",
+            LookupType = saga.LookupType,
+            LookupValue = saga.LookupValue
+        };
+        _ = _refreshReviewStoreMock.Setup( store => store.GetPendingForSagaAsync(
+                saga.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [staleTarget] );
+
+        await CreateService( ).InvokeFinalizeForTestAsync( saga, TestContext.CancellationToken );
+
+        _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAsync(
+            It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAtUriAsync(
+            It.IsAny<MediaLinkResult>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( manager => manager.TryReleaseFinalizeClaimAsync(
+            saga.SagaId, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _deduplicatorMock.Verify( dedup => dedup.ReleaseAsync(
+            It.IsAny<string>( ), It.IsAny<string?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>Every distinct refresh target is updated and the sorted first URI is canonical.</summary>
+    [TestMethod]
+    public async Task WriteFinalResult_WithMultipleRefreshTargets_UpdatesAllDeterministically( ) {
+        LookupSagaState saga = CreateCompleteSaga( );
+        const string FirstUri = "at://did:plc:test/link.bridgebeats.lookup/album:a";
+        const string SecondUri = "at://did:plc:test/link.bridgebeats.lookup/album:z";
+        RefreshReviewEntry CreateTarget( string uri ) => new( ) {
+            SourceRecordUri = uri,
+            SagaId = saga.SagaId,
+            InstanceToken = saga.InstanceToken,
+            LookupType = saga.LookupType,
+            LookupValue = saga.LookupValue
+        };
+        _ = _refreshReviewStoreMock.Setup( store => store.GetPendingForSagaAsync(
+                saga.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [CreateTarget( SecondUri ), CreateTarget( FirstUri ), CreateTarget( SecondUri )] );
+        _ = _atProtoStorageMock.Setup( storage => storage.StoreMediaLinkResultAtUriAsync(
+                It.IsAny<MediaLinkResult>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( MediaLinkResult _, string uri, CancellationToken _ ) => uri );
+
+        await CreateService( ).InvokeFinalizeForTestAsync( saga, TestContext.CancellationToken );
+
+        _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAtUriAsync(
+            It.IsAny<MediaLinkResult>( ), FirstUri, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAtUriAsync(
+            It.IsAny<MediaLinkResult>( ), SecondUri, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _sagaManagerMock.Verify( manager => manager.TrySetFinalResultUriAsync(
+            saga.SagaId, FirstUri, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
+    /// <summary>A later target failure retains the full target plan and retries the saga.</summary>
+    [TestMethod]
+    public async Task WriteFinalResult_WhenLaterRefreshTargetFails_RetainsWaitersAndReleasesClaim( ) {
+        LookupSagaState saga = CreateCompleteSaga( );
+        const string FirstUri = "at://did:plc:test/link.bridgebeats.lookup/album:a";
+        const string SecondUri = "at://did:plc:test/link.bridgebeats.lookup/album:z";
+        RefreshReviewEntry first = new( ) {
+            SourceRecordUri = FirstUri,
+            SagaId = saga.SagaId,
+            InstanceToken = saga.InstanceToken,
+            LookupType = saga.LookupType,
+            LookupValue = saga.LookupValue
+        };
+        RefreshReviewEntry second = first with { SourceRecordUri = SecondUri };
+        _ = _refreshReviewStoreMock.Setup( store => store.GetPendingForSagaAsync(
+                saga.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [first, second] );
+        _ = _atProtoStorageMock.Setup( storage => storage.StoreMediaLinkResultAtUriAsync(
+                It.IsAny<MediaLinkResult>( ), FirstUri, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( FirstUri );
+        _ = _atProtoStorageMock.Setup( storage => storage.StoreMediaLinkResultAtUriAsync(
+                It.IsAny<MediaLinkResult>( ), SecondUri, It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new InvalidOperationException( "PDS unavailable" ) );
+
+        await CreateService( ).InvokeFinalizeForTestAsync( saga, TestContext.CancellationToken );
+
+        _refreshReviewStoreMock.Verify( store => store.CompleteAsync(
+            It.IsAny<RefreshReviewEntry>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( manager => manager.TryReleaseFinalizeClaimAsync(
+            saga.SagaId, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _sagaManagerMock.Verify( manager => manager.TrySetFinalResultUriAsync(
+            It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _deduplicatorMock.Verify( deduplicator => deduplicator.ReleaseAsync(
+            It.IsAny<string>( ), It.IsAny<string?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>A retry reuses the frozen target order and preserves the original canonical URI.</summary>
+    [TestMethod]
+    public async Task WriteFinalResult_WhenLaterTargetFailsThenRecovers_PreservesCanonicalUri( ) {
+        LookupSagaState saga = CreateCompleteSaga( );
+        const string FirstUri = "at://did:plc:test/link.bridgebeats.lookup/album:a";
+        const string SecondUri = "at://did:plc:test/link.bridgebeats.lookup/album:z";
+        RefreshReviewEntry first = new( ) {
+            SourceRecordUri = FirstUri,
+            SagaId = saga.SagaId,
+            InstanceToken = saga.InstanceToken,
+            LookupType = saga.LookupType,
+            LookupValue = saga.LookupValue
+        };
+        RefreshReviewEntry second = first with { SourceRecordUri = SecondUri };
+        _ = _refreshReviewStoreMock.Setup( store => store.GetPendingForSagaAsync(
+                saga.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [first, second] );
+        _ = _atProtoStorageMock.Setup( storage => storage.StoreMediaLinkResultAtUriAsync(
+                It.IsAny<MediaLinkResult>( ), FirstUri, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( FirstUri );
+        _ = _atProtoStorageMock.SetupSequence( storage => storage.StoreMediaLinkResultAtUriAsync(
+                It.IsAny<MediaLinkResult>( ), SecondUri, It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new InvalidOperationException( "PDS unavailable" ) )
+            .ReturnsAsync( SecondUri );
+
+        SagaCoordinatorBackgroundService service = CreateService( );
+        await service.InvokeFinalizeForTestAsync( saga, TestContext.CancellationToken );
+        await service.InvokeFinalizeForTestAsync( saga, TestContext.CancellationToken );
+
+        _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAtUriAsync(
+            It.IsAny<MediaLinkResult>( ), FirstUri, It.IsAny<CancellationToken>( ) ), Times.Exactly( 2 ) );
+        _sagaManagerMock.Verify( manager => manager.TrySetFinalResultUriAsync(
+            saga.SagaId, FirstUri, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAsync(
+            It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>A repeatedly failing sibling moves to review and no longer blocks a durable target.</summary>
+    [TestMethod]
+    public async Task WriteFinalResult_WhenTargetRetryExhausted_FinalizesSuccessfulSibling( ) {
+        LookupSagaState saga = CreateCompleteSaga( );
+        const string FirstUri = "at://did:plc:test/link.bridgebeats.lookup/album:a";
+        const string FailingUri = "at://did:plc:test/link.bridgebeats.lookup/album:z";
+        RefreshReviewEntry first = new( ) {
+            SourceRecordUri = FirstUri,
+            SagaId = saga.SagaId,
+            InstanceToken = saga.InstanceToken,
+            LookupType = saga.LookupType,
+            LookupValue = saga.LookupValue
+        };
+        RefreshReviewEntry failing = first with { SourceRecordUri = FailingUri };
+        _ = _refreshReviewStoreMock.Setup( store => store.GetPendingForSagaAsync(
+                saga.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [first, failing] );
+        _ = _atProtoStorageMock.Setup( storage => storage.StoreMediaLinkResultAtUriAsync(
+                It.IsAny<MediaLinkResult>( ), FirstUri, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( FirstUri );
+        _ = _atProtoStorageMock.Setup( storage => storage.StoreMediaLinkResultAtUriAsync(
+                It.IsAny<MediaLinkResult>( ), FailingUri, It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new InvalidOperationException( "PDS unavailable" ) );
+        _ = _refreshReviewStoreMock.Setup( store => store.IncrementTargetWriteAttemptAsync(
+                FailingUri, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( 3 );
+
+        await CreateService( ).InvokeFinalizeForTestAsync( saga, TestContext.CancellationToken );
+
+        _refreshReviewStoreMock.Verify( store => store.MarkUnresolvedAsync(
+            failing,
+            It.Is<string>( reason => reason.Contains( "3 attempts", StringComparison.Ordinal ) ),
+            It.IsAny<CancellationToken>( ) ), Times.Once );
+        _sagaManagerMock.Verify( manager => manager.TrySetFinalResultUriAsync(
+            saga.SagaId, FirstUri, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _deduplicatorMock.Verify( dedup => dedup.ReleaseAsync(
+            saga.LookupKey, FirstUri, It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
+    /// <summary>A deterministic poison target is reviewed without preventing valid siblings.</summary>
+    [TestMethod]
+    public async Task WriteFinalResult_WhenOneRefreshTargetIsInvalid_ReviewsItAndContinues( ) {
+        LookupSagaState saga = CreateCompleteSaga( );
+        const string InvalidUri = "at://did:plc:test/wrong.collection/album:a";
+        const string ValidUri = "at://did:plc:test/link.bridgebeats.lookup/album:z";
+        RefreshReviewEntry invalid = new( ) {
+            SourceRecordUri = InvalidUri,
+            SagaId = saga.SagaId,
+            InstanceToken = saga.InstanceToken,
+            LookupType = saga.LookupType,
+            LookupValue = saga.LookupValue
+        };
+        RefreshReviewEntry valid = invalid with { SourceRecordUri = ValidUri };
+        _ = _refreshReviewStoreMock.Setup( store => store.GetPendingForSagaAsync(
+                saga.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [invalid, valid] );
+        _ = _atProtoStorageMock.Setup( storage => storage.StoreMediaLinkResultAtUriAsync(
+                It.IsAny<MediaLinkResult>( ), InvalidUri, It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new InvalidTargetRecordException( "wrong collection" ) );
+        _ = _atProtoStorageMock.Setup( storage => storage.StoreMediaLinkResultAtUriAsync(
+                It.IsAny<MediaLinkResult>( ), ValidUri, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ValidUri );
+
+        await CreateService( ).InvokeFinalizeForTestAsync( saga, TestContext.CancellationToken );
+
+        _refreshReviewStoreMock.Verify( store => store.MarkUnresolvedAsync(
+            invalid,
+            It.Is<string>( reason => reason.Contains( "wrong collection", StringComparison.Ordinal ) ),
+            It.IsAny<CancellationToken>( ) ), Times.Once );
+        _sagaManagerMock.Verify( manager => manager.TrySetFinalResultUriAsync(
+            saga.SagaId, ValidUri, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
+    /// <summary>When every refresh target is invalid, review is durable before persistence failure is published.</summary>
+    [TestMethod]
+    public async Task WriteFinalResult_WhenAllRefreshTargetsAreInvalid_DeletesBeforePersistenceFailureRelease( ) {
+        LookupSagaState saga = CreateCompleteSaga( );
+        RefreshReviewEntry first = new( ) {
+            SourceRecordUri = "at://did:plc:test/wrong.collection/album:a",
+            SagaId = saga.SagaId,
+            InstanceToken = saga.InstanceToken,
+            LookupType = saga.LookupType,
+            LookupValue = saga.LookupValue
+        };
+        RefreshReviewEntry second = first with {
+            SourceRecordUri = "at://did:plc:test/wrong.collection/album:z"
+        };
+        _ = _refreshReviewStoreMock.Setup( store => store.GetPendingForSagaAsync(
+                saga.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [second, first] );
+        _ = _atProtoStorageMock.Setup( storage => storage.StoreMediaLinkResultAtUriAsync(
+                It.IsAny<MediaLinkResult>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new InvalidTargetRecordException( "wrong collection" ) );
+
+        MockSequence terminalSequence = new( );
+        _ = _sagaManagerMock.InSequence( terminalSequence ).Setup( manager => manager.TryDeleteAsync(
+                saga.SagaId, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _deduplicatorMock.InSequence( terminalSequence ).Setup( deduplicator => deduplicator.ReleaseResultNotPersistedAsync(
+                saga.LookupKey, It.IsAny<CancellationToken>( ) ) )
+            .Returns( Task.CompletedTask );
+
+        await CreateService( ).InvokeFinalizeForTestAsync( saga, TestContext.CancellationToken );
+
+        _refreshReviewStoreMock.Verify( store => store.MarkUnresolvedAsync(
+            first, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _refreshReviewStoreMock.Verify( store => store.MarkUnresolvedAsync(
+            second, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _sagaManagerMock.Verify( manager => manager.TryDeleteAsync(
+            saga.SagaId, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _deduplicatorMock.Verify( deduplicator => deduplicator.ReleaseResultNotPersistedAsync(
+            saga.LookupKey, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAtUriAsync(
+            It.IsAny<MediaLinkResult>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            Times.Exactly( 2 ) );
+        _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAsync(
+            It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>Review cleanup failure after durability cannot cause a drifted fallback write.</summary>
+    [TestMethod]
+    public async Task WriteFinalResult_WhenRefreshCleanupFails_StillPublishesTargetedUri( ) {
+        LookupSagaState saga = CreateCompleteSaga( );
+        const string SourceUri = "at://did:plc:test/link.bridgebeats.lookup/album:a";
+        RefreshReviewEntry target = new( ) {
+            SourceRecordUri = SourceUri,
+            SagaId = saga.SagaId,
+            InstanceToken = saga.InstanceToken,
+            LookupType = saga.LookupType,
+            LookupValue = saga.LookupValue
+        };
+        _ = _refreshReviewStoreMock.Setup( store => store.GetPendingForSagaAsync(
+                saga.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [target] );
+        _ = _atProtoStorageMock.Setup( storage => storage.StoreMediaLinkResultAtUriAsync(
+                It.IsAny<MediaLinkResult>( ), SourceUri, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( SourceUri );
+        _ = _refreshReviewStoreMock.Setup( store => store.CompleteAsync(
+                saga.SagaId, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new InvalidOperationException( "cleanup result was ambiguous" ) );
+
+        await CreateService( ).InvokeFinalizeForTestAsync( saga, TestContext.CancellationToken );
+
+        _deduplicatorMock.Verify( deduplicator => deduplicator.ReleaseAsync(
+            saga.LookupKey, SourceUri, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAsync(
+            It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( manager => manager.TryReleaseFinalizeClaimAsync(
+            saga.SagaId, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Never );
     }
 
     /// <summary>A zero-result stale refresh is persisted for review before its saga is deleted.</summary>
@@ -1393,10 +1792,8 @@ public class SagaCoordinatorBackgroundServiceTests {
     }
 
     /// <summary>
-    /// Verifies the marker-contention path: when the secondaries-queued marker is already taken by a
-    /// concurrent worker (the claim returns false), this worker does not enqueue any lookups but
-    /// still initializes provider states, marks the saga partial, writes a partial result, and
-    /// defers finalization, so the marker holder remains responsible for completion.
+    /// Verifies that the legacy secondaries marker is advisory after atomic staging: a stale marker
+    /// cannot suppress the outbox recovery path or strand secondary legs.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
@@ -1458,17 +1855,16 @@ public class SagaCoordinatorBackgroundServiceTests {
             // Expected
         }
 
-        // Assert - The losing handler must not queue duplicate secondary lookups
+        // Atomic staging, not the marker, decides whether a delivery is new or already published.
         queueMock.Verify(
             q => q.EnqueueAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ),
-            Times.Never
+            Times.Exactly( 2 )
         );
 
-        // Assert - The idempotent state/partial writes still run (they happen before the
-        // marker claim so a published partial can never be mistaken for a final result)
+        // Provider initialization is part of the outbox Lua transaction.
         _sagaManagerMock.Verify(
             s => s.TryInitializeProviderStatesAsync( TestSagaId, It.IsAny<IEnumerable<SupportedProviders>>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
-            Times.Once
+            Times.Never
         );
         _sagaManagerMock.Verify(
             s => s.TrySetIsPartialAsync( TestSagaId, true, "instance-current", It.IsAny<CancellationToken>( ) ),
@@ -1493,9 +1889,8 @@ public class SagaCoordinatorBackgroundServiceTests {
     }
 
     /// <summary>
-    /// Verifies the ordering invariant on the secondaries path: provider states are initialized and
-    /// the saga is marked partial before the secondaries-queued marker is claimed, so a concurrent
-    /// worker that loses the marker race still observes initialized state.
+    /// Verifies the ordering invariant on the secondaries path: the saga is marked partial, then all
+    /// provider legs are atomically staged, and only then is the legacy marker updated.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
@@ -1528,10 +1923,6 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Record the order of the saga-manager calls that close the partial-vs-final race
         List<string> callOrder = [];
         _ = _sagaManagerMock
-            .Setup( s => s.TryInitializeProviderStatesAsync( TestSagaId, It.IsAny<IEnumerable<SupportedProviders>>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
-            .Callback( ( ) => callOrder.Add( "InitializeProviderStates" ) )
-            .ReturnsAsync( true );
-        _ = _sagaManagerMock
             .Setup( s => s.TrySetIsPartialAsync( TestSagaId, true, "instance-current", It.IsAny<CancellationToken>( ) ) )
             .Callback( ( ) => callOrder.Add( "SetIsPartial" ) )
             .ReturnsAsync( true );
@@ -1539,6 +1930,16 @@ public class SagaCoordinatorBackgroundServiceTests {
             .Setup( s => s.TryMarkSecondariesQueuedAsync( TestSagaId, "instance-current", It.IsAny<CancellationToken>( ) ) )
             .Callback( ( ) => callOrder.Add( "TryMarkSecondariesQueued" ) )
             .ReturnsAsync( true );
+        _ = _dispatchOutboxMock
+            .Setup( outbox => outbox.StageBatchAsync(
+                It.IsAny<IReadOnlyList<QueuedLookupRequest>>( ),
+                QueuePriority.Interactive,
+                It.IsAny<CancellationToken>( ) ) )
+            .Callback( ( ) => callOrder.Add( "StageBatch" ) )
+            .ReturnsAsync( new Dictionary<SupportedProviders, ProviderDispatchStageOutcome> {
+                [SupportedProviders.AppleMusic] = ProviderDispatchStageOutcome.Staged,
+                [SupportedProviders.Tidal] = ProviderDispatchStageOutcome.Staged
+            } );
 
         Mock<IRequestQueue<QueuedLookupRequest>> queueMock = new( );
         _ = _queueResolverMock
@@ -1569,18 +1970,17 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - The idempotent writes both precede the marker claim
         CollectionAssert.AreEqual(
-            new List<string> { "InitializeProviderStates", "SetIsPartial", "TryMarkSecondariesQueued" },
+            new List<string> { "SetIsPartial", "StageBatch", "TryMarkSecondariesQueued" },
             callOrder
         );
     }
 
     /// <summary>
-    /// Verifies that every failed secondary enqueue is converted into a terminal provider leg and
-    /// publishes progress, so the one-time fan-out marker cannot strand the saga.
+    /// Verifies that immediate relay failures leave durable provider legs pending for relay retry.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task SagaCompletion_WhenEveryEnqueueFails_ReachesTerminalStateAndWritesPartial( ) {
+    public async Task SagaCompletion_WhenEveryImmediateRelayFails_RemainsPartialForRelayRetry( ) {
         // Arrange
         Dictionary<string, Action<RedisChannel, RedisValue>> handlers = [];
         _ = _subscriberMock
@@ -1643,11 +2043,10 @@ public class SagaCoordinatorBackgroundServiceTests {
             Times.Exactly( 2 )
         );
 
-        // No providers remain unresolved: both failed enqueues were durably converted into
-        // terminal failed legs, so this invocation finalizes immediately.
+        // The staged provider legs remain unresolved until the relay succeeds and workers finish.
         _sagaManagerMock.Verify(
             s => s.TrySetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
-            Times.Once
+            Times.Never
         );
 
         _atProtoStorageMock.Verify(
@@ -1656,7 +2055,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         );
         _sagaManagerMock.Verify(
             s => s.TrySetPartialResultUriAsync( TestSagaId, TestRecordUri, "instance-current", It.IsAny<CancellationToken>( ) ),
-            Times.Never
+            Times.Once
         );
         _sagaManagerMock.Verify(
             s => s.TrySetIsPartialAsync( TestSagaId, true, "instance-current", It.IsAny<CancellationToken>( ) ),
@@ -1670,20 +2069,20 @@ public class SagaCoordinatorBackgroundServiceTests {
                     state.IsComplete && !state.IsSuccess && state.ErrorMessage != null ),
                 "instance-current",
                 It.IsAny<CancellationToken>( ) ),
-            Times.Exactly( 2 )
+            Times.Never
         );
         _subscriberMock.Verify(
             s => s.PublishAsync(
                 RedisChannel.Literal( "saga:completed" ),
                 TestSagaId,
                 It.IsAny<CommandFlags>( ) ),
-            Times.AtLeastOnce( )
+            Times.Never
         );
 
         // Successful terminal release clears the reconciliation entry.
         _sagaManagerMock.Verify(
             s => s.RemoveFromPendingIndexAsync( TestSagaId, It.IsAny<CancellationToken>( ) ),
-            Times.Once
+            Times.Never
         );
     }
 
@@ -1780,21 +2179,17 @@ public class SagaCoordinatorBackgroundServiceTests {
         _sagaManagerMock.Verify(
             s => s.TryUpdateProviderStateAsync(
                 TestSagaId,
-                It.Is<ProviderLookupState>( state =>
-                    state.Provider == SupportedProviders.Tidal
-                    && state.IsComplete
-                    && !state.IsSuccess
-                    && state.ErrorMessage != null ),
+                It.Is<ProviderLookupState>( state => state.Provider == SupportedProviders.Tidal ),
                 "instance-current",
                 It.IsAny<CancellationToken>( ) ),
-            Times.Once
+            Times.Never
         );
         _subscriberMock.Verify(
             s => s.PublishAsync(
                 RedisChannel.Literal( "saga:completed" ),
                 TestSagaId,
                 It.IsAny<CommandFlags>( ) ),
-            Times.AtLeastOnce( )
+            Times.Never
         );
 
         // Assert - The pending index is NOT cleared: at least one provider is in flight
@@ -1950,7 +2345,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Arrange
         SagaCoordinatorBackgroundService service = CreateService( );
 
-        string resultJson = """{"isrc":"USRC12345678","trackName":"Test Song","artistName":"Test Artist","url":"https://open.spotify.com/track/abc123"}""";
+        string resultJson = """{"externalId":"USRC12345678","title":"Test Song","artist":"Test Artist","url":"https://open.spotify.com/track/abc123"}""";
         LookupSagaState partialSaga = new( ) {
             SagaId = TestSagaId,
             LookupKey = TestLookupKey,
@@ -2058,12 +2453,12 @@ public class SagaCoordinatorBackgroundServiceTests {
 
     /// <summary>
     /// Verifies that a failed PDS write on the terminal path releases the finalize claim so the next
-    /// poll cycle can retry, and releases the dedup lock with null to unblock waiters. The generation
+    /// poll cycle can retry, without publishing a terminal no-result signal to waiters. The generation
     /// is NOT reset on the terminal path because the terminal path never advances the generation.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task Finalize_WhenPdsWriteFails_ReleasesClaimAndDedup( ) {
+    public async Task Finalize_WhenPdsWriteFails_ReleasesClaimWithoutDedupFeedbackLoop( ) {
         // Arrange
         SagaCoordinatorBackgroundService service = CreateService( );
         LookupSagaState completeSaga = CreateCompleteSaga( );
@@ -2105,10 +2500,10 @@ public class SagaCoordinatorBackgroundServiceTests {
             Times.Once
         );
 
-        // Assert - Dedup lock released with null to unblock waiters
+        // Assert - a retryable storage failure must not publish a terminal no-result completion.
         _deduplicatorMock.Verify(
             d => d.ReleaseAsync( completeSaga.LookupKey, null, It.IsAny<CancellationToken>( ) ),
-            Times.Once
+            Times.Never
         );
     }
 
@@ -2504,9 +2899,9 @@ public class SagaCoordinatorBackgroundServiceTests {
             } );
 
         // Build three sagas representing distinct generations k=1, k=2, k=3
-        string spotifyJson = """{"isrc":"USRC12345678","trackName":"Test Song","artistName":"Test Artist","url":"https://open.spotify.com/track/abc123"}""";
-        string appleMusicJson = """{"isrc":"USRC12345678","trackName":"Test Song","artistName":"Test Artist","url":"https://music.apple.com/album/1"}""";
-        string tidalJson = """{"isrc":"USRC12345678","trackName":"Test Song","artistName":"Test Artist","url":"https://tidal.com/track/1"}""";
+        string spotifyJson = """{"externalId":"USRC12345678","title":"Test Song","artist":"Test Artist","url":"https://open.spotify.com/track/abc123"}""";
+        string appleMusicJson = """{"externalId":"USRC12345678","title":"Test Song","artist":"Test Artist","url":"https://music.apple.com/album/1"}""";
+        string tidalJson = """{"externalId":"USRC12345678","title":"Test Song","artist":"Test Artist","url":"https://tidal.com/track/1"}""";
 
         LookupSagaState sagaGen1 = new( ) {
             SagaId = TestSagaId,
@@ -2596,7 +2991,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Arrange
         SagaCoordinatorBackgroundService service = CreateService( );
 
-        string resultJson = """{"isrc":"USRC12345678","trackName":"Test Song","artistName":"Test Artist","url":"https://open.spotify.com/track/abc123"}""";
+        string resultJson = """{"externalId":"USRC12345678","title":"Test Song","artist":"Test Artist","url":"https://open.spotify.com/track/abc123"}""";
         LookupSagaState partialSaga = new( ) {
             SagaId = TestSagaId,
             LookupKey = TestLookupKey,
@@ -2713,7 +3108,7 @@ public class SagaCoordinatorBackgroundServiceTests {
     /// <summary>
     /// Verifies that a PDS write failure on the non-terminal path resets the write generation
     /// but does NOT release the finalize claim (which was never acquired on the non-terminal
-    /// path). The dedup lock is also not released with null on the non-terminal failure path.
+    /// path). Waiters remain attached while the generation is retried.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
@@ -2721,7 +3116,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Arrange
         SagaCoordinatorBackgroundService service = CreateService( );
 
-        string resultJson = """{"isrc":"USRC12345678","trackName":"Test Song","artistName":"Test Artist","url":"https://open.spotify.com/track/abc123"}""";
+        string resultJson = """{"externalId":"USRC12345678","title":"Test Song","artist":"Test Artist","url":"https://open.spotify.com/track/abc123"}""";
         LookupSagaState partialSaga = new( ) {
             SagaId = TestSagaId,
             LookupKey = TestLookupKey,
@@ -2776,6 +3171,12 @@ public class SagaCoordinatorBackgroundServiceTests {
             Times.Never,
             "A failed PDS write must not clear sweep attempts before the partial URI is durable"
         );
+        _deduplicatorMock.Verify(
+            deduplicator => deduplicator.ReleaseAsync(
+                partialSaga.LookupKey, null, It.IsAny<CancellationToken>( ) ),
+            Times.Never,
+            "A retryable PDS write failure must not publish a terminal no-result signal"
+        );
     }
 
     /// <summary>Matching current-instance refresh context suppresses non-terminal PDS materialization.</summary>
@@ -2818,7 +3219,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Arrange
         SagaCoordinatorBackgroundService service = CreateService( );
 
-        string resultJson = """{"isrc":"USRC12345678","trackName":"Test Song","artistName":"Test Artist","url":"https://open.spotify.com/track/abc123"}""";
+        string resultJson = """{"externalId":"USRC12345678","title":"Test Song","artist":"Test Artist","url":"https://open.spotify.com/track/abc123"}""";
         LookupSagaState partialSaga = new( ) {
             SagaId = TestSagaId,
             LookupKey = TestLookupKey,
@@ -2972,7 +3373,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         // The saga is now complete but the successful count (generation) stayed at 1.
         SagaCoordinatorBackgroundService service = CreateService( );
 
-        string spotifyJson = """{"isrc":"USRC12345678","trackName":"Test Song","artistName":"Test Artist","url":"https://open.spotify.com/track/abc123"}""";
+        string spotifyJson = """{"externalId":"USRC12345678","title":"Test Song","artist":"Test Artist","url":"https://open.spotify.com/track/abc123"}""";
         LookupSagaState completedViaFailure = new( ) {
             SagaId = TestSagaId,
             LookupKey = TestLookupKey,
@@ -3323,7 +3724,7 @@ public class SagaCoordinatorBackgroundServiceTests {
             _cacheRepositoryMock.Object,
             _deduplicatorMock.Object,
             _resultCombiner,
-            _queueResolverMock.Object,
+            _dispatchOutboxMock.Object,
             _enabledProviders,
             _loggerMock.Object,
             reviewStore ?? _refreshReviewStoreMock.Object
@@ -3406,10 +3807,10 @@ public class SagaCoordinatorBackgroundServiceTests {
     private static LookupSagaState CreateCompleteSaga( ) {
         string resultJson = """
         {
-            "isrc": "USRC12345678",
-            "trackName": "Test Song",
-            "artistName": "Test Artist",
-            "albumName": "Test Album",
+            "externalId": "USRC12345678",
+            "title": "Test Song",
+            "artist": "Test Artist",
+            "artUrl": "https://example.com/art.jpg",
             "url": "https://open.spotify.com/track/abc123"
         }
         """;

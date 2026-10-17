@@ -5,6 +5,7 @@ using System.Text.Json;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Exceptions;
 using BridgeBeats.Contracts.Interfaces;
+using BridgeBeats.Contracts.Records;
 using BridgeBeats.Core.Domain.Providers.Common;
 using BridgeBeats.Core.Domain.Providers.Spotify;
 using Microsoft.Extensions.Logging;
@@ -17,7 +18,7 @@ namespace BridgeBeats.Tests.Unit;
 /// <see cref="SpotifyLookupService"/>'s bulk methods (<c>GetTracksByIdsAsync</c> and
 /// <c>GetAlbumsByIdsAsync</c>). Each test drives the concrete service through a stub
 /// <see cref="HttpMessageHandler"/>; no interfaces are substituted at the lookup-service
-/// boundary. The API stub includes the terminal provider-rate-limit handler used by the production
+/// boundary. The API stub includes the provider rate-limit handler used by the production
 /// named client, so status classification is exercised at its transport boundary.
 /// </summary>
 /// <remarks>
@@ -195,10 +196,13 @@ public class SpotifyBulkStatusMappingTests {
         SpotifyTokenHandler tokenHandler = new( credentials, tokenFactory.Object, tokenLogger.Object );
 
         // API-endpoint stub: returns apiResponse for every GET to the spotify-api client.
-        TerminalProviderRateLimitHandler terminalRateLimitHandler = new( SupportedProviders.Spotify ) {
+        RetryAfterLimitHandler rateLimitHandler = new(
+            120,
+            new QueueSettings( ),
+            new Mock<ILogger<RetryAfterLimitHandler>>( ).Object ) {
             InnerHandler = new FixedResponseHandler( apiResponse )
         };
-        HttpClient apiClient = new( terminalRateLimitHandler ) {
+        HttpClient apiClient = new( rateLimitHandler ) {
             BaseAddress = new Uri( "https://api.spotify.com/v1/" )
         };
         Mock<IHttpClientFactory> apiFactory = new( );

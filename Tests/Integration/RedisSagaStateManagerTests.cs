@@ -1,3 +1,4 @@
+using BridgeBeats.Contracts.Constants;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
@@ -81,6 +82,150 @@ public class RedisSagaStateManagerTests {
             sagaId, SupportedProviders.AppleMusic, second.InstanceToken!, TestContext.CancellationToken ) );
         LookupSagaState current = (await _sagaManager.GetAsync( sagaId, TestContext.CancellationToken ))!;
         Assert.AreEqual( SupportedProviders.AppleMusic, current.InitialProvider );
+    }
+
+    /// <summary>Stale provider snapshots are merged atomically instead of erasing siblings.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task TrySetRateLimitInfoAsync_StaleSnapshots_PreserveBothProviders( ) {
+        const string SagaId = "rate-limit-atomic-merge";
+        LookupSagaState saga = await _sagaManager.GetOrCreateAsync(
+            SagaId,
+            "isrc:RATELIMITMERGE1",
+            LookupRequestType.IsrcLookup,
+            "RATELIMITMERGE1",
+            cancellationToken: TestContext.CancellationToken );
+        ProviderRateLimitInfo spotify = new(
+            SupportedProviders.Spotify,
+            DateTimeOffset.UtcNow.AddMinutes( 1 ),
+            "provider" );
+        ProviderRateLimitInfo apple = new(
+            SupportedProviders.AppleMusic,
+            DateTimeOffset.UtcNow.AddMinutes( 2 ),
+            "songs/:id" );
+
+        Assert.IsTrue( await _sagaManager.TrySetRateLimitInfoAsync(
+            SagaId, [spotify], saga.InstanceToken!, TestContext.CancellationToken ) );
+        Assert.IsTrue( await _sagaManager.TrySetRateLimitInfoAsync(
+            SagaId, [apple], saga.InstanceToken!, TestContext.CancellationToken ) );
+
+        LookupSagaState stored = (await _sagaManager.GetAsync(
+            SagaId, TestContext.CancellationToken ))!;
+        Assert.IsNotNull( stored.RateLimitInfo );
+        Assert.HasCount( 2, stored.RateLimitInfo );
+        SupportedProviders[] providers = [.. stored.RateLimitInfo.Select( info => info.Provider )];
+        Assert.Contains( SupportedProviders.Spotify, providers );
+        Assert.Contains( SupportedProviders.AppleMusic, providers );
+    }
+
+    /// <summary>An older same-provider cooldown cannot displace a newer instant.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task TrySetRateLimitInfoAsync_SameProvider_PreservesLatestInstant( ) {
+        const string SagaId = "rate-limit-same-provider-merge";
+        LookupSagaState saga = await _sagaManager.GetOrCreateAsync(
+            SagaId,
+            "isrc:RATELIMITMERGE2",
+            LookupRequestType.IsrcLookup,
+            "RATELIMITMERGE2",
+            cancellationToken: TestContext.CancellationToken );
+        DateTimeOffset later = DateTimeOffset.UtcNow.AddMinutes( 10 );
+        DateTimeOffset earlierWithLargerClockText = later
+            .AddMinutes( -1 )
+            .ToOffset( TimeSpan.FromHours( 8 ) );
+
+        Assert.IsTrue( await _sagaManager.TrySetRateLimitInfoAsync(
+            SagaId,
+            [new ProviderRateLimitInfo( SupportedProviders.Spotify, later, "tracks" )],
+            saga.InstanceToken!,
+            TestContext.CancellationToken ) );
+        Assert.IsTrue( await _sagaManager.TrySetRateLimitInfoAsync(
+            SagaId,
+            [new ProviderRateLimitInfo( SupportedProviders.Spotify, earlierWithLargerClockText, "albums" )],
+            saga.InstanceToken!,
+            TestContext.CancellationToken ) );
+
+        LookupSagaState stored = (await _sagaManager.GetAsync(
+            SagaId, TestContext.CancellationToken ))!;
+        Assert.IsNotNull( stored.RateLimitInfo );
+        Assert.HasCount( 1, stored.RateLimitInfo );
+        Assert.AreEqual( later.ToUnixTimeMilliseconds( ),
+            stored.RateLimitInfo[0].RetryAfter.ToUnixTimeMilliseconds( ) );
+        Assert.AreEqual( "tracks", stored.RateLimitInfo[0].Endpoint );
+    }
+
+    /// <summary>A newer same-provider cooldown replaces the previously stored instant.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task TrySetRateLimitInfoAsync_SameProvider_NewerInstantReplacesOlder( ) {
+        const string SagaId = "rate-limit-same-provider-replacement";
+        LookupSagaState saga = await _sagaManager.GetOrCreateAsync(
+            SagaId,
+            "isrc:RATELIMITMERGE4",
+            LookupRequestType.IsrcLookup,
+            "RATELIMITMERGE4",
+            cancellationToken: TestContext.CancellationToken );
+        DateTimeOffset earlier = DateTimeOffset.UtcNow.AddMinutes( 2 );
+        DateTimeOffset later = earlier.AddMinutes( 4 );
+
+        Assert.IsTrue( await _sagaManager.TrySetRateLimitInfoAsync(
+            SagaId,
+            [new ProviderRateLimitInfo( SupportedProviders.Spotify, earlier, "tracks" )],
+            saga.InstanceToken!,
+            TestContext.CancellationToken ) );
+        Assert.IsTrue( await _sagaManager.TrySetRateLimitInfoAsync(
+            SagaId,
+            [new ProviderRateLimitInfo( SupportedProviders.Spotify, later, "albums" )],
+            saga.InstanceToken!,
+            TestContext.CancellationToken ) );
+
+        LookupSagaState stored = (await _sagaManager.GetAsync(
+            SagaId, TestContext.CancellationToken ))!;
+        Assert.IsNotNull( stored.RateLimitInfo );
+        Assert.HasCount( 1, stored.RateLimitInfo );
+        Assert.AreEqual( later.ToUnixTimeMilliseconds( ),
+            stored.RateLimitInfo[0].RetryAfter.ToUnixTimeMilliseconds( ) );
+        Assert.AreEqual( "albums", stored.RateLimitInfo[0].Endpoint );
+    }
+
+    /// <summary>An empty atomic merge is rejected before it can persist a JSON object in place of a list.</summary>
+    [TestMethod]
+    public async Task TrySetRateLimitInfoAsync_EmptyList_ShouldReject( ) {
+        const string SagaId = "rate-limit-empty-merge";
+        LookupSagaState saga = await _sagaManager.GetOrCreateAsync(
+            SagaId,
+            "isrc:RATELIMITMERGE3",
+            LookupRequestType.IsrcLookup,
+            "RATELIMITMERGE3",
+            cancellationToken: TestContext.CancellationToken );
+
+        _ = await Assert.ThrowsExactlyAsync<ArgumentException>( ( ) =>
+            _sagaManager.TrySetRateLimitInfoAsync(
+                SagaId, [], saga.InstanceToken!, TestContext.CancellationToken ) );
+    }
+
+    /// <summary>Malformed advisory rate-limit JSON does not make the rest of a saga unreadable.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task GetAsync_MalformedRateLimitInfo_IgnoresAuxiliaryField( ) {
+        const string SagaId = "malformed-rate-limit-info";
+        LookupSagaState created = await _sagaManager.GetOrCreateAsync(
+            SagaId,
+            "isrc:MALFORMED-RATE-LIMIT",
+            LookupRequestType.IsrcLookup,
+            "MALFORMED-RATE-LIMIT",
+            cancellationToken: TestContext.CancellationToken );
+        _ = await s_redis!.GetDatabase( ).HashSetAsync(
+            $"saga:{SagaId}",
+            "rateLimitInfo",
+            "{not-json" );
+
+        LookupSagaState? loaded = await _sagaManager.GetAsync(
+            SagaId, TestContext.CancellationToken );
+
+        Assert.IsNotNull( loaded );
+        Assert.AreEqual( created.InstanceToken, loaded.InstanceToken );
+        Assert.IsNull( loaded.RateLimitInfo );
     }
 
     /// <summary>An explicitly stale finalize lease is replaced with a fresh instance and clean provider state.</summary>
@@ -819,5 +964,91 @@ public class RedisSagaStateManagerTests {
         Assert.IsFalse( apple.IsComplete );
         Assert.IsFalse( apple.IsSuccess );
         Assert.IsNull( apple.ResultJson );
+    }
+
+    /// <summary>Provider initialization renews its existing leg without extending the core saga.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task TryInitializeProviderStatesAsync_ExistingProvider_RefreshesOnlyProviderTtl( ) {
+        const string SagaId = "provider-init-does-not-refresh";
+        LookupSagaState saga = await _sagaManager.GetOrCreateAsync(
+            SagaId,
+            "isrc:TTLPROVIDER001",
+            LookupRequestType.IsrcLookup,
+            "TTLPROVIDER001",
+            cancellationToken: TestContext.CancellationToken );
+        Assert.IsTrue( await _sagaManager.TryInitializeProviderStatesAsync(
+            SagaId,
+            [SupportedProviders.Spotify],
+            saga.InstanceToken!,
+            TestContext.CancellationToken ) );
+        IDatabase db = s_redis!.GetDatabase( );
+        string sagaKey = $"saga:{SagaId}";
+        string providerKey = $"saga:{SagaId}:provider:{SupportedProviders.Spotify}";
+        _ = await db.KeyExpireAsync( sagaKey, TimeSpan.FromSeconds( 20 ) );
+        _ = await db.KeyExpireAsync( providerKey, TimeSpan.FromSeconds( 20 ) );
+
+        Assert.IsTrue( await _sagaManager.TryInitializeProviderStatesAsync(
+            SagaId,
+            [SupportedProviders.Spotify],
+            saga.InstanceToken!,
+            TestContext.CancellationToken ) );
+
+        TimeSpan? sagaTtl = await db.KeyTimeToLiveAsync( sagaKey );
+        TimeSpan? providerTtl = await db.KeyTimeToLiveAsync( providerKey );
+        Assert.IsNotNull( sagaTtl );
+        Assert.IsNotNull( providerTtl );
+        Assert.IsLessThan( TimeSpan.FromMinutes( 1 ), sagaTtl.Value );
+        Assert.IsGreaterThan( TimeSpan.FromMinutes( 1 ), providerTtl.Value );
+    }
+
+    /// <summary>Rate-limit deferral renews the core after initialization has renewed the provider leg.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task RateLimitDeferral_RenewsCoreAndProviderLegTogether( ) {
+        const string SagaId = "provider-deferral-refreshes-both";
+        LookupSagaState saga = await _sagaManager.GetOrCreateAsync(
+            SagaId,
+            "isrc:TTLDEFERRAL001",
+            LookupRequestType.IsrcLookup,
+            "TTLDEFERRAL001",
+            cancellationToken: TestContext.CancellationToken );
+        Assert.IsTrue( await _sagaManager.TryInitializeProviderStatesAsync(
+            SagaId,
+            [SupportedProviders.Spotify],
+            saga.InstanceToken!,
+            TestContext.CancellationToken ) );
+
+        IDatabase db = s_redis!.GetDatabase( );
+        string sagaKey = $"saga:{SagaId}";
+        string providerKey = $"saga:{SagaId}:provider:{SupportedProviders.Spotify}";
+        _ = await db.KeyExpireAsync( sagaKey, TimeSpan.FromSeconds( 20 ) );
+        _ = await db.KeyExpireAsync( providerKey, TimeSpan.FromSeconds( 20 ) );
+
+        Assert.IsTrue( await _sagaManager.TryInitializeProviderStatesAsync(
+            SagaId,
+            [SupportedProviders.Spotify],
+            saga.InstanceToken!,
+            TestContext.CancellationToken ) );
+        Assert.IsTrue( await _sagaManager.TrySetIsPartialAsync(
+            SagaId,
+            true,
+            saga.InstanceToken!,
+            TestContext.CancellationToken ) );
+        Assert.IsTrue( await _sagaManager.TrySetRateLimitInfoAsync(
+            SagaId,
+            [new ProviderRateLimitInfo(
+                SupportedProviders.Spotify,
+                DateTimeOffset.UtcNow.AddMinutes( 1 ),
+                ProviderEndpointConstants.ProviderWide )],
+            saga.InstanceToken!,
+            TestContext.CancellationToken ) );
+
+        TimeSpan? sagaTtl = await db.KeyTimeToLiveAsync( sagaKey );
+        TimeSpan? providerTtl = await db.KeyTimeToLiveAsync( providerKey );
+        Assert.IsNotNull( sagaTtl );
+        Assert.IsNotNull( providerTtl );
+        Assert.IsGreaterThan( TimeSpan.FromMinutes( 1 ), sagaTtl.Value );
+        Assert.IsGreaterThan( TimeSpan.FromMinutes( 1 ), providerTtl.Value );
     }
 }

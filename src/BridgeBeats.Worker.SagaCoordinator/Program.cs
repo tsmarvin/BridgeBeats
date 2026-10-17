@@ -78,6 +78,8 @@ public static class Program {
         // Add Redis client from Aspire
         builder.AddRedisClient( "redis" );
 
+        _ = builder.Services.AddValidatedQueueSettings( builder.Configuration );
+
         // Lane B: Data Protection — must use the same app name and key path as Web so
         // values encrypted in one process (Web, SagaCoordinator, Maintenance) can be
         // decrypted by any other.
@@ -95,12 +97,7 @@ public static class Program {
         _ = builder.Services.AddSingleton( enabledProviders );
 
         // Register queue infrastructure services
-        _ = builder.Services.AddQueueInfrastructure( );
-
-        // Register all provider queues for secondary lookups.
-        // AddAllProviderQueues automatically applies SpotifyBulkQueueDecorator for QueuedLookupRequest,
-        // routing Spotify SongIdLookup/AlbumIdLookup to the type-specific bulk streams.
-        _ = builder.Services.AddAllProviderQueues<QueuedLookupRequest>( );
+        _ = builder.Services.AddQueueInfrastructure( registerDispatchRelay: true );
 
         // Register ATProto session manager and storage service (centralized authentication)
         int sessionTtlDays = builder.Configuration.GetValue( "BridgeBeats:ATProtoSessionTtlDays", 45 );
@@ -125,11 +122,11 @@ public static class Program {
         _ = builder.Services.AddHostedService( sp => new SagaCoordinatorBackgroundService(
             sp.GetRequiredService<IConnectionMultiplexer>( ),
             sp.GetRequiredService<ISagaStateManager>( ),
-            sp.GetRequiredService<IATProtoStorageService>( ),
+            sp.GetRequiredService<ITargetedATProtoStorageService>( ),
             sp.GetRequiredService<IMediaLinkCacheRepository>( ),
             sp.GetRequiredService<IRequestDeduplicator>( ),
             sp.GetRequiredService<SagaResultCombiner>( ),
-            sp.GetRequiredService<IProviderQueueResolver<QueuedLookupRequest>>( ),
+            sp.GetRequiredService<ILookupDispatchOutbox>( ),
             sp.GetRequiredService<HashSet<SupportedProviders>>( ),
             sp.GetRequiredService<ILogger<SagaCoordinatorBackgroundService>>( ),
             sp.GetRequiredService<IRefreshReviewStore>( )

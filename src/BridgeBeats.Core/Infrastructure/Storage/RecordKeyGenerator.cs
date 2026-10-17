@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using BridgeBeats.Contracts.DTOs;
+using BridgeBeats.Core.Domain.Services;
 
 namespace BridgeBeats.Core.Infrastructure.Storage;
 
@@ -31,9 +32,9 @@ public static class RecordKeyGenerator {
             throw new ArgumentException( "MediaLinkResult must contain at least one result", nameof( result ) );
         }
 
-        // Find the first result with a non-empty externalId
+        // Find the first result with an external id that survives rkey sanitization.
         MusicLookupResult? firstResultWithId = result.Results.Values
-            .FirstOrDefault( r => !string.IsNullOrWhiteSpace( r.ExternalId ) );
+            .FirstOrDefault( MediaLookupResultIdentity.HasUsableExternalId );
 
         if (firstResultWithId != null) {
             string? rkey = GenerateRkey( firstResultWithId.ExternalId, firstResultWithId.IsAlbum ?? false );
@@ -87,9 +88,9 @@ public static class RecordKeyGenerator {
         }
 
         string prefix = isAlbum ? "album" : "track";
-        string sanitizedId = SanitizeForRkey( externalId );
+        string sanitizedId = MediaLookupResultIdentity.NormalizeExternalId( externalId );
 
-        return string.IsNullOrEmpty( sanitizedId )
+        return !sanitizedId.Any( char.IsLetterOrDigit )
             ? throw new ArgumentException( "ExternalId must contain valid characters after sanitization", nameof( externalId ) )
             : $"{prefix}:{sanitizedId}";
     }
@@ -122,25 +123,6 @@ public static class RecordKeyGenerator {
 
         // Truncate to maxLength and return lowercase for consistency
         return base32Hash[..Math.Min( maxLength, base32Hash.Length )].ToLowerInvariant( );
-    }
-
-    /// <summary>
-    /// Strips an external id down to the characters allowed in an rkey: letters, digits, and hyphen.
-    /// </summary>
-    /// <param name="externalId">The raw external id.</param>
-    /// <returns>The id with all characters other than letters, digits, and hyphen removed, or an empty string when the input is null or whitespace.</returns>
-    private static string SanitizeForRkey( string externalId ) {
-        if (string.IsNullOrWhiteSpace( externalId )) {
-            return string.Empty;
-        }
-
-        // Keep only alphanumeric characters and hyphens
-        StringBuilder sb = new( );
-        foreach (char c in externalId.Where( c => char.IsLetterOrDigit( c ) || c == '-' )) {
-            _ = sb.Append( c );
-        }
-
-        return sb.ToString( );
     }
 
     /// <summary>

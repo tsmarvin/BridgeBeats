@@ -13,6 +13,7 @@ using BridgeBeats.Core.Infrastructure.Queue;
 using BridgeBeats.Core.Infrastructure.Utilities;
 using Microsoft.Extensions.Logging;
 using Moq;
+using Polly.CircuitBreaker;
 using StackExchange.Redis;
 
 namespace BridgeBeats.Tests.Unit;
@@ -110,6 +111,10 @@ public class QueueProcessorBackgroundServiceTests {
         _ = _sagaManagerMock.Setup( s => s.TrySetRateLimitInfoAsync(
                 It.IsAny<string>( ), It.IsAny<List<ProviderRateLimitInfo>>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( true );
+        _ = _queueMock.Setup( q => q.ReplaceAsync(
+                It.IsAny<string>( ), It.IsAny<QueuedLookupRequest>( ),
+                It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( DeliveryReplacementOutcome.Replaced );
 
         _ = _redisMock.Setup( r => r.GetSubscriber( It.IsAny<object>( ) ) ).Returns( _subscriberMock.Object );
     }
@@ -241,7 +246,9 @@ public class QueueProcessorBackgroundServiceTests {
     public async Task ProcessMessage_WhenEndpointNotRateLimited_ShouldCallLookupService( ) {
         // Arrange
         QueueProcessorBackgroundService service = CreateService( );
-        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US1234567890" );
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US1234567890" ) with {
+            RateLimitedEndpoint = "tracks"
+        };
         QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
 
         SetupNotRateLimited( );
@@ -386,7 +393,9 @@ public class QueueProcessorBackgroundServiceTests {
     public async Task ProcessMessage_WhenEndpointRateLimited_ShouldRequeueWithDelay( ) {
         // Arrange
         QueueProcessorBackgroundService service = CreateService( );
-        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US1234567890" );
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US1234567890" ) with {
+            RateLimitedEndpoint = "tracks"
+        };
         QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
 
         TimeSpan timeRemaining = TimeSpan.FromSeconds( 30 );
@@ -1165,8 +1174,7 @@ public class QueueProcessorBackgroundServiceTests {
     #region Rate Limit Exception Handling Tests
 
     /// <summary>
-    /// A <see cref="RetryAfterExceededException"/> from the lookup sets a rate-limit window in the
-    /// tracker for this provider.
+    /// The HTTP handler owns the shared tracker write, so the queue processor does not duplicate it.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
@@ -1201,19 +1209,19 @@ public class QueueProcessorBackgroundServiceTests {
         // Assert
         _rateLimitTrackerMock.Verify(
             r => r.SetRateLimitedAsync(
-                TestProvider,
-                It.IsAny<string>( ), // Uses LookupType.ToString() as endpoint
+                It.IsAny<SupportedProviders>( ),
+                It.IsAny<string>( ),
                 It.IsAny<DateTimeOffset>( ),
                 It.IsAny<CancellationToken>( )
             ),
-            Times.Once
+            Times.Never
         );
     }
 
     /// <summary>
     /// A <see cref="RetryAfterExceededException"/> acknowledges the original message and re-enqueues
-    /// the request at <see cref="QueuePriority.Background"/> with an incremented attempt count and the
-    /// rate-limited endpoint recorded.
+    /// the request at <see cref="QueuePriority.Background"/> with its attempt count preserved, the
+    /// rate-limited endpoint recorded, and an unconditional eligibility timestamp.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
@@ -1226,12 +1234,14 @@ public class QueueProcessorBackgroundServiceTests {
 
         SetupNotRateLimited( );
         SetupSagaNotComplete( request.SagaId );
+        DateTimeOffset beforeDeferral = DateTimeOffset.UtcNow;
         _ = _lookupServiceMock.Setup( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
             .ThrowsAsync( new RetryAfterExceededException(
                 retryAfter,
                 TimeSpan.FromSeconds( 30 ),
                 new Uri( "https://api.spotify.com/v1/tracks" ),
-                SupportedProviders.Spotify
+                SupportedProviders.Spotify,
+                ProviderEndpointConstants.Tracks
             ) );
 
         int callCount = 0;
@@ -1245,24 +1255,136 @@ public class QueueProcessorBackgroundServiceTests {
         await cts.CancelAsync( );
         await service.StopAsync( CancellationToken.None );
 
-        // Assert - Should acknowledge original and re-enqueue (rate-limit-aware dequeue will skip until limit expires)
+        // Assert - the original is atomically replaced (rate-limit-aware dequeue will skip until limit expires)
         _queueMock.Verify(
-            q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ),
-            Times.Once
-        );
-        _queueMock.Verify(
-            q => q.EnqueueAsync(
+            q => q.ReplaceAsync(
+                message.MessageId,
                 It.Is<QueuedLookupRequest>( r =>
                     r.LookupType == request.LookupType &&
                     r.LookupValue == request.LookupValue &&
-                    r.AttemptCount == request.AttemptCount + 1 &&
-                    r.RateLimitedEndpoint == request.LookupType.ToString( )
+                    r.AttemptCount == request.AttemptCount &&
+                    r.RateLimitedEndpoint == ProviderEndpointConstants.Tracks &&
+                    r.NotBefore >= beforeDeferral.AddSeconds( 55 )
                 ),
                 QueuePriority.Background,
                 It.IsAny<CancellationToken>( )
             ),
             Times.Once
         );
+    }
+
+    /// <summary>A near-expired shared cooldown is not extended back to the configured minimum.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_WhenRemainingCooldownIsBelowMinimum_PreservesRemainingDuration( ) {
+        QueueProcessorBackgroundService service = CreateService( );
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US1234567890" );
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        QueuedLookupRequest? requeued = null;
+
+        SetupNotRateLimited( );
+        SetupSagaNotComplete( request.SagaId );
+        _ = _lookupServiceMock.Setup( lookup => lookup.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
+            .ThrowsAsync( new ProviderRateLimitException(
+                TimeSpan.FromSeconds( 1 ),
+                new Uri( "https://api.spotify.com/v1/tracks" ),
+                SupportedProviders.Spotify,
+                ProviderEndpointConstants.Tracks ) );
+        _ = _queueMock.Setup( queue => queue.ReplaceAsync(
+                message.MessageId,
+                It.IsAny<QueuedLookupRequest>( ),
+                It.IsAny<QueuePriority>( ),
+                It.IsAny<CancellationToken>( ) ) )
+            .Callback( (string _, QueuedLookupRequest queued, QueuePriority _, CancellationToken _) =>
+                requeued = queued )
+            .ReturnsAsync( DeliveryReplacementOutcome.Replaced );
+        int callCount = 0;
+        _ = _queueMock.Setup( queue => queue.DequeueAsync(
+                It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => callCount++ == 0 ? message : null );
+        DateTimeOffset beforeDeferral = DateTimeOffset.UtcNow;
+
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 200, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        Assert.IsNotNull( requeued );
+        Assert.IsNotNull( requeued.NotBefore );
+        DateTimeOffset actualNotBefore = requeued.NotBefore.Value;
+        Assert.IsGreaterThanOrEqualTo( beforeDeferral, actualNotBefore );
+        Assert.IsLessThan( beforeDeferral.AddSeconds( 4 ), actualNotBefore,
+            "The queue processor must not raise a remaining one-second cooldown to the five-second minimum." );
+    }
+
+    /// <summary>A circuit-open delivery exhausts the bounded queue budget after Polly gives up.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_WhenCircuitIsOpenAtRetryCeiling_ShouldMoveToDlq( ) {
+        QueueProcessorBackgroundService service = CreateService( provider: SupportedProviders.Tidal );
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US-CIRCUIT-OPEN" ) with {
+            AttemptCount = LookupConstants.MaxQueueRetryAttempts - 1
+        };
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+
+        SetupNotRateLimited( );
+        SetupSagaNotComplete( request.SagaId );
+        _ = _lookupServiceMock.Setup( lookup => lookup.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
+            .ThrowsAsync( new BrokenCircuitException( ) );
+        int calls = 0;
+        _ = _queueMock.Setup( queue => queue.DequeueAsync(
+                It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 200, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        _queueMock.Verify( queue => queue.EnqueueAsync(
+            It.IsAny<QueuedLookupRequest>( ),
+            It.IsAny<QueuePriority>( ),
+            It.IsAny<CancellationToken>( ) ), Times.Never );
+        _queueMock.Verify( queue => queue.RequeueAsync(
+            It.IsAny<string>( ), It.IsAny<TimeSpan?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _rateLimitTrackerMock.Verify( tracker => tracker.SetRateLimitedAsync(
+            It.IsAny<SupportedProviders>( ),
+            It.IsAny<string>( ),
+            It.IsAny<DateTimeOffset>( ),
+            It.IsAny<CancellationToken>( ) ), Times.Never );
+        _queueMock.Verify( queue => queue.MoveToDlqAsync(
+            message.MessageId, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
+    /// <summary>An expired delivery terminates without another provider call or requeue.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_WhenAbsoluteDeadlinePassed_ShouldMoveToDlq( ) {
+        QueueProcessorBackgroundService service = CreateService( jobExpirationMinutes: 1 );
+        QueuedLookupRequest request = CreateRequest(
+            LookupRequestType.IsrcLookup,
+            "US-EXPIRED" ) with { CreatedAt = DateTimeOffset.UtcNow.AddMinutes( -2 ) };
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        SetupSagaNotComplete( request.SagaId );
+        int calls = 0;
+        _ = _queueMock.Setup( queue => queue.DequeueAsync(
+                It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 200, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        _lookupServiceMock.Verify( lookup => lookup.GetInfoByISRCAsync(
+            It.IsAny<string>( ) ), Times.Never );
+        _queueMock.Verify( queue => queue.MoveToDlqAsync(
+            message.MessageId, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( queue => queue.RequeueAsync(
+            It.IsAny<string>( ), It.IsAny<TimeSpan?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
     }
 
     /// <summary>
@@ -1491,7 +1613,8 @@ public class QueueProcessorBackgroundServiceTests {
             OriginPriority = QueuePriority.Interactive
         };
         QueuedMessage<QueuedLookupRequest> message = CreateMessage( request ) with { Priority = QueuePriority.Interactive };
-        TimeSpan retryAfter = TimeSpan.FromSeconds( 60 );
+        DateTimeOffset beforeRateLimit = DateTimeOffset.UtcNow;
+        TimeSpan retryAfter = TimeSpan.MaxValue;
 
         SetupNotRateLimited( );
         SetupSagaNotComplete( request.SagaId );
@@ -1526,16 +1649,17 @@ public class QueueProcessorBackgroundServiceTests {
         await cts.CancelAsync( );
         await service.StopAsync( CancellationToken.None );
 
-        // Assert — enqueue precedes acknowledgement at Background priority.
+        // Assert — the delivery is atomically replaced on its interactive lane.
         _queueMock.Verify(
-            q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ),
-            Times.Once
-        );
-        _queueMock.Verify(
-            q => q.EnqueueAsync(
+            q => q.ReplaceAsync(
+                message.MessageId,
                 It.Is<QueuedLookupRequest>( r =>
                     r.LookupType == request.LookupType &&
-                    r.AttemptCount == request.AttemptCount + 1
+                    r.AttemptCount == request.AttemptCount &&
+                    r.NotBefore > beforeRateLimit &&
+                    r.NotBefore <= beforeRateLimit
+                        .Add( QueueSettings.DefaultMaximumRateLimitRetryAfter )
+                        .AddSeconds( 2 )
                 ),
                 QueuePriority.Interactive,
                 It.IsAny<CancellationToken>( )
@@ -1571,7 +1695,8 @@ public class QueueProcessorBackgroundServiceTests {
             .ThrowsAsync( new RetryAfterExceededException(
                 TimeSpan.FromSeconds( 60 ), TimeSpan.FromSeconds( 30 ),
                 new Uri( "https://api.spotify.com/v1/tracks" ), SupportedProviders.Spotify ) );
-        _ = _queueMock.Setup( q => q.EnqueueAsync(
+        _ = _queueMock.Setup( q => q.ReplaceAsync(
+                message.MessageId,
                 It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ) )
             .ThrowsAsync( new RedisServerException( "XADD failed" ) );
         int calls = 0;
@@ -1596,7 +1721,11 @@ public class QueueProcessorBackgroundServiceTests {
         await service.StopAsync( CancellationToken.None );
 
         _queueMock.Verify( q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ), Times.Never );
-        _queueMock.Verify( q => q.EnqueueAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( q => q.ReplaceAsync(
+            message.MessageId,
+            It.IsAny<QueuedLookupRequest>( ),
+            It.IsAny<QueuePriority>( ),
+            It.IsAny<CancellationToken>( ) ), Times.Once );
         _loggerMock.Verify( l => l.Log(
             LogLevel.Warning,
             new EventId( LogEventIds.Services.Queue.InteractiveDeferredToBackground ),
@@ -1647,16 +1776,13 @@ public class QueueProcessorBackgroundServiceTests {
         await cts.CancelAsync( );
         await service.StopAsync( CancellationToken.None );
 
-        // Assert — same requeue-at-Background path; no divergence from background-origin behavior
+        // Assert — same atomic replacement at Background priority.
         _queueMock.Verify(
-            q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ),
-            Times.Once
-        );
-        _queueMock.Verify(
-            q => q.EnqueueAsync(
+            q => q.ReplaceAsync(
+                message.MessageId,
                 It.Is<QueuedLookupRequest>( r =>
                     r.LookupType == request.LookupType &&
-                    r.AttemptCount == request.AttemptCount + 1
+                    r.AttemptCount == request.AttemptCount
                 ),
                 QueuePriority.Background,
                 It.IsAny<CancellationToken>( )
@@ -1733,6 +1859,73 @@ public class QueueProcessorBackgroundServiceTests {
         _queueMock.Verify( q => q.MoveToDlqAsync( message.MessageId, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
         _queueMock.Verify( q => q.EnqueueAsync(
             It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>A DNS resolution outage consumes the bounded durable retry budget.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_NameResolutionFailure_RequeuesAsTransient( ) {
+        QueueProcessorBackgroundService service = CreateService( );
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "DNS-FAIL" );
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        SetupNotRateLimited( );
+        SetupSagaNotComplete( request.SagaId );
+        _ = _lookupServiceMock.Setup( lookup => lookup.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
+            .ThrowsAsync( new HttpRequestException(
+                HttpRequestError.NameResolutionError,
+                "Provider host could not be resolved." ) );
+        int calls = 0;
+        _ = _queueMock.Setup( queue => queue.DequeueAsync(
+                It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 200, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        _queueMock.Verify( queue => queue.MoveToDlqAsync(
+            message.MessageId, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _queueMock.Verify( queue => queue.RequeueAsync(
+            message.MessageId, null, It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
+    /// <summary>Transport configuration failures are terminal and bypass the durable retry loop.</summary>
+    [TestMethod]
+    [DataRow( HttpRequestError.UserAuthenticationError )]
+    [DataRow( HttpRequestError.ConfigurationLimitExceeded )]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_PermanentTransportFailure_MovesToDlq(
+        HttpRequestError error
+    ) {
+        QueueProcessorBackgroundService service = CreateService( );
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, $"PERMANENT-{error}" );
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        SetupNotRateLimited( );
+        SetupSagaNotComplete( request.SagaId );
+        _ = _lookupServiceMock.Setup( lookup => lookup.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
+            .ThrowsAsync( new HttpRequestException( error, "Provider transport configuration failed." ) );
+        int calls = 0;
+        _ = _queueMock.Setup( queue => queue.DequeueAsync(
+                It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 200, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        _sagaManagerMock.Verify( saga => saga.TryUpdateProviderStateAsync(
+            request.SagaId,
+            It.Is<ProviderLookupState>( state => state.IsComplete && !state.IsSuccess ),
+            It.IsAny<string>( ),
+            It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( queue => queue.MoveToDlqAsync(
+            message.MessageId, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( queue => queue.RequeueAsync(
+            It.IsAny<string>( ), It.IsAny<TimeSpan?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
     }
 
     /// <summary>Ordinary transient retries preserve the delivered interactive or bulk lane.</summary>
@@ -2355,16 +2548,23 @@ public class QueueProcessorBackgroundServiceTests {
     /// Builds a <see cref="QueueProcessorBackgroundService"/> bound to <see cref="TestProvider"/> from
     /// the current dependency mocks.
     /// </summary>
-    private QueueProcessorBackgroundService CreateService( IMusicLookupService? lookupService = null, int concurrency = 1 ) =>
+    private QueueProcessorBackgroundService CreateService(
+        IMusicLookupService? lookupService = null,
+        int concurrency = 1,
+        SupportedProviders provider = TestProvider,
+        int jobExpirationMinutes = 2880 ) =>
         new(
             _redisMock.Object,
             _queueMock.Object,
             _rateLimitTrackerMock.Object,
             _sagaManagerMock.Object,
             lookupService ?? _lookupServiceMock.Object,
-            TestProvider,
+            provider,
             _loggerMock.Object,
-            new QueueSettings { DefaultProviderConcurrency = concurrency }
+            new QueueSettings {
+                DefaultProviderConcurrency = concurrency,
+                JobExpirationMinutes = jobExpirationMinutes
+            }
         );
 
     /// <summary>Queue seam exposing consumer-group assurance for hosted-loop recovery tests.</summary>
@@ -2377,6 +2577,7 @@ public class QueueProcessorBackgroundServiceTests {
         public Task<QueuedMessage<QueuedLookupRequest>?> DequeueAsync( IRateLimitTracker tracker, CancellationToken cancellationToken = default ) => DequeueRate( cancellationToken );
         public Task AcknowledgeAsync( string messageId, CancellationToken cancellationToken = default ) => Task.CompletedTask;
         public Task RequeueAsync( string messageId, TimeSpan? delay = null, CancellationToken cancellationToken = default ) => Task.CompletedTask;
+        public Task<DeliveryReplacementOutcome> ReplaceAsync( string messageId, QueuedLookupRequest replacement, QueuePriority priority, CancellationToken cancellationToken = default ) => Task.FromResult( DeliveryReplacementOutcome.Replaced );
         public Task<QueueDepth> GetDepthAsync( CancellationToken cancellationToken = default ) => Task.FromResult( new QueueDepth( 0, 0, 0, 0 ) );
         public Task<IReadOnlyList<QueuedMessage<QueuedLookupRequest>>> GetDlqMessagesAsync( int limit, CancellationToken cancellationToken = default ) => Task.FromResult<IReadOnlyList<QueuedMessage<QueuedLookupRequest>>>( [] );
         public Task RequeueFromDlqAsync( string messageId, QueuePriority priority, CancellationToken cancellationToken = default ) => Task.CompletedTask;

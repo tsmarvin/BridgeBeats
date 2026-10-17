@@ -356,6 +356,172 @@ public class CachingMediaLinkServiceTests {
         Assert.IsEmpty( results );
     }
 
+    /// <summary>Provider URLs resolving to the same normalized external id produce one result.</summary>
+    [TestMethod]
+    public async Task GetInfoAsync_WithDuplicateExternalIds_ShouldYieldOneResult( ) {
+        MediaLinkResult first = CreateMediaLinkResult( );
+        MediaLinkResult duplicate = new( ) {
+            Results = new Dictionary<SupportedProviders, MusicLookupResult> {
+                [SupportedProviders.AppleMusic] = new MusicLookupResult {
+                    Artist = TestArtist,
+                    Title = TestTitle,
+                    ExternalId = TestIsrc.ToLowerInvariant( ),
+                    URL = "https://music.apple.com/us/song/duplicate",
+                    IsAlbum = false
+                }
+            }
+        };
+        _ = _orchestratorMock
+            .Setup( orchestrator => orchestrator.LookupByContentAsync( TestContent ) )
+            .Returns( CreateAsyncEnumerable(
+                new LookupResult { Result = first },
+                new LookupResult { Result = duplicate } ) );
+
+        List<MediaLinkResult> results = [];
+        await foreach (MediaLinkResult result in _service.GetInfoAsync( TestContent )) {
+            results.Add( result );
+        }
+
+        Assert.HasCount( 1, results );
+    }
+
+    /// <summary>Equivalent provider results without an external id are deduplicated by value.</summary>
+    [TestMethod]
+    public async Task GetInfoAsync_WithDuplicateValuesWithoutExternalId_ShouldYieldOneResult( ) {
+        MediaLinkResult first = new( ) {
+            Results = new Dictionary<SupportedProviders, MusicLookupResult> {
+                [SupportedProviders.Spotify] = new MusicLookupResult {
+                    Artist = TestArtist,
+                    Title = TestTitle,
+                    URL = "https://open.spotify.com/track/no-external-id",
+                    IsAlbum = false
+                }
+            }
+        };
+        MediaLinkResult duplicate = new( ) {
+            Results = new Dictionary<SupportedProviders, MusicLookupResult> {
+                [SupportedProviders.Spotify] = new MusicLookupResult {
+                    Artist = TestArtist,
+                    Title = TestTitle,
+                    URL = "https://open.spotify.com/track/no-external-id",
+                    IsAlbum = false
+                }
+            }
+        };
+        _ = _orchestratorMock
+            .Setup( orchestrator => orchestrator.LookupByContentAsync( TestContent ) )
+            .Returns( CreateAsyncEnumerable(
+                new LookupResult { Result = first },
+                new LookupResult { Result = duplicate } ) );
+
+        List<MediaLinkResult> results = [];
+        await foreach (MediaLinkResult result in _service.GetInfoAsync( TestContent )) {
+            results.Add( result );
+        }
+
+        Assert.HasCount( 1, results );
+    }
+
+    /// <summary>A partial no-id result does not suppress a later equivalent complete result.</summary>
+    [TestMethod]
+    public async Task GetInfoAsync_PartialThenCompleteWithoutExternalId_ShouldYieldBothResults( ) {
+        MusicLookupResult value = new( ) {
+            Artist = TestArtist,
+            Title = TestTitle,
+            URL = "https://open.spotify.com/track/no-external-id",
+            IsAlbum = false
+        };
+        MediaLinkResult partial = new( ) {
+            Results = new Dictionary<SupportedProviders, MusicLookupResult> {
+                [SupportedProviders.Spotify] = value
+            }
+        };
+        MediaLinkResult complete = new( ) {
+            Results = new Dictionary<SupportedProviders, MusicLookupResult> {
+                [SupportedProviders.Spotify] = new MusicLookupResult {
+                    Artist = value.Artist,
+                    Title = value.Title,
+                    URL = value.URL,
+                    IsAlbum = value.IsAlbum
+                }
+            }
+        };
+        _ = _orchestratorMock
+            .Setup( orchestrator => orchestrator.LookupByContentAsync( TestContent ) )
+            .Returns( CreateAsyncEnumerable(
+                new LookupResult { Result = partial, SagaId = "partial-no-id" },
+                new LookupResult { Result = complete } ) );
+
+        List<MediaLinkResult> results = [];
+        await foreach (MediaLinkResult result in _service.GetInfoAsync( TestContent )) {
+            results.Add( result );
+        }
+
+        Assert.HasCount( 2, results );
+        Assert.IsTrue( results[0].IsPartial );
+        Assert.IsFalse( results[1].IsPartial );
+    }
+
+    /// <summary>A partial result never hides a later complete result for the same identity.</summary>
+    [TestMethod]
+    public async Task GetInfoAsync_PartialThenCompleteSameIdentity_ShouldYieldBothResults( ) {
+        MediaLinkResult partial = CreateMediaLinkResult( );
+        MediaLinkResult complete = new( ) {
+            Results = new Dictionary<SupportedProviders, MusicLookupResult> {
+                [SupportedProviders.AppleMusic] = new MusicLookupResult {
+                    Artist = TestArtist,
+                    Title = TestTitle,
+                    ExternalId = TestIsrc.ToLowerInvariant( ),
+                    URL = "https://music.apple.com/us/song/complete",
+                    IsAlbum = false
+                }
+            }
+        };
+        _ = _orchestratorMock
+            .Setup( orchestrator => orchestrator.LookupByContentAsync( TestContent ) )
+            .Returns( CreateAsyncEnumerable(
+                new LookupResult { Result = partial, SagaId = "partial-saga" },
+                new LookupResult { Result = complete } ) );
+
+        List<MediaLinkResult> results = [];
+        await foreach (MediaLinkResult result in _service.GetInfoAsync( TestContent )) {
+            results.Add( result );
+        }
+
+        Assert.HasCount( 2, results );
+        Assert.IsTrue( results[0].IsPartial );
+        Assert.IsFalse( results[1].IsPartial );
+    }
+
+    /// <summary>The same text remains distinct when one identity is a track and one is an album.</summary>
+    [TestMethod]
+    public async Task GetInfoAsync_WithSameExternalIdAcrossKinds_ShouldYieldBothResults( ) {
+        MediaLinkResult track = CreateMediaLinkResult( );
+        MediaLinkResult album = new( ) {
+            Results = new Dictionary<SupportedProviders, MusicLookupResult> {
+                [SupportedProviders.AppleMusic] = new MusicLookupResult {
+                    Artist = TestArtist,
+                    Title = TestTitle,
+                    ExternalId = TestIsrc.ToLowerInvariant( ),
+                    URL = "https://music.apple.com/us/album/distinct-kind",
+                    IsAlbum = true
+                }
+            }
+        };
+        _ = _orchestratorMock
+            .Setup( orchestrator => orchestrator.LookupByContentAsync( TestContent ) )
+            .Returns( CreateAsyncEnumerable(
+                new LookupResult { Result = track },
+                new LookupResult { Result = album } ) );
+
+        List<MediaLinkResult> results = [];
+        await foreach (MediaLinkResult result in _service.GetInfoAsync( TestContent )) {
+            results.Add( result );
+        }
+
+        Assert.HasCount( 2, results );
+    }
+
     #endregion
 
     #region Partial Result Message Tests

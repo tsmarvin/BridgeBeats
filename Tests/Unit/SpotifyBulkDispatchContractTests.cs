@@ -236,11 +236,11 @@ public class SpotifyBulkDispatchContractTests {
                 It.IsAny<CommandFlags>( ) ) )
             .ReturnsAsync( (RedisValue)"9999999999-0" );
 
-        // Atomic bulk-rejection transfer returns the interactive replacement id.
+        // Queue-delivery transitions report a typed numeric outcome.
         _ = _dbMock.Setup( d => d.ScriptEvaluateAsync(
                 It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ) )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999999999-1" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         // Subscriber PublishAsync succeeds
         _ = _subscriberMock.Setup( s => s.PublishAsync(
@@ -320,6 +320,162 @@ public class SpotifyBulkDispatchContractTests {
             It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Empty-dict (transient request failure) must not trigger Interactive re-enqueue; only 4xx does" );
+    }
+
+    /// <summary>Expired bulk work is terminalized before any Spotify request is issued.</summary>
+    [TestMethod]
+    public async Task ProcessBulkTracks_WhenJobExpired_TerminalizesBeforeProviderIo( ) {
+        QueuedLookupRequest expired = CreateRequest( TestTrackId ) with {
+            CreatedAt = DateTimeOffset.UtcNow.AddDays( -3 )
+        };
+        _ = _dbMock.Setup( d => d.StreamReadGroupAsync(
+                TrackStream,
+                It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue?>( ),
+                It.IsAny<int?>( ),
+                It.IsAny<bool>( ),
+                It.IsAny<TimeSpan?>( ),
+                It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( [BuildStreamEntryFromRequest( expired )] );
+
+        await CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
+
+        _lookupServiceMock.Verify( service => service.GetTracksByIdsAsync(
+            It.IsAny<IEnumerable<string>>( ) ), Times.Never );
+        _sagaManagerMock.Verify( manager => manager.TryUpdateProviderStateAsync(
+            TestSagaId,
+            It.Is<ProviderLookupState>( state => state.IsComplete
+                && !state.IsSuccess
+                && state.ErrorMessage == "Lookup job expired before provider completion." ),
+            "test-instance",
+            It.IsAny<CancellationToken>( ) ), Times.Once );
+        _requestQueueMock.Verify( queue => queue.MoveToDlqAsync(
+            It.IsAny<string>( ),
+            "Lookup job expired before provider completion.",
+            It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
+    /// <summary>An extreme durable bulk deferral is clamped and rescheduled without provider I/O or attempt consumption.</summary>
+    [TestMethod]
+    public async Task ProcessBulkTracks_WhenNotBeforeIsExtreme_ClampsAndRequeuesWithoutProviderIo( ) {
+        DateTimeOffset beforeProcessing = DateTimeOffset.UtcNow;
+        DateTimeOffset notBefore = DateTimeOffset.MaxValue;
+        QueuedLookupRequest deferred = CreateRequest( TestTrackId, attemptCount: 3 ) with {
+            RateLimitedEndpoint = SpotifyConstants.TracksEndpoint,
+            NotBefore = notBefore,
+            EnqueueOrigin = QueueEnqueueOrigin.Requeue
+        };
+        StreamEntry entry = BuildStreamEntryFromRequest( deferred );
+        _ = _dbMock.Setup( database => database.StreamReadGroupAsync(
+                TrackStream,
+                It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue?>( ),
+                It.IsAny<int?>( ),
+                It.IsAny<bool>( ),
+                It.IsAny<TimeSpan?>( ),
+                It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( [entry] );
+        _ = _dbMock.Setup( database => database.StreamRangeAsync(
+                TrackStream,
+                It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue>( ),
+                It.IsAny<int?>( ),
+                It.IsAny<Order>( ),
+                It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( [entry] );
+        RedisValue[]? capturedArguments = null;
+        _ = _dbMock.Setup( database => database.ScriptEvaluateAsync(
+                It.IsAny<string>( ),
+                It.IsAny<RedisKey[]?>( ),
+                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 15 ),
+                It.IsAny<CommandFlags>( ) ) )
+            .Callback( ( string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _ ) =>
+                capturedArguments = arguments )
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
+
+        await CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
+
+        _lookupServiceMock.Verify( service => service.GetTracksByIdsAsync(
+            It.IsAny<IEnumerable<string>>( ) ), Times.Never );
+        Assert.IsNotNull( capturedArguments );
+        QueuedLookupRequest requeued = JsonSerializer.Deserialize<QueuedLookupRequest>(
+            capturedArguments[3].ToString( ), s_jsonOptions )!;
+        Assert.AreEqual( 3, requeued.AttemptCount );
+        Assert.IsGreaterThan( beforeProcessing, requeued.NotBefore.GetValueOrDefault( ) );
+        Assert.IsLessThanOrEqualTo(
+            beforeProcessing.Add( QueueSettings.DefaultMaximumRateLimitRetryAfter ).AddSeconds( 2 ),
+            requeued.NotBefore.GetValueOrDefault( ) );
+        Assert.AreEqual( SpotifyConstants.TracksEndpoint, requeued.RateLimitedEndpoint );
+    }
+
+    /// <summary>A later expiration failure cannot requeue an earlier delivery already made terminal.</summary>
+    [TestMethod]
+    public async Task ProcessBulkTracks_WhenLaterExpirationFails_RequeuesOnlyUncommittedDelivery( ) {
+        QueuedLookupRequest firstRequest = CreateRequest( "expired-first" ) with {
+            SagaId = "expired-first-saga",
+            CreatedAt = DateTimeOffset.UtcNow.AddDays( -3 )
+        };
+        QueuedLookupRequest secondRequest = CreateRequest( "expired-second" ) with {
+            SagaId = "expired-second-saga",
+            CreatedAt = DateTimeOffset.UtcNow.AddDays( -3 )
+        };
+        StreamEntry firstTemplate = BuildStreamEntryFromRequest( firstRequest );
+        StreamEntry secondTemplate = BuildStreamEntryFromRequest( secondRequest );
+        StreamEntry first = new( (RedisValue)"1234567890-1", firstTemplate.Values );
+        StreamEntry second = new( (RedisValue)"1234567890-2", secondTemplate.Values );
+        _ = _dbMock.Setup( database => database.StreamReadGroupAsync(
+                TrackStream,
+                It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue?>( ),
+                It.IsAny<int?>( ),
+                It.IsAny<bool>( ),
+                It.IsAny<TimeSpan?>( ),
+                It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( [first, second] );
+        _ = _sagaManagerMock.Setup( manager => manager.GetAsync(
+                firstRequest.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( new LookupSagaState {
+                SagaId = firstRequest.SagaId,
+                LookupKey = $"{LookupRequestType.SongIdLookup}:{SupportedProviders.Spotify}:{firstRequest.LookupValue}",
+                LookupType = firstRequest.LookupType,
+                LookupValue = firstRequest.LookupValue,
+                InstanceToken = "test-instance"
+            } );
+        _ = _sagaManagerMock.Setup( manager => manager.GetAsync(
+                secondRequest.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new InvalidOperationException( "second expiration failed" ) );
+        _ = _dbMock.Setup( database => database.StreamRangeAsync(
+                TrackStream,
+                It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue>( ),
+                It.IsAny<int?>( ),
+                It.IsAny<Order>( ),
+                It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( [second] );
+        RedisValue[]? capturedArguments = null;
+        _ = _dbMock.Setup( database => database.ScriptEvaluateAsync(
+                It.IsAny<string>( ),
+                It.IsAny<RedisKey[]?>( ),
+                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 15 ),
+                It.IsAny<CommandFlags>( ) ) )
+            .Callback( ( string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _ ) =>
+                capturedArguments = arguments )
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
+
+        await CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
+
+        _requestQueueMock.Verify( queue => queue.MoveToDlqAsync(
+            $"{TrackStream}:1234567890-1",
+            "Lookup job expired before provider completion.",
+            It.IsAny<CancellationToken>( ) ), Times.Once );
+        Assert.IsNotNull( capturedArguments );
+        QueuedLookupRequest requeued = JsonSerializer.Deserialize<QueuedLookupRequest>(
+            capturedArguments[3].ToString( ), s_jsonOptions )!;
+        Assert.AreEqual( secondRequest.SagaId, requeued.SagaId );
+        Assert.AreNotEqual( firstRequest.SagaId, requeued.SagaId );
     }
 
     /// <summary>
@@ -457,8 +613,8 @@ public class SpotifyBulkDispatchContractTests {
             .ReturnsAsync( false );
         _ = _dbMock.Setup( database => database.ScriptEvaluateAsync(
                 It.IsAny<string>( ),
-                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == TrackStream ),
-                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 2 ),
+                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 3 && keys[0] == TrackStream ),
+                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 3 ),
                 It.IsAny<CommandFlags>( ) ) )
             .ThrowsAsync( new RedisServerException( "atomic acknowledgement unavailable" ) );
 
@@ -500,8 +656,8 @@ public class SpotifyBulkDispatchContractTests {
             .ReturnsAsync( true );
         _ = _dbMock.Setup( database => database.ScriptEvaluateAsync(
                 It.IsAny<string>( ),
-                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == TrackStream ),
-                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 2 ),
+                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 3 && keys[0] == TrackStream ),
+                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 3 ),
                 It.IsAny<CommandFlags>( ) ) )
             .ThrowsAsync( new RedisServerException( "atomic acknowledgement unavailable" ) );
 
@@ -643,13 +799,14 @@ public class SpotifyBulkDispatchContractTests {
                 It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ) )
             .Callback( ( string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _ ) => capturedArguments = arguments )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999-0" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         SpotifyBatchQueueHelper helper = CreateHelper( );
         string compositeId = $"{TrackStream}:1234567890-0";
 
         // Act — returns Requeued (not capped, not not-found)
-        RequeueOutcome outcome = await helper.RequeueAsync( compositeId, TestSagaId, TestContext.CancellationToken );
+        RequeueOutcome outcome = await helper.RequeueAsync(
+            compositeId, TestSagaId, cancellationToken: TestContext.CancellationToken );
 
         // Assert — method signals "requeued"
         Assert.AreEqual( RequeueOutcome.Requeued, outcome, "Return value must be Requeued (message re-added, not capped)" );
@@ -678,7 +835,9 @@ public class SpotifyBulkDispatchContractTests {
                 It.IsAny<CommandFlags>( ) ) ).ThrowsAsync( new RedisServerException( "atomic move failed" ) );
 
         _ = await Assert.ThrowsAsync<RedisServerException>(
-            ( ) => CreateHelper( ).RequeueAsync( $"{TrackStream}:1234567890-0", TestSagaId, TestContext.CancellationToken ) );
+            ( ) => CreateHelper( ).RequeueAsync(
+                $"{TrackStream}:1234567890-0", TestSagaId,
+                cancellationToken: TestContext.CancellationToken ) );
 
     }
 
@@ -705,16 +864,100 @@ public class SpotifyBulkDispatchContractTests {
         string compositeId = $"{TrackStream}:1234567890-0";
 
         // Act — returns CapReached
-        RequeueOutcome outcome = await helper.RequeueAsync( compositeId, TestSagaId, TestContext.CancellationToken );
+        RequeueOutcome outcome = await helper.RequeueAsync(
+            compositeId, TestSagaId, cancellationToken: TestContext.CancellationToken );
 
         // Assert — method signals "gave up"
         Assert.AreEqual( RequeueOutcome.CapReached, outcome, "Return value must be CapReached when the retry cap is reached" );
 
         _dbMock.Verify( d => d.ScriptEvaluateAsync(
             It.IsAny<string>( ),
-            It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == TrackStream ),
-            It.Is<RedisValue[]?>( args => args != null && args.Length == 2 ),
+            It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 3 && keys[0] == TrackStream ),
+            It.Is<RedisValue[]?>( args => args != null && args.Length == 3 ),
             It.IsAny<CommandFlags>( ) ), Times.Never );
+    }
+
+    /// <summary>A rate-limit deferral bypasses the cap and preserves both attempt count and endpoint.</summary>
+    [TestMethod]
+    public async Task RequeueAsync_RateLimitAtCap_ShouldPreserveAttemptAndRequeue( ) {
+        int attemptCount = LookupConstants.MaxQueueRetryAttempts - 1;
+        QueuedLookupRequest request = CreateRequest( TestTrackId, attemptCount );
+        StreamEntry entry = BuildStreamEntryFromRequest( request );
+        _ = _dbMock.Setup( d => d.StreamRangeAsync(
+                TrackStream, It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ), It.IsAny<int?>( ),
+                It.IsAny<Order>( ), It.IsAny<CommandFlags>( ) ) ).ReturnsAsync( [entry] );
+
+        RedisValue[]? capturedArguments = null;
+        _ = _dbMock.Setup( d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
+                It.IsAny<CommandFlags>( ) ) )
+            .Callback( ( string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _ ) => capturedArguments = arguments )
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
+
+        RequeueOutcome outcome = await CreateHelper( ).RequeueAsync(
+            $"{TrackStream}:1234567890-0",
+            TestSagaId,
+            preserveAttemptCount: true,
+            rateLimitedEndpoint: SpotifyConstants.TracksEndpoint,
+            notBefore: DateTimeOffset.UtcNow.AddMinutes( 1 ),
+            cancellationToken: TestContext.CancellationToken );
+
+        Assert.AreEqual( RequeueOutcome.Requeued, outcome );
+        string payload = (string)capturedArguments![3]!;
+        QueuedLookupRequest requeued = JsonSerializer.Deserialize<QueuedLookupRequest>( payload, s_jsonOptions )!;
+        Assert.AreEqual( attemptCount, requeued.AttemptCount );
+        Assert.AreEqual( SpotifyConstants.TracksEndpoint, requeued.RateLimitedEndpoint );
+        Assert.IsTrue( requeued.NotBefore > DateTimeOffset.UtcNow.AddSeconds( 50 ) );
+    }
+
+    /// <summary>A preserved-attempt deferral is invalid without a durable eligibility instant.</summary>
+    [TestMethod]
+    public async Task RequeueAsync_PreserveAttemptWithoutNotBefore_ShouldRejectArguments( ) {
+        ArgumentException exception = await Assert.ThrowsExactlyAsync<ArgumentException>( ( ) =>
+            CreateHelper( ).RequeueAsync(
+                $"{TrackStream}:1234567890-0",
+                TestSagaId,
+                preserveAttemptCount: true,
+                rateLimitedEndpoint: SpotifyConstants.TracksEndpoint,
+                cancellationToken: TestContext.CancellationToken ) );
+
+        Assert.AreEqual( "notBefore", exception.ParamName );
+        _dbMock.VerifyNoOtherCalls( );
+    }
+
+    /// <summary>An ordinary retry cannot accidentally retain stale rate-limit scheduling metadata.</summary>
+    [TestMethod]
+    public async Task RequeueAsync_OrdinaryRetryWithDeferralArguments_ShouldClearDeferralMetadata( ) {
+        QueuedLookupRequest request = CreateRequest( TestTrackId, attemptCount: 0 ) with {
+            RateLimitedEndpoint = SpotifyConstants.TracksEndpoint,
+            NotBefore = DateTimeOffset.UtcNow.AddMinutes( 1 )
+        };
+        StreamEntry entry = BuildStreamEntryFromRequest( request );
+        _ = _dbMock.Setup( d => d.StreamRangeAsync(
+                TrackStream, It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ), It.IsAny<int?>( ),
+                It.IsAny<Order>( ), It.IsAny<CommandFlags>( ) ) ).ReturnsAsync( [entry] );
+        RedisValue[]? capturedArguments = null;
+        _ = _dbMock.Setup( d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
+                It.IsAny<CommandFlags>( ) ) )
+            .Callback( ( string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _ ) =>
+                capturedArguments = arguments )
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
+
+        RequeueOutcome outcome = await CreateHelper( ).RequeueAsync(
+            $"{TrackStream}:1234567890-0",
+            TestSagaId,
+            preserveAttemptCount: false,
+            rateLimitedEndpoint: SpotifyConstants.AlbumsEndpoint,
+            notBefore: DateTimeOffset.UtcNow.AddHours( 1 ),
+            cancellationToken: TestContext.CancellationToken );
+
+        Assert.AreEqual( RequeueOutcome.Requeued, outcome );
+        QueuedLookupRequest requeued = JsonSerializer.Deserialize<QueuedLookupRequest>(
+            (string)capturedArguments![3]!, s_jsonOptions )!;
+        Assert.AreEqual( 1, requeued.AttemptCount );
+        Assert.IsNull( requeued.RateLimitedEndpoint );
+        Assert.IsNull( requeued.NotBefore );
     }
 
     /// <summary>The fourth execution (AttemptCount=3) is still replaceable and produces AttemptCount=4.</summary>
@@ -730,10 +973,11 @@ public class SpotifyBulkDispatchContractTests {
                 It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ) )
             .Callback( ( string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _ ) => capturedArguments = arguments )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999-0" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         RequeueOutcome outcome = await CreateHelper( ).RequeueAsync(
-            $"{TrackStream}:1234567890-0", TestSagaId, TestContext.CancellationToken );
+            $"{TrackStream}:1234567890-0", TestSagaId,
+            cancellationToken: TestContext.CancellationToken );
 
         Assert.AreEqual( RequeueOutcome.Requeued, outcome );
         VerifyAtomicRequeue( TrackStream, Times.Once( ) );
@@ -903,7 +1147,16 @@ public class SpotifyBulkDispatchContractTests {
             retryAfterValue: TimeSpan.FromSeconds( 30 ),
             threshold: TimeSpan.FromSeconds( 120 ),
             requestUri: null,
-            provider: SupportedProviders.Spotify );
+            provider: SupportedProviders.Spotify,
+            endpoint: ProviderEndpointConstants.AuthToken );
+
+        RedisValue[]? requeueArguments = null;
+        _ = _dbMock.Setup( d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
+                It.IsAny<CommandFlags>( ) ) )
+            .Callback( ( string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _ ) =>
+                requeueArguments = arguments )
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         _ = _rateLimitTrackerMock.Setup( t => t.SetRateLimitedAsync(
                 It.IsAny<SupportedProviders>( ),
@@ -915,7 +1168,7 @@ public class SpotifyBulkDispatchContractTests {
         SpotifyBulkProcessorService service = CreateService( );
 
         // Act — call internal method directly
-        await service.HandleBulkRateLimitAsync( messages, SpotifyConstants.BulkTracksEndpoint, ex, TestContext.CancellationToken );
+        await service.HandleBulkRateLimitAsync( messages, SpotifyConstants.TracksEndpoint, ex, TestContext.CancellationToken );
 
         // Assert — SetIsPartialAsync called for the saga
         _sagaManagerMock.Verify( m => m.TrySetIsPartialAsync(
@@ -930,7 +1183,8 @@ public class SpotifyBulkDispatchContractTests {
         _sagaManagerMock.Verify( m => m.TrySetRateLimitInfoAsync(
             TestSagaId,
             It.Is<List<ProviderRateLimitInfo>>( list =>
-                list.Any( r => r.Provider == SupportedProviders.Spotify ) ),
+                list.Any( r => r.Provider == SupportedProviders.Spotify
+                    && r.Endpoint == ProviderEndpointConstants.AuthToken ) ),
             It.IsAny<string>( ),
             It.IsAny<CancellationToken>( ) ),
             Times.Once,
@@ -943,6 +1197,51 @@ public class SpotifyBulkDispatchContractTests {
             It.IsAny<CommandFlags>( ) ),
             Times.Once,
             "Rate-limited sentinel must be published so interactive callers are not left hanging" );
+
+        string payload = (string)requeueArguments![3]!;
+        QueuedLookupRequest requeued = JsonSerializer.Deserialize<QueuedLookupRequest>( payload, s_jsonOptions )!;
+        Assert.AreEqual( request.AttemptCount, requeued.AttemptCount );
+        Assert.AreEqual( ProviderEndpointConstants.AuthToken, requeued.RateLimitedEndpoint );
+        Assert.IsTrue( requeued.NotBefore > DateTimeOffset.UtcNow.AddSeconds( 20 ) );
+    }
+
+    /// <summary>A near-expired shared bulk cooldown is not raised back to the configured minimum.</summary>
+    [TestMethod]
+    public async Task HandleBulkRateLimit_WhenRemainingCooldownIsBelowMinimum_PreservesRemainingDuration( ) {
+        QueuedLookupRequest request = CreateRequest( TestTrackId );
+        List<QueuedMessage<QueuedLookupRequest>> messages = [
+            new QueuedMessage<QueuedLookupRequest>(
+                $"{TrackStream}:1234567890-0",
+                request,
+                DateTimeOffset.UtcNow )
+        ];
+        ProviderRateLimitException exception = new(
+            TimeSpan.FromSeconds( 1 ),
+            requestUri: null,
+            SupportedProviders.Spotify,
+            ProviderEndpointConstants.Tracks );
+        RedisValue[]? requeueArguments = null;
+        _ = _dbMock.Setup( database => database.ScriptEvaluateAsync(
+                It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
+                It.IsAny<CommandFlags>( ) ) )
+            .Callback( (string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _) =>
+                requeueArguments = arguments )
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
+        DateTimeOffset beforeDeferral = DateTimeOffset.UtcNow;
+
+        await CreateService( ).HandleBulkRateLimitAsync(
+            messages,
+            SpotifyConstants.TracksEndpoint,
+            exception,
+            TestContext.CancellationToken );
+
+        string payload = (string)requeueArguments![3]!;
+        QueuedLookupRequest requeued = JsonSerializer.Deserialize<QueuedLookupRequest>(
+            payload, s_jsonOptions )!;
+        Assert.IsNotNull( requeued.NotBefore );
+        Assert.IsGreaterThanOrEqualTo( beforeDeferral, requeued.NotBefore.Value );
+        Assert.IsLessThan( beforeDeferral.AddSeconds( 4 ), requeued.NotBefore.Value,
+            "The bulk processor must not raise a remaining one-second cooldown to the five-second minimum." );
     }
 
     /// <summary>
@@ -1112,7 +1411,8 @@ public class SpotifyBulkDispatchContractTests {
         string compositeId = $"{TrackStream}:1234567890-0";
 
         // Act
-        RequeueOutcome outcome = await helper.RequeueAsync( compositeId, TestSagaId, TestContext.CancellationToken );
+        RequeueOutcome outcome = await helper.RequeueAsync(
+            compositeId, TestSagaId, cancellationToken: TestContext.CancellationToken );
 
         // Assert — returns NotFound, not CapReached
         Assert.AreEqual( RequeueOutcome.NotFound, outcome,
@@ -1224,7 +1524,8 @@ public class SpotifyBulkDispatchContractTests {
             _lookupServiceMock.Object,
             _requestQueueMock.Object,
             _serviceLoggerMock.Object,
-            options
+            options,
+            Microsoft.Extensions.Options.Options.Create( new QueueSettings( ) )
         );
     }
 
@@ -1637,7 +1938,7 @@ public class SpotifyBulkDispatchContractTests {
                 capturedKeys.Add( keys );
                 capturedValues.Add( values );
             } )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999999999-1" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         SpotifyBulkProcessorService service = CreateService( );
 
@@ -1657,7 +1958,7 @@ public class SpotifyBulkDispatchContractTests {
         Assert.HasCount( ExpectedCount, capturedKeys );
         Assert.HasCount( ExpectedCount, capturedValues );
         QueuedLookupRequest? forwarded = JsonSerializer.Deserialize<QueuedLookupRequest>(
-            capturedValues[0]![2].ToString( ), s_jsonOptions );
+            capturedValues[0]![3].ToString( ), s_jsonOptions );
         Assert.AreEqual( QueueEnqueueOrigin.Requeue, forwarded!.EnqueueOrigin );
         Assert.IsTrue( forwarded.BypassBulkRouting );
         _requestQueueMock.Verify( q => q.EnqueueAsync(
@@ -1786,7 +2087,7 @@ public class SpotifyBulkDispatchContractTests {
                 It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ) )
             .Callback( ( string _, RedisKey[]? _, RedisValue[]? values, CommandFlags _ ) => capturedValues = values )
-            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"9999999999-1" ) );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
 
         SpotifyBulkProcessorService service = CreateService( );
 
@@ -1796,7 +2097,7 @@ public class SpotifyBulkDispatchContractTests {
         // Assert — AttemptCount carried unchanged
         Assert.IsNotNull( capturedValues, "The atomic transfer script must receive the re-enqueued payload" );
         QueuedLookupRequest? capturedRequest = JsonSerializer.Deserialize<QueuedLookupRequest>(
-            capturedValues[2].ToString( ), s_jsonOptions );
+            capturedValues[3].ToString( ), s_jsonOptions );
         Assert.IsNotNull( capturedRequest );
         Assert.AreEqual(
             OriginalAttemptCount,
@@ -1834,14 +2135,14 @@ public class SpotifyBulkDispatchContractTests {
     private void VerifyAtomicRequeue( string stream, Times times ) =>
         _dbMock.Verify( database => database.ScriptEvaluateAsync(
             It.IsAny<string>( ),
-            It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == stream ),
-            It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 7 ),
+            It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 4 && keys[0] == stream && keys[1] == stream ),
+            It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 15 ),
             It.IsAny<CommandFlags>( ) ), times );
 
     private void VerifyAtomicRemoval( string stream, Times times ) =>
         _dbMock.Verify( database => database.ScriptEvaluateAsync(
             It.IsAny<string>( ),
-            It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == stream ),
-            It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 2 ),
+            It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 3 && keys[0] == stream ),
+            It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 3 ),
             It.IsAny<CommandFlags>( ) ), times );
 }

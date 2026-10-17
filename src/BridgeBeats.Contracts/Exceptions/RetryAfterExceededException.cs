@@ -27,12 +27,14 @@ namespace BridgeBeats.Contracts.Exceptions {
         /// <param name="threshold">The maximum retry wait the caller will tolerate.</param>
         /// <param name="requestUri">The rate-limited request URI, or <see langword="null"/> if unknown.</param>
         /// <param name="provider">The provider that issued the limit, or <see langword="null"/> if unknown.</param>
+        /// <param name="endpoint">The stable endpoint key that was limited, or <see langword="null"/> if unknown.</param>
         public RetryAfterExceededException(
             TimeSpan retryAfterValue,
             TimeSpan threshold,
             Uri? requestUri,
-            SupportedProviders? provider
-        ) : base( BuildExceededMessage( retryAfterValue, threshold, requestUri, provider ), retryAfterValue, requestUri, provider ) {
+            SupportedProviders? provider,
+            string? endpoint = null
+        ) : base( BuildExceededMessage( retryAfterValue, threshold, requestUri, provider, endpoint ), retryAfterValue, requestUri, provider, endpoint ) {
             Threshold = ValidateThreshold( threshold );
         }
 
@@ -45,13 +47,15 @@ namespace BridgeBeats.Contracts.Exceptions {
         /// <param name="requestUri">The rate-limited request URI, or <see langword="null"/> if unknown.</param>
         /// <param name="provider">The provider that issued the limit, or <see langword="null"/> if unknown.</param>
         /// <param name="innerException">The exception that is the cause of this exception.</param>
+        /// <param name="endpoint">The stable endpoint key that was limited, or <see langword="null"/> if unknown.</param>
         public RetryAfterExceededException(
             TimeSpan retryAfterValue,
             TimeSpan threshold,
             Uri? requestUri,
             SupportedProviders? provider,
-            Exception innerException
-        ) : base( BuildExceededMessage( retryAfterValue, threshold, requestUri, provider ), retryAfterValue, requestUri, provider, innerException ) {
+            Exception innerException,
+            string? endpoint = null
+        ) : base( BuildExceededMessage( retryAfterValue, threshold, requestUri, provider, endpoint ), retryAfterValue, requestUri, provider, innerException, endpoint ) {
             Threshold = ValidateThreshold( threshold );
         }
 
@@ -62,9 +66,9 @@ namespace BridgeBeats.Contracts.Exceptions {
             return threshold;
         }
 
-        private static string BuildExceededMessage( TimeSpan retryAfterValue, TimeSpan threshold, Uri? requestUri, SupportedProviders? provider )
+        private static string BuildExceededMessage( TimeSpan retryAfterValue, TimeSpan threshold, Uri? requestUri, SupportedProviders? provider, string? endpoint )
             => $"Rate limit exceeded for {provider?.ToString( ) ?? "Unknown"}; retry after {retryAfterValue.TotalSeconds:F0} seconds exceeds threshold {threshold.TotalSeconds:F0}. " +
-               $"Request URI: {requestUri?.ToString( ) ?? "Unknown"}";
+               $"Endpoint: {endpoint ?? "Unknown"}. Request URI: {requestUri?.ToString( ) ?? "Unknown"}";
 
         /// <summary>
         /// Infers the <see cref="SupportedProviders"/> from a request URI by matching a substring of

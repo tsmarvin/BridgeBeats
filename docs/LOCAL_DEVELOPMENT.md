@@ -131,6 +131,29 @@ aspire publish
 
 > **Note**: Generated compose files are for development and prototyping. The production `docker-compose.yml` in `containers/` is the supported deployment, with Caddy, health checks, persistent volumes, and Docker-secret management.
 
+## Manual PDS Cache Scale Test
+
+`LivePdsCacheBootstrapScaleTests` downloads one real repository CAR, runs the production cache
+bootstrap indexing path into an isolated Redis Testcontainer, and then measures rate-limit admission
+latency against the populated keyspace. It never connects to production Redis and is guarded by an
+explicit run switch, so normal test runs skip it even when the PDS variables are configured.
+
+From the repository root:
+
+```bash
+BRIDGEBEATS_RUN_MANUAL_CACHE_BOOTSTRAP=1 \
+BRIDGEBEATS_TEST_PDS_URI=https://pds.bridgebeats.link \
+BRIDGEBEATS_TEST_USER_DID=did:plc:replace-me \
+dotnet test Tests/BridgeBeats.Tests.csproj \
+  --filter "FullyQualifiedName~LivePdsCacheBootstrapScaleTests" \
+  --logger "console;verbosity=detailed"
+```
+
+The test reports bootstrap duration, records, albums, tracks, successfully indexed records,
+per-record errors, Redis key count, and admission latency for empty/active rate-limit indexes,
+cache hits, and 32-way concurrent cold reads. Docker must be running. The CAR endpoint is public,
+so the test requires a PDS URI and repository DID but no ATProto password.
+
 ## Troubleshooting
 
 ### Redis connection errors on startup

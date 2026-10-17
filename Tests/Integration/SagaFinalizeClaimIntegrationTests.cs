@@ -1,3 +1,4 @@
+using System.Text.Json;
 using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Interfaces;
@@ -100,7 +101,7 @@ public class SagaFinalizeClaimIntegrationTests {
 
         // Shared storage double with an Interlocked counter — the discriminator
         int pdsWriteCount = 0;
-        Mock<IATProtoStorageService> storageDouble = new( );
+        Mock<ITargetedATProtoStorageService> storageDouble = new( );
         _ = storageDouble
             .Setup( s => s.StoreMediaLinkResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( ( ) => {
@@ -110,7 +111,12 @@ public class SagaFinalizeClaimIntegrationTests {
             } );
 
         // Build a complete saga fixture with one successful provider
-        string resultJson = """{"isrc":"USRC99999001","trackName":"Race Test","artistName":"Test","url":"https://spotify.com/t/1"}""";
+        string resultJson = JsonSerializer.Serialize( new MusicLookupResult {
+            ExternalId = "USRC99999001",
+            Title = "Race Test",
+            Artist = "Test",
+            URL = "https://spotify.com/t/1"
+        }, JsonSerializerOptions.Web );
         LookupSagaState completeSaga = new( ) {
             SagaId = TestSagaId,
             LookupKey = TestLookupKey,
@@ -194,10 +200,10 @@ public class SagaFinalizeClaimIntegrationTests {
                 cacheMock.Object,
                 deduplicatorMock.Object,
                 resultCombiner,
-                queueResolverMock.Object,
+                new Mock<ILookupDispatchOutbox>( ).Object,
                 enabledProviders,
                 loggerMock.Object,
-                Mock.Of<IRefreshReviewStore>( )
+                CreateRefreshReviewStore( )
             );
 
             // All paths converge on WriteFinalResultAsync internally; invoke via polling path
@@ -312,7 +318,7 @@ public class SagaFinalizeClaimIntegrationTests {
         );
 
         int pdsWriteCount = 0;
-        Mock<IATProtoStorageService> storageDouble = new( );
+        Mock<ITargetedATProtoStorageService> storageDouble = new( );
         _ = storageDouble
             .Setup( s => s.StoreMediaLinkResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( ( ) => {
@@ -350,6 +356,14 @@ public class SagaFinalizeClaimIntegrationTests {
 
         // Assert
         Assert.IsTrue( claimed, "First delivery must successfully acquire the finalize claim" );
+    }
+
+    private static IRefreshReviewStore CreateRefreshReviewStore( ) {
+        Mock<IRefreshReviewStore> store = new( );
+        _ = store.Setup( candidate => candidate.GetPendingForSagaAsync(
+                It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [] );
+        return store.Object;
     }
 
 

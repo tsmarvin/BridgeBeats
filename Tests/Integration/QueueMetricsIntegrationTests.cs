@@ -573,6 +573,30 @@ public class QueueMetricsIntegrationTests {
             "AddQueueInfrastructure(registerMetrics: false) must NOT register a QueueMetricsRegistration IHostedService" );
     }
 
+    /// <summary>The dispatch relay is opt-in so non-owner hosts do not poll the shared outbox.</summary>
+    [TestMethod]
+    public void HostBuild_DispatchRelayRegistration_IsExplicit( ) {
+        ServiceCollection withoutRelay = new( );
+        _ = withoutRelay.AddSingleton( s_redis! );
+        _ = withoutRelay.AddLogging( );
+        _ = withoutRelay.Configure<QueueSettings>( _ => { } );
+        _ = withoutRelay.AddQueueInfrastructure( registerMetrics: false );
+        using ServiceProvider withoutRelayProvider = withoutRelay.BuildServiceProvider( );
+        Assert.IsEmpty( withoutRelayProvider.GetServices<IHostedService>( )
+            .Where( service => service is LookupDispatchOutboxBackgroundService ) );
+
+        ServiceCollection withRelay = new( );
+        _ = withRelay.AddSingleton( s_redis! );
+        _ = withRelay.AddLogging( );
+        _ = withRelay.Configure<QueueSettings>( _ => { } );
+        _ = withRelay.AddQueueInfrastructure(
+            registerMetrics: false,
+            registerDispatchRelay: true );
+        using ServiceProvider withRelayProvider = withRelay.BuildServiceProvider( );
+        Assert.HasCount( 1, withRelayProvider.GetServices<IHostedService>( )
+            .Where( service => service is LookupDispatchOutboxBackgroundService ) );
+    }
+
     #endregion
 
     #region Test-Isolation Guard

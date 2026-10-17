@@ -9,16 +9,64 @@ updates:
     directory: "/" # Location of .NET project files
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 10
     groups:
+      aspire:
+        patterns:
+          - "Aspire.*"
+      dotnet-extensions:
+        patterns:
+          - "Microsoft.Extensions.*"
       entity-framework-core:
         patterns:
           - "Microsoft.EntityFrameworkCore*"
           - "Microsoft.AspNetCore.Identity.EntityFrameworkCore"
+      opentelemetry:
+        patterns:
+          - "OpenTelemetry.*"
+      openapi:
+        patterns:
+          - "Microsoft.OpenApi"
+          - "Swashbuckle.AspNetCore"
+      atproto:
+        patterns:
+          - "idunno.AtProto"
+          - "idunno.Bluesky"
+      test-tooling:
+        patterns:
+          - "Microsoft.NET.Test.Sdk"
+          - "MSTest.*"
+          - "coverlet.collector"
+          - "Moq"
+          - "Testcontainers.*"
+      serilog:
+        patterns:
+          - "Serilog.*"
   - package-ecosystem: "docker"
     directory: "/containers" # Location of Dockerfiles
     schedule:
       interval: "weekly"
+    groups:
+      dotnet-runtime:
+        patterns:
+          - "mcr.microsoft.com/dotnet/*"
   - package-ecosystem: "github-actions"
     directory: "/" # Location of GitHub Actions workflows
     schedule:
       interval: "weekly"
+    groups:
+      docker-actions:
+        patterns:
+          - "docker/*"
+      artifact-actions:
+        patterns:
+          - "actions/upload-artifact"
+          - "actions/download-artifact"
+      pages-actions:
+        patterns:
+          - "actions/upload-pages-artifact"
+          - "actions/deploy-pages"
+      dotnet-ci-actions:
+        patterns:
+          - "actions/checkout"
+          - "actions/setup-dotnet"

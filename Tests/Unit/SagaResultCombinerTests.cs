@@ -307,6 +307,50 @@ public class SagaResultCombinerTests {
         Assert.IsNull( result );
     }
 
+    /// <summary>A nominal success with no identifier or metadata cannot be persisted and is skipped.</summary>
+    [TestMethod]
+    public void CombineResults_WithEmptyProviderPayload_ShouldReturnNull( ) {
+        _ = _loggerMock.Setup( logger => logger.IsEnabled( LogLevel.Warning ) ).Returns( true );
+        MusicLookupResult emptyResult = new( ) {
+            URL = "https://provider.example/item/empty"
+        };
+        LookupSagaState saga = CreateSaga( ) with {
+            ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                [SupportedProviders.Tidal] = CreateProviderState( SupportedProviders.Tidal, emptyResult )
+            }
+        };
+
+        MediaLinkResult? result = _combiner.CombineResults( saga );
+
+        Assert.IsNull( result );
+        _loggerMock.Verify(
+            logger => logger.Log(
+                LogLevel.Warning,
+                It.Is<EventId>( eventId => eventId.Id == 3104 ),
+                It.IsAny<It.IsAnyType>( ),
+                null,
+                It.IsAny<Func<It.IsAnyType, Exception?, string>>( ) ),
+            Times.Once );
+    }
+
+    /// <summary>An external id removed entirely by rkey sanitization is not persistable by itself.</summary>
+    [TestMethod]
+    public void CombineResults_WithUnsanitizableExternalIdOnly_ShouldReturnNull( ) {
+        MusicLookupResult invalidResult = new( ) {
+            ExternalId = "@@@",
+            URL = "https://provider.example/item/invalid"
+        };
+        LookupSagaState saga = CreateSaga( ) with {
+            ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                [SupportedProviders.Tidal] = CreateProviderState( SupportedProviders.Tidal, invalidResult )
+            }
+        };
+
+        MediaLinkResult? result = _combiner.CombineResults( saga );
+
+        Assert.IsNull( result );
+    }
+
     /// <summary>
     /// Verifies that a provider whose <c>ResultJson</c> is malformed is skipped (and logged as a
     /// warning) while a sibling provider with valid JSON still combines: the result contains the

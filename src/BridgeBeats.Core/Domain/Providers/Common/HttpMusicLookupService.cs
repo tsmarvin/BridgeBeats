@@ -126,24 +126,6 @@ public partial class HttpMusicLookupService(
                 throw new HttpRequestException( "Provider worker returned an invalid response.", ex, response.StatusCode );
             }
 
-            if (response.StatusCode == System.Net.HttpStatusCode.TooManyRequests) {
-                // The envelope preserves sub-second precision; Retry-After is integer-rounded for
-                // HTTP interoperability and is only a fallback for non-envelope responses.
-                double? retryAfter = result?.RetryAfterSeconds ?? ParseRetryAfterSeconds( response );
-                double? threshold = result?.RetryThresholdSeconds;
-                if (!retryAfter.HasValue || !IsValidRetrySeconds( retryAfter.Value )) {
-                    throw new HttpRequestException( "Worker rate-limit response was missing retry metadata.", null, response.StatusCode );
-                }
-                TimeSpan retryDelay = TimeSpan.FromSeconds( retryAfter.Value );
-                if (threshold.HasValue && !IsValidRetrySeconds( threshold.Value )) {
-                    throw new HttpRequestException( "Worker rate-limit response contained invalid threshold metadata.", null, response.StatusCode );
-                }
-                if (threshold is >= 0 && retryAfter.Value > threshold.Value) {
-                    throw new RetryAfterExceededException( retryDelay, TimeSpan.FromSeconds( threshold.Value ), null, provider );
-                }
-                throw new ProviderRateLimitException( retryDelay, null, provider );
-            }
-
             if (!response.IsSuccessStatusCode) {
                 LogWorkerHttpError( logger, provider, (int)response.StatusCode, endpoint );
                 throw new HttpRequestException( "Provider worker request failed.", null, response.StatusCode );
@@ -171,33 +153,6 @@ public partial class HttpMusicLookupService(
             throw;
         }
     }
-
-    private static double? ParseRetryAfterSeconds( HttpResponseMessage response ) {
-        if (!response.Headers.TryGetValues( "Retry-After", out IEnumerable<string>? values )) {
-            return null;
-        }
-
-        string? value = values.FirstOrDefault( );
-        if (double.TryParse( value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double seconds )
-            && double.IsFinite( seconds )
-            && seconds >= 0
-            && seconds <= TimeSpan.MaxValue.TotalSeconds) {
-            return seconds;
-        }
-
-        if (DateTimeOffset.TryParse(
-                value,
-                System.Globalization.CultureInfo.InvariantCulture,
-                System.Globalization.DateTimeStyles.AllowWhiteSpaces | System.Globalization.DateTimeStyles.AssumeUniversal,
-                out DateTimeOffset date )) {
-            return Math.Max( 0, (date - DateTimeOffset.UtcNow).TotalSeconds );
-        }
-
-        return null;
-    }
-
-    private static bool IsValidRetrySeconds( double seconds )
-        => double.IsFinite( seconds ) && seconds >= 0 && seconds <= TimeSpan.MaxValue.TotalSeconds;
 
     #region LoggerMessage Methods
 

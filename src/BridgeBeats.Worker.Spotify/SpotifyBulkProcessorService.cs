@@ -44,7 +44,7 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
     /// <summary>Helper that owns the bulk-stream consumer groups, dequeue, ack, and requeue.</summary>
     private readonly SpotifyBatchQueueHelper _batchHelper;
 
-    /// <summary>Tracker used to read and set per-endpoint rate-limit state.</summary>
+    /// <summary>Tracker used to read policy-derived shared rate-limit state.</summary>
     private readonly IRateLimitTracker _rateLimitTracker;
 
     /// <summary>Manager used to create, update, and inspect saga state.</summary>
@@ -72,11 +72,14 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
     /// <summary>Base request-failure cooldown in seconds used as the exponent base for backoff.</summary>
     private readonly int _requestFailureCooldownSeconds;
 
+    /// <summary>Queue timing settings shared with the single-item processor.</summary>
+    private readonly QueueSettings _queueSettings;
+
     // Request-failure cooldown state — suppresses flush after empty-dict (network/auth error)
     // to avoid burning retry attempts faster than Spotify can recover.
     // Cooldown doubles per consecutive failure, capped at SpotifyBatchSettings.MaxRequestFailureCooldownSeconds.
-    // Each stream maintains its own independent cooldown: a tracks-endpoint failure does not
-    // suppress album flushes (and vice versa), consistent with per-endpoint rate-limit isolation.
+    // Each stream maintains its own independent local cooldown: a tracks-operation failure does not
+    // suppress album flushes (and vice versa). Shared Spotify HTTP rate limits are provider-wide.
 
     /// <summary>Time until which the track-id stream is in request-failure cooldown.</summary>
     private DateTimeOffset _trackIdCooldownUntil = DateTimeOffset.MinValue;
@@ -93,9 +96,6 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
     /// <summary>Pub/Sub channel on which saga-level completion is published.</summary>
     private const string SagaCompletedChannel = "saga:completed";
 
-    /// <summary>Prefix of the per-lookup Pub/Sub completion channel (<c>complete:{lookupKey}</c>).</summary>
-    private const string LookupCompleteChannelPrefix = "complete:";
-
     /// <summary>Scheduled recovery event after an unhandled loop error (5 seconds).</summary>
     private static readonly TimeSpan s_errorDelay = TimeSpan.FromSeconds( 5 );
 
@@ -105,7 +105,7 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
     /// </summary>
     /// <param name="redis">Redis connection multiplexer for publishing completion events.</param>
     /// <param name="batchHelper">Helper for bulk-stream dequeue, ack, and requeue.</param>
-    /// <param name="rateLimitTracker">Tracker for per-endpoint rate-limit state.</param>
+    /// <param name="rateLimitTracker">Tracker for policy-derived shared rate-limit state.</param>
     /// <param name="sagaManager">Manager for saga state.</param>
     /// <param name="lookupService">Spotify bulk lookup service.</param>
     /// <param name="requestQueue">
@@ -115,6 +115,7 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
     /// </param>
     /// <param name="logger">Logger for the service.</param>
     /// <param name="batchSettings">Bound batch settings supplying the linger window and base cooldown.</param>
+    /// <param name="queueSettings">Bound queue settings supplying the absolute job lifetime.</param>
     /// <exception cref="ArgumentNullException">Thrown when any required dependency or <paramref name="batchSettings"/> is <see langword="null"/>.</exception>
     public SpotifyBulkProcessorService(
         IConnectionMultiplexer redis,
@@ -124,7 +125,8 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
         ISpotifyBulkLookupService lookupService,
         IRequestQueue<QueuedLookupRequest> requestQueue,
         ILogger<SpotifyBulkProcessorService> logger,
-        IOptions<SpotifyBatchSettings> batchSettings
+        IOptions<SpotifyBatchSettings> batchSettings,
+        IOptions<QueueSettings> queueSettings
     ) {
         _redis = redis ?? throw new ArgumentNullException( nameof( redis ) );
         _batchHelper = batchHelper ?? throw new ArgumentNullException( nameof( batchHelper ) );
@@ -134,9 +136,17 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
         _requestQueue = requestQueue ?? throw new ArgumentNullException( nameof( requestQueue ) );
         _logger = logger ?? throw new ArgumentNullException( nameof( logger ) );
         ArgumentNullException.ThrowIfNull( batchSettings );
+        ArgumentNullException.ThrowIfNull( queueSettings );
         int lingerMs = batchSettings.Value.LingerMs;
         _batchLinger = TimeSpan.FromMilliseconds( lingerMs );
         _requestFailureCooldownSeconds = batchSettings.Value.RequestFailureCooldownSeconds;
+        _queueSettings = queueSettings.Value;
+        if (_batchLinger >= TimeSpan.FromMinutes( _queueSettings.JobExpirationMinutes )) {
+            throw new OptionsValidationException(
+                Options.DefaultName,
+                typeof( SpotifyBatchSettings ),
+                ["BridgeBeats:Queue:JobExpirationMinutes must exceed BridgeBeats:Spotify:Batch:LingerMs."] );
+        }
 
         _jsonOptions = new JsonSerializerOptions {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -221,13 +231,13 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
         await AddCandidateAsync(
             depth.BulkTrackIdCount,
             SpotifyConstants.MaxTracksPerBatchLookup,
-            SpotifyConstants.BulkTracksEndpoint,
+            SpotifyConstants.TracksEndpoint,
             isTracks: true,
             _trackIdCooldownUntil );
         await AddCandidateAsync(
             depth.BulkAlbumIdCount,
             SpotifyConstants.MaxAlbumsPerBatchLookup,
-            SpotifyConstants.BulkAlbumsEndpoint,
+            SpotifyConstants.AlbumsEndpoint,
             isTracks: false,
             _albumIdCooldownUntil );
 
@@ -302,7 +312,7 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
         // Rate-limit guard: don't call the bulk endpoint if it's currently limited
         RateLimitState rateLimitState = await _rateLimitTracker.GetStateAsync(
             SupportedProviders.Spotify,
-            SpotifyConstants.BulkTracksEndpoint,
+            SpotifyConstants.TracksEndpoint,
             ct
         );
 
@@ -351,7 +361,7 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
         // Rate-limit guard: don't call the bulk endpoint if it's currently limited
         RateLimitState rateLimitState = await _rateLimitTracker.GetStateAsync(
             SupportedProviders.Spotify,
-            SpotifyConstants.BulkAlbumsEndpoint,
+            SpotifyConstants.AlbumsEndpoint,
             ct
         );
 
@@ -419,21 +429,31 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
             return;
         }
 
-        LogProcessingTrackCount( _logger, messages.Count );
-        SpotifyBatchMetrics.RecordBatchSize( "tracks", messages.Count );
-
-        // Build a track-ID → messages map so each bulk API result maps back to its request(s)
-        Dictionary<string, List<QueuedMessage<QueuedLookupRequest>>> idToMessages = [];
-        foreach (QueuedMessage<QueuedLookupRequest> message in messages) {
-            string trackId = message.Payload.LookupValue;
-            if (!idToMessages.TryGetValue( trackId, out List<QueuedMessage<QueuedLookupRequest>>? value )) {
-                value = [];
-                idToMessages[trackId] = value;
-            }
-            value.Add( message );
-        }
-
         try {
+            await RejectIneligibleMessagesAsync(
+                messages,
+                SpotifyConstants.TracksEndpoint,
+                ct,
+                dequeueWallTimer,
+                dequeueWallStart );
+            if (messages.Count == 0) {
+                return;
+            }
+
+            LogProcessingTrackCount( _logger, messages.Count );
+            SpotifyBatchMetrics.RecordBatchSize( "tracks", messages.Count );
+
+            // Build a track-ID → messages map so each bulk API result maps back to its request(s)
+            Dictionary<string, List<QueuedMessage<QueuedLookupRequest>>> idToMessages = [];
+            foreach (QueuedMessage<QueuedLookupRequest> message in messages) {
+                string trackId = message.Payload.LookupValue;
+                if (!idToMessages.TryGetValue( trackId, out List<QueuedMessage<QueuedLookupRequest>>? value )) {
+                    value = [];
+                    idToMessages[trackId] = value;
+                }
+                value.Add( message );
+            }
+
             // Call the bulk lookup API (GET /tracks?ids=...)
             Stopwatch httpTimer = Stopwatch.StartNew( );
             using Activity? httpActivity = QueueMetrics.ActivitySource.StartActivity( "queue.spotify.provider_http" );
@@ -476,7 +496,7 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
 
             LogTrackLookupsSuccess( _logger, messages.Count );
         } catch (ProviderRateLimitException ex) {
-            await HandleBulkRateLimitAsync( messages, SpotifyConstants.BulkTracksEndpoint, ex, ct, dequeueWallTimer, dequeueWallStart );
+            await HandleBulkRateLimitAsync( messages, SpotifyConstants.TracksEndpoint, ex, ct, dequeueWallTimer, dequeueWallStart );
         } catch (SpotifyBulkRejectedException ex) {
             await HandleBulkRejectionAsync( messages, ex, ct, dequeueWallTimer, dequeueWallStart );
         } catch (PostCommitAcknowledgementException) {
@@ -487,6 +507,7 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
             throw;
         } catch (Exception ex) {
             LogTrackLookupsError( _logger, ex );
+            ArmRequestFailureCooldown( ref _trackIdCooldownUntil, ref _consecutiveTrackIdFailures );
             await RequeueAllAsync( messages, ct, dequeueWallTimer, dequeueWallStart );
         }
     }
@@ -518,21 +539,31 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
             return;
         }
 
-        LogProcessingAlbumCount( _logger, messages.Count );
-        SpotifyBatchMetrics.RecordBatchSize( "albums", messages.Count );
-
-        // Build an album-ID → messages map
-        Dictionary<string, List<QueuedMessage<QueuedLookupRequest>>> idToMessages = [];
-        foreach (QueuedMessage<QueuedLookupRequest> message in messages) {
-            string albumId = message.Payload.LookupValue;
-            if (!idToMessages.TryGetValue( albumId, out List<QueuedMessage<QueuedLookupRequest>>? value )) {
-                value = [];
-                idToMessages[albumId] = value;
-            }
-            value.Add( message );
-        }
-
         try {
+            await RejectIneligibleMessagesAsync(
+                messages,
+                SpotifyConstants.AlbumsEndpoint,
+                ct,
+                dequeueWallTimer,
+                dequeueWallStart );
+            if (messages.Count == 0) {
+                return;
+            }
+
+            LogProcessingAlbumCount( _logger, messages.Count );
+            SpotifyBatchMetrics.RecordBatchSize( "albums", messages.Count );
+
+            // Build an album-ID → messages map
+            Dictionary<string, List<QueuedMessage<QueuedLookupRequest>>> idToMessages = [];
+            foreach (QueuedMessage<QueuedLookupRequest> message in messages) {
+                string albumId = message.Payload.LookupValue;
+                if (!idToMessages.TryGetValue( albumId, out List<QueuedMessage<QueuedLookupRequest>>? value )) {
+                    value = [];
+                    idToMessages[albumId] = value;
+                }
+                value.Add( message );
+            }
+
             // Call the bulk lookup API (GET /albums?ids=...)
             Stopwatch httpTimer = Stopwatch.StartNew( );
             using Activity? httpActivity = QueueMetrics.ActivitySource.StartActivity( "queue.spotify.provider_http" );
@@ -571,7 +602,7 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
 
             LogAlbumLookupsSuccess( _logger, messages.Count );
         } catch (ProviderRateLimitException ex) {
-            await HandleBulkRateLimitAsync( messages, SpotifyConstants.BulkAlbumsEndpoint, ex, ct, dequeueWallTimer, dequeueWallStart );
+            await HandleBulkRateLimitAsync( messages, SpotifyConstants.AlbumsEndpoint, ex, ct, dequeueWallTimer, dequeueWallStart );
         } catch (SpotifyBulkRejectedException ex) {
             await HandleBulkRejectionAsync( messages, ex, ct, dequeueWallTimer, dequeueWallStart );
         } catch (PostCommitAcknowledgementException) {
@@ -582,6 +613,7 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
             throw;
         } catch (Exception ex) {
             LogAlbumLookupsError( _logger, ex );
+            ArmRequestFailureCooldown( ref _albumIdCooldownUntil, ref _consecutiveAlbumIdFailures );
             await RequeueAllAsync( messages, ct, dequeueWallTimer, dequeueWallStart );
         }
     }
@@ -782,7 +814,7 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
     }
 
     /// <summary>
-    /// Handles a bulk-endpoint rate limit by recording it, marking each affected saga partial, and
+    /// Handles a bulk-endpoint rate limit by marking each affected saga partial and
     /// requeuing the whole batch.
     /// </summary>
     /// <param name="messages">The messages whose batch hit the rate limit.</param>
@@ -793,7 +825,7 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
     /// <param name="dequeueWallStart">UTC timestamp captured immediately before the batch dequeue.</param>
     /// <returns>A task that completes once all sagas are marked and the batch requeued.</returns>
     /// <remarks>
-    /// Sets the endpoint rate limit in the tracker, then for each message marks its saga partial,
+    /// The outbound handler owns the shared endpoint cooldown. This method marks each saga partial,
     /// merges a <see cref="ProviderRateLimitInfo"/> for Spotify into the saga, and publishes a
     /// rate-limit sentinel so synchronous waiters receive a signal. The entire batch is requeued at
     /// the end. Per-saga errors are logged and do not stop the loop.
@@ -808,23 +840,33 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
     ) {
         dequeueWallTimer ??= Stopwatch.StartNew( );
         dequeueWallStart ??= DateTimeOffset.UtcNow;
-        LogRateLimitEncountered( _logger, endpoint, ex.RetryAfterValue.ToString( ) );
+        string effectiveEndpoint = ProviderEndpointConstants.ResolveEffective( ex.Endpoint, endpoint );
+        LogRateLimitEncountered( _logger, effectiveEndpoint, ex.RetryAfterValue.ToString( ) );
 
         DateTimeOffset now = DateTimeOffset.UtcNow;
-        TimeSpan boundedRetry = TimeSpan.FromTicks( Math.Min( ex.RetryAfterValue.Ticks, (DateTimeOffset.MaxValue - now).Ticks ) );
-        DateTimeOffset retryAfter = now.Add( boundedRetry );
+        DateTimeOffset retryAfter = _queueSettings.GetUpperBoundedRateLimitRetryAfter(
+            now,
+            ex.RetryAfterValue );
+        // Keep the in-process bulk-operation lanes independent. The handler-derived
+        // effective endpoint is used for diagnostics and shared policy, where Spotify
+        // data requests intentionally collapse to a provider-wide window.
+        ArmRateLimitCooldown( endpoint, retryAfter );
         List<QueuedMessage<QueuedLookupRequest>> admittedMessages = [];
         HashSet<string> wallRecordedMessageIds = [];
 
         try {
-            await _rateLimitTracker.SetRateLimitedAsync( SupportedProviders.Spotify, endpoint, retryAfter, ct );
-
             // SetIsPartialAsync + merge SetRateLimitInfoAsync + publish rate-limited sentinel so
             // interactive callers whose request lands in a bulk batch do not hang until timeout on a 429.
             foreach (QueuedMessage<QueuedLookupRequest> message in messages) {
                 if (ct.IsCancellationRequested) { break; }
                 QueuedLookupRequest request = message.Payload;
                 try {
+                    if (_queueSettings.IsPastAbsoluteDeadline( request.CreatedAt, DateTimeOffset.UtcNow )) {
+                        await TerminalizeExpiredMessageAsync( message, ct );
+                        _ = wallRecordedMessageIds.Add( message.MessageId );
+                        RecordMessageWall( message, dequeueWallTimer, dequeueWallStart.Value );
+                        continue;
+                    }
                     string lookupKey = LookupKeyBuilder.TypedKey( request.LookupType, SupportedProviders.Spotify, request.LookupValue );
                     LookupSagaState? saga = await _sagaManager.GetAsync( request.SagaId, ct );
                     if (saga is null) {
@@ -859,7 +901,7 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
                     List<ProviderRateLimitInfo> mergedRateLimitInfo = saga?.RateLimitInfo is not null
                         ? [.. saga.RateLimitInfo.Where( r => r.Provider != SupportedProviders.Spotify )]
                         : [];
-                    mergedRateLimitInfo.Add( new ProviderRateLimitInfo( SupportedProviders.Spotify, retryAfter, endpoint ) );
+                    mergedRateLimitInfo.Add( new ProviderRateLimitInfo( SupportedProviders.Spotify, retryAfter, effectiveEndpoint ) );
                     if (!await _sagaManager.TrySetRateLimitInfoAsync( request.SagaId, mergedRateLimitInfo, instanceToken, ct )) {
                         await AcknowledgeStaleDeliveryAsync( message, ct );
                         continue;
@@ -868,7 +910,7 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
                     await PublishRateLimitSentinelAsync( request.SagaId, instanceToken, ct );
                     admittedMessages.Add( message );
 
-                    LogBulkSagaMarkedPartial( _logger, request.SagaId, endpoint, retryAfter );
+                    LogBulkSagaMarkedPartial( _logger, request.SagaId, effectiveEndpoint, retryAfter );
                 } catch (PostCommitAcknowledgementException) {
                     throw;
                 } catch (TerminalDlqRecoveryException) {
@@ -880,14 +922,17 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
                 }
             }
 
-            // Requeue admitted messages (with AttemptCount increment via RequeueAsync). Each
-            // admitted message owns its wall sample in RequeueSingleAsync.
+            // A rate limit is a deferral, not a failed lookup attempt. Requeue every admitted
+            // message with its current AttemptCount and the exact endpoint key intact.
             await RequeueAllAsync(
                 admittedMessages,
                 ct,
                 dequeueWallTimer,
                 dequeueWallStart.Value,
-                wallRecordedMessageIds );
+                wallRecordedMessageIds,
+                preserveAttemptCount: true,
+                rateLimitedEndpoint: effectiveEndpoint,
+                notBefore: retryAfter );
         } finally {
             // Quarantined, stale, failed, and cancellation-skipped messages never reach
             // RequeueSingleAsync. Close the telemetry obligation for every dequeued message here,
@@ -897,6 +942,125 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
                     RecordMessageWall( message, dequeueWallTimer, dequeueWallStart.Value );
                 }
             }
+        }
+    }
+
+    private async Task RejectIneligibleMessagesAsync(
+        List<QueuedMessage<QueuedLookupRequest>> messages,
+        string operationEndpoint,
+        CancellationToken ct,
+        Stopwatch dequeueWallTimer,
+        DateTimeOffset dequeueWallStart
+    ) {
+        foreach (QueuedMessage<QueuedLookupRequest> message in messages.ToArray( )) {
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+            if (_queueSettings.IsPastAbsoluteDeadline( message.Payload.CreatedAt, now )) {
+                await TerminalizeExpiredMessageAsync( message, ct );
+                RecordMessageWall( message, dequeueWallTimer, dequeueWallStart );
+                // Mutate the caller-owned working set as each terminalization commits. If a later
+                // item fails, the outer fallback cannot requeue deliveries already made terminal.
+                _ = messages.Remove( message );
+                continue;
+            }
+
+            if (message.Payload.NotBefore is { } notBefore && notBefore > now) {
+                // NotBefore is the durable source of truth for a rate-limit deferral. The shared
+                // tracker and in-process cooldown avoid most early dequeues, but this guard remains
+                // authoritative after tracker write failures or process restarts.
+                DateTimeOffset boundedNotBefore = _queueSettings.BoundExistingRateLimitNotBefore(
+                    now,
+                    notBefore,
+                    message.Payload.CreatedAt );
+                ArmRateLimitCooldown(
+                    message.Payload.RateLimitedEndpoint ?? operationEndpoint,
+                    boundedNotBefore );
+                await RequeueSingleAsync(
+                    message,
+                    ct,
+                    dequeueWallTimer,
+                    dequeueWallStart,
+                    preserveAttemptCount: true,
+                    rateLimitedEndpoint: message.Payload.RateLimitedEndpoint,
+                    notBefore: boundedNotBefore );
+                _ = messages.Remove( message );
+            }
+        }
+    }
+
+    private async Task TerminalizeExpiredMessageAsync(
+        QueuedMessage<QueuedLookupRequest> message,
+        CancellationToken ct
+    ) {
+        const string ExpirationReason = "Lookup job expired before provider completion.";
+        QueuedLookupRequest request = message.Payload;
+        string lookupKey = LookupKeyBuilder.TypedKey(
+            request.LookupType, SupportedProviders.Spotify, request.LookupValue );
+        LookupSagaState? saga = await _sagaManager.GetAsync( request.SagaId, ct );
+        if (saga is null) {
+            await AcknowledgeStaleDeliveryAsync( message, ct );
+            return;
+        }
+        if (string.IsNullOrWhiteSpace( saga.InstanceToken )) {
+            await QuarantineBulkMessageAsync( message, "Saga instance is missing or invalid.", ct );
+            return;
+        }
+        if (string.IsNullOrWhiteSpace( request.SagaInstanceToken )
+            || !string.Equals( request.SagaInstanceToken, saga.InstanceToken, StringComparison.Ordinal )) {
+            await AcknowledgeStaleDeliveryAsync( message, ct );
+            return;
+        }
+
+        bool rootIdentityMatches = string.Equals( saga.LookupKey, lookupKey, StringComparison.Ordinal )
+            && saga.LookupType == request.LookupType
+            && string.Equals( saga.LookupValue, request.LookupValue, StringComparison.Ordinal );
+        bool initializedSpotifyLeg = saga.ProviderStates.TryGetValue(
+            SupportedProviders.Spotify, out ProviderLookupState? spotifyState )
+            && !spotifyState.IsComplete;
+        if (!rootIdentityMatches && !initializedSpotifyLeg) {
+            await QuarantineBulkMessageAsync( message, "Saga identity does not match queued request.", ct );
+            return;
+        }
+
+        string instanceToken = saga.InstanceToken;
+        if (!await _sagaManager.TryUpdateProviderStateAsync(
+            request.SagaId,
+            new ProviderLookupState(
+                SupportedProviders.Spotify,
+                IsComplete: true,
+                IsSuccess: false,
+                ResultJson: null,
+                CompletedAt: DateTimeOffset.UtcNow,
+                ErrorMessage: ExpirationReason ),
+            instanceToken,
+            ct )) {
+            await AcknowledgeStaleDeliveryAsync( message, ct );
+            return;
+        }
+
+        try {
+            await PublishSagaProgressAsync( request.SagaId );
+        } catch (Exception ex) {
+            throw new PostCommitAcknowledgementException( message.MessageId, ex );
+        }
+        try {
+            await _requestQueue.MoveToDlqAsync( message.MessageId, ExpirationReason, ct );
+        } catch (OperationCanceledException) when (ct.IsCancellationRequested) {
+            throw;
+        } catch (Exception ex) {
+            throw new TerminalDlqRecoveryException( message.MessageId, ex );
+        }
+        QueueMetrics.RecordSagaLegCompleted(
+            SupportedProviders.Spotify, message.Priority, "expired" );
+    }
+
+    private void ArmRateLimitCooldown( string operationEndpoint, DateTimeOffset retryAfter ) {
+        string normalizedEndpoint = ProviderEndpointConstants.Normalize( operationEndpoint );
+        if (normalizedEndpoint == SpotifyConstants.TracksEndpoint
+            && retryAfter > _trackIdCooldownUntil) {
+            _trackIdCooldownUntil = retryAfter;
+        } else if (normalizedEndpoint == SpotifyConstants.AlbumsEndpoint
+            && retryAfter > _albumIdCooldownUntil) {
+            _albumIdCooldownUntil = retryAfter;
         }
     }
 
@@ -962,19 +1126,34 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
     /// <param name="dequeueWallTimer">Timestamp started before the batch dequeue.</param>
     /// <param name="dequeueWallStart">UTC timestamp captured immediately before the batch dequeue.</param>
     /// <param name="wallRecordedMessageIds">Optional set used to prevent duplicate wall samples.</param>
+    /// <param name="preserveAttemptCount">Whether requeue is a deferral that must not consume attempts.</param>
+    /// <param name="rateLimitedEndpoint">Endpoint to persist on a rate-limit deferral.</param>
+    /// <param name="notBefore">Earliest eligibility instant to persist on the replacement.</param>
     /// <returns>A task that completes once all messages have been attempted.</returns>
     private async Task RequeueAllAsync(
         IReadOnlyList<QueuedMessage<QueuedLookupRequest>> messages,
         CancellationToken ct,
         Stopwatch dequeueWallTimer,
         DateTimeOffset dequeueWallStart,
-        HashSet<string>? wallRecordedMessageIds = null
+        HashSet<string>? wallRecordedMessageIds = null,
+        bool preserveAttemptCount = false,
+        string? rateLimitedEndpoint = null,
+        DateTimeOffset? notBefore = null
     ) {
         foreach (QueuedMessage<QueuedLookupRequest> message in messages) {
             if (ct.IsCancellationRequested) { break; }
             try {
+                DateTimeOffset? effectiveNotBefore = preserveAttemptCount && notBefore is not null
+                    ? _queueSettings.BoundExistingRateLimitNotBefore(
+                        DateTimeOffset.UtcNow,
+                        notBefore.Value,
+                        message.Payload.CreatedAt )
+                    : notBefore;
                 await RequeueSingleAsync( message, ct, dequeueWallTimer, dequeueWallStart,
-                    wallRecordedMessageIds: wallRecordedMessageIds );
+                    wallRecordedMessageIds: wallRecordedMessageIds,
+                    preserveAttemptCount: preserveAttemptCount,
+                    rateLimitedEndpoint: rateLimitedEndpoint,
+                    notBefore: effectiveNotBefore );
             } catch (PostCommitAcknowledgementException) {
                 throw;
             } catch (QueueDeliveryIdentityQuarantineException) {
@@ -994,6 +1173,9 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
     /// <param name="dequeueWallStart">UTC timestamp captured immediately before the batch dequeue.</param>
     /// <param name="recordWall">Whether this helper owns the terminal wall sample.</param>
     /// <param name="wallRecordedMessageIds">Optional set used to prevent duplicate wall samples.</param>
+    /// <param name="preserveAttemptCount">Whether requeue is a deferral that must not consume attempts.</param>
+    /// <param name="rateLimitedEndpoint">Endpoint to persist on a rate-limit deferral.</param>
+    /// <param name="notBefore">Earliest eligibility instant to persist on the replacement.</param>
     /// <returns>A task that completes once the message is requeued or its saga is finalized.</returns>
     /// <remarks>
     /// When <see cref="SpotifyBatchQueueHelper.RequeueAsync"/> returns
@@ -1007,11 +1189,20 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
         Stopwatch dequeueWallTimer,
         DateTimeOffset dequeueWallStart,
         bool recordWall = true,
-        HashSet<string>? wallRecordedMessageIds = null
+        HashSet<string>? wallRecordedMessageIds = null,
+        bool preserveAttemptCount = false,
+        string? rateLimitedEndpoint = null,
+        DateTimeOffset? notBefore = null
     ) {
         QueuedLookupRequest request = message.Payload;
         try {
-            RequeueOutcome outcome = await _batchHelper.RequeueAsync( message.MessageId, request.SagaId, ct );
+            RequeueOutcome outcome = await _batchHelper.RequeueAsync(
+                message.MessageId,
+                request.SagaId,
+                preserveAttemptCount,
+                rateLimitedEndpoint,
+                notBefore,
+                ct );
 
             if (outcome == RequeueOutcome.CapReached) {
                 // Cap hit or unrecoverable payload — write the failed provider state and
@@ -1240,7 +1431,7 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
             }
 
             string resultUri = saga.PartialResultUri ?? saga.FinalResultUri ?? string.Empty;
-            string channel = $"{LookupCompleteChannelPrefix}{saga.LookupKey}";
+            string channel = $"{LookupConstants.CompletionChannelPrefix}{saga.LookupKey}";
             ISubscriber subscriber = _redis.GetSubscriber( );
             _ = await subscriber.PublishAsync( RedisChannel.Literal( channel ), resultUri );
         } catch (Exception ex) {
@@ -1262,7 +1453,7 @@ public sealed partial class SpotifyBulkProcessorService : BackgroundService {
             LookupSagaState? saga = await _sagaManager.GetAsync( sagaId, ct );
             if (saga is null || saga.InstanceToken != expectedInstanceToken) { return; }
 
-            string channel = $"{LookupCompleteChannelPrefix}{saga.LookupKey}";
+            string channel = $"{LookupConstants.CompletionChannelPrefix}{saga.LookupKey}";
             ISubscriber subscriber = _redis.GetSubscriber( );
             _ = await subscriber.PublishAsync( RedisChannel.Literal( channel ), LookupConstants.RateLimitedSentinel );
         } catch (Exception ex) {

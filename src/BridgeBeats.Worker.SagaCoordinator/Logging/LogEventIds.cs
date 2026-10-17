@@ -175,6 +175,15 @@ public static class LogEventIds {
     /// <summary>Persisting a terminal zero-result saga for refresh review failed; terminal cleanup continues.</summary>
     public const int RefreshReviewPersistenceFailed = 5056;
 
+    /// <summary>Reading refresh targets failed, so terminal finalization was deferred.</summary>
+    public const int RefreshReviewReadFailed = 5057;
+
+    /// <summary>A refresh context belongs to a different saga generation.</summary>
+    public const int RefreshReviewTokenMismatch = 5058;
+
+    /// <summary>A refresh target exhausted its bounded write retries and moved to review.</summary>
+    public const int RefreshTargetRetryExhausted = 5059;
+
     #region Program Startup (5100-5124)
 
     /// <summary>The set of providers enabled for secondary lookups, logged once at startup after the logging pipeline is live.</summary>

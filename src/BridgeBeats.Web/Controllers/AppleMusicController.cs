@@ -1,3 +1,4 @@
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
@@ -8,6 +9,7 @@ using BridgeBeats.Core.Infrastructure.Identity;
 using BridgeBeats.Core.Infrastructure.Storage;
 using BridgeBeats.Core.Infrastructure.Utilities;
 using BridgeBeats.Web.Models;
+using BridgeBeats.Web.Streaming;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
@@ -383,7 +385,7 @@ public partial class AppleMusicController(
     /// <returns>
     /// HTTP POST <c>applemusic/playlist-results-stream</c>. Writes a chunked <c>text/html</c> stream directly
     /// to the response; sets status <c>401</c> when unauthenticated or <c>503</c> when Apple Music is not
-    /// configured before writing an error fragment. Requires a valid anti-forgery token.
+    /// configured before writing a JSON error response. Requires a valid anti-forgery token.
     /// </returns>
     [HttpPost]
     [ValidateAntiForgeryToken]
@@ -392,12 +394,18 @@ public partial class AppleMusicController(
         ApplicationUser? user = await userManager.GetUserAsync( User );
         if (user == null) {
             Response.StatusCode = 401;
-            await Response.WriteAsync( "<div class=\"alert alert-danger\">Authentication required</div>" );
+            await Response.WriteAsJsonAsync( new {
+                error = "Authentication required",
+                message = "Sign in before looking up Apple Music playlist tracks."
+            } );
             return;
         }
         if (jwtHandler == null) {
             Response.StatusCode = 503;
-            await Response.WriteAsync( "<div class=\"alert alert-danger\">Apple Music service is not configured</div>" );
+            await Response.WriteAsJsonAsync( new {
+                error = "Service unavailable",
+                message = "Apple Music service is not configured."
+            } );
             return;
         }
         Response.ContentType = "text/html; charset=utf-8";
@@ -406,81 +414,92 @@ public partial class AppleMusicController(
         int processedCount = 0;
         int errorCount = 0;
         int rateLimitCount = 0;
-        foreach (string songId in songIds) {
-            try {
-                MediaLinkResult? lookupResult = await mediaLinkService.GetInfoByProviderIdAsync( songId, SupportedProviders.AppleMusic, false );
-                if (lookupResult == null || lookupResult.Results.Count == 0) {
-                    if (lookupResult?.Messages is { Count: > 0 }) {
-                        rateLimitCount++;
-                        string warningHtml = "<div class=\"alert alert-warning\"><strong>Rate Limited</strong><br/>"
-                            + string.Join( "<br/>", lookupResult.Messages )
+        try {
+            foreach (string songId in songIds) {
+                try {
+                    MediaLinkResult? lookupResult = await mediaLinkService.GetInfoByProviderIdAsync( songId, SupportedProviders.AppleMusic, false );
+                    if (lookupResult == null || lookupResult.Results.Count == 0) {
+                        if (lookupResult?.Messages is { Count: > 0 }) {
+                            rateLimitCount++;
+                            string warningHtml = "<div class=\"alert alert-warning\"><strong>Rate Limited</strong><br/>"
+                            + string.Join( "<br/>", lookupResult.Messages.Select( HtmlEncoder.Default.Encode ) )
                             + "</div>";
-                        await Response.WriteAsync( warningHtml );
-                        await Response.Body.FlushAsync( );
-                    } else {
-                        errorCount++;
+                            await Response.WriteAsync( warningHtml + StreamFraming.ItemDelimiter );
+                            await Response.Body.FlushAsync( );
+                        } else {
+                            errorCount++;
+                        }
+                        continue;
                     }
-                    continue;
-                }
 
-                MusicLookupResult? primaryResult = null;
-                SupportedProviders primaryProvider = SupportedProviders.AppleMusic;
-                foreach ((SupportedProviders provider, MusicLookupResult dto) in lookupResult.Results) {
-                    if (dto.IsPrimary) {
-                        primaryResult = dto;
-                        primaryProvider = provider;
-                        break;
+                    MusicLookupResult? primaryResult = null;
+                    SupportedProviders primaryProvider = SupportedProviders.AppleMusic;
+                    foreach ((SupportedProviders provider, MusicLookupResult dto) in lookupResult.Results) {
+                        if (dto.IsPrimary) {
+                            primaryResult = dto;
+                            primaryProvider = provider;
+                            break;
+                        }
+                        if (primaryResult == null) {
+                            primaryResult = dto;
+                            primaryProvider = provider;
+                        }
                     }
+
                     if (primaryResult == null) {
-                        primaryResult = dto;
-                        primaryProvider = provider;
+                        errorCount++;
+                        continue;
                     }
-                }
 
-                if (primaryResult == null) {
-                    errorCount++;
-                    continue;
-                }
+                    string? cardUrl = null;
+                    if (cardService?.IsEnabled == true) {
+                        cardUrl = cardService.StoreResult( lookupResult );
+                    }
 
-                string? cardUrl = null;
-                if (cardService?.IsEnabled == true) {
-                    cardUrl = cardService.StoreResult( lookupResult );
-                }
+                    string? atProtoUri = await GetATProtoUriFromCache( lookupResult );
 
-                string? atProtoUri = await GetATProtoUriFromCache( lookupResult );
-
-                string appleProbeKey = LookupKeyBuilder.TypedKey(
+                    string appleProbeKey = LookupKeyBuilder.TypedKey(
                     LookupRequestType.SongIdLookup, SupportedProviders.AppleMusic, songId.Trim( ) );
-                bool appleIsInProgress = probe is not null
+                    bool appleIsInProgress = probe is not null
                     && await probe.IsActiveAsync( appleProbeKey, HttpContext.RequestAborted );
 
-                MusicLookupViewModel.MusicLookupResultItem item = new( )
+                    MusicLookupViewModel.MusicLookupResultItem item = new( )
                 {
-                    CardUrl = cardUrl,
-                    ATProtoUri = atProtoUri,
-                    Result = lookupResult,
-                    PrimaryProvider = primaryProvider,
-                    PrimaryResult = primaryResult,
-                    IsLookupInProgress = appleIsInProgress
-                };
+                        CardUrl = cardUrl,
+                        ATProtoUri = atProtoUri,
+                        Result = lookupResult,
+                        PrimaryProvider = primaryProvider,
+                        PrimaryResult = primaryResult,
+                        IsLookupInProgress = appleIsInProgress
+                    };
 
-                string html = await RenderViewToStringAsync( "_LookupResultCard", item );
-                await Response.WriteAsync( html );
-                await Response.Body.FlushAsync( );
-                processedCount++;
-            } catch (Exception ex) {
-                LogProcessSongError( ex, songId.SanitizeForLogging( ) );
-                errorCount++;
+                    string html = await RenderViewToStringAsync( "_LookupResultCard", item );
+                    await Response.WriteAsync( html + StreamFraming.ItemDelimiter );
+                    await Response.Body.FlushAsync( );
+                    processedCount++;
+                } catch (OperationCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested) {
+                    throw;
+                } catch (Exception ex) {
+                    LogProcessSongError( ex, songId.SanitizeForLogging( ) );
+                    errorCount++;
+                }
             }
-        }
-        if (processedCount == 0 && errorCount > 0) {
-            await Response.WriteAsync( $"<div class=\"alert alert-warning\" data-stream-complete=\"true\" data-processed=\"0\" data-errors=\"{errorCount}\" data-rate-limited=\"{rateLimitCount}\">No results found for the tracks in this playlist</div>" );
-        } else if (processedCount == 0 && rateLimitCount > 0) {
-            await Response.WriteAsync( $"<div class=\"d-none\" data-stream-complete=\"true\" data-processed=\"0\" data-errors=\"{errorCount}\" data-rate-limited=\"{rateLimitCount}\"></div>" );
-        } else if (errorCount > 0) {
-            await Response.WriteAsync( $"<div class=\"d-none\" data-stream-complete=\"true\" data-processed=\"{processedCount}\" data-errors=\"{errorCount}\" data-rate-limited=\"{rateLimitCount}\"></div>" );
-        } else {
-            await Response.WriteAsync( $"<div class=\"d-none\" data-stream-complete=\"true\" data-processed=\"{processedCount}\" data-errors=\"0\" data-rate-limited=\"{rateLimitCount}\"></div>" );
+            if (processedCount == 0 && errorCount > 0) {
+                await Response.WriteAsync( $"<div class=\"alert alert-warning\" data-stream-complete=\"true\" data-processed=\"0\" data-errors=\"{errorCount}\" data-rate-limited=\"{rateLimitCount}\">No results found for the tracks in this playlist</div>{StreamFraming.ItemDelimiter}" );
+            } else if (processedCount == 0 && rateLimitCount > 0) {
+                await Response.WriteAsync( $"<div class=\"d-none\" data-stream-complete=\"true\" data-processed=\"0\" data-errors=\"{errorCount}\" data-rate-limited=\"{rateLimitCount}\"></div>{StreamFraming.ItemDelimiter}" );
+            } else if (errorCount > 0) {
+                await Response.WriteAsync( $"<div class=\"d-none\" data-stream-complete=\"true\" data-processed=\"{processedCount}\" data-errors=\"{errorCount}\" data-rate-limited=\"{rateLimitCount}\"></div>{StreamFraming.ItemDelimiter}" );
+            } else {
+                await Response.WriteAsync( $"<div class=\"d-none\" data-stream-complete=\"true\" data-processed=\"{processedCount}\" data-errors=\"0\" data-rate-limited=\"{rateLimitCount}\"></div>{StreamFraming.ItemDelimiter}" );
+            }
+        } catch (OperationCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested) {
+            // The client disconnected; there is no response stream left to complete.
+        } catch (Exception ex) {
+            LogPlaylistResultsStreamError( ex );
+            if (!HttpContext.RequestAborted.IsCancellationRequested) {
+                await Response.WriteAsync( $"<div class=\"alert alert-danger\" data-stream-complete=\"true\" data-processed=\"{processedCount}\" data-errors=\"{errorCount + 1}\" data-rate-limited=\"{rateLimitCount}\">An error occurred while processing the playlist. Please try again.</div>{StreamFraming.ItemDelimiter}" );
+            }
         }
     }
 

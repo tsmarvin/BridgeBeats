@@ -118,9 +118,7 @@ namespace BridgeBeats.Web.Configuration {
             _ = services.AddMemoryCache( );
 
             // Configure QueueSettings from configuration (with defaults)
-            _ = services.Configure<QueueSettings>(
-                config.GetSection( "BridgeBeats:Queue" )
-            );
+            _ = services.AddValidatedQueueSettings( config );
 
             // Configure antiforgery to accept tokens in headers for JSON requests
             _ = services.AddAntiforgery( options => {

@@ -119,4 +119,11 @@ public partial class AppleMusicController {
         Level = LogLevel.Error,
         Message = "Error processing song {SongId}" )]
     private partial void LogProcessSongError( Exception ex, string songId );
+
+    /// <summary>Logs an unexpected failure while writing the playlist result stream.</summary>
+    [LoggerMessage(
+        EventId = Logging.LogEventIds.Controllers.AppleMusicControllerPlaylistResultsStreamError,
+        Level = LogLevel.Error,
+        Message = "Error writing Apple Music playlist result stream" )]
+    private partial void LogPlaylistResultsStreamError( Exception ex );
 }

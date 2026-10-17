@@ -1,3 +1,11 @@
+using System.Net;
+using System.Net.Http.Json;
+using BridgeBeats.Contracts.Constants;
+using BridgeBeats.Contracts.Enums;
+using BridgeBeats.Contracts.Exceptions;
+using BridgeBeats.Contracts.Interfaces;
+using BridgeBeats.Contracts.Records;
+using BridgeBeats.Contracts.Records.WorkerApi;
 using BridgeBeats.Core.Domain.Extensions;
 using BridgeBeats.Core.Infrastructure.Extensions;
 using BridgeBeats.Core.Infrastructure.Storage;
@@ -6,6 +14,9 @@ using Microsoft.Extensions.Http.Resilience;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Moq;
+using Polly;
+using Polly.CircuitBreaker;
+using Polly.Retry;
 
 namespace BridgeBeats.Tests.Unit;
 
@@ -21,6 +32,9 @@ namespace BridgeBeats.Tests.Unit;
 /// </summary>
 [TestClass]
 public class ResilienceWiringTests {
+
+    /// <summary>Current MSTest context.</summary>
+    public TestContext TestContext { get; set; } = null!;
 
     /// <summary>
     /// The <c>atproto-sync</c> named client carries the standard resilience pipeline (here asserted via
@@ -98,6 +112,142 @@ public class ResilienceWiringTests {
             "SamplingDuration at default AttemptTimeout must be 240s (2 x 120s)." );
         Assert.AreEqual( TimeSpan.FromMinutes( 10 ), opts.TotalRequestTimeout.Timeout,
             "TotalRequestTimeout must remain 10 minutes." );
+    }
+
+    /// <summary>Raw HTTP failures remain retryable until a provider handler converts a 429.</summary>
+    [TestMethod]
+    [DataRow( 429 )]
+    [DataRow( 500 )]
+    public async Task ProviderRateLimitResponse_RawStatusRemainsRetryable( int statusCode ) {
+        HttpStandardResilienceOptions options = new( );
+        AspireServiceExtensions.ExcludeProviderRateLimits( options );
+        ResilienceContext context = ResilienceContextPool.Shared.Get( CancellationToken.None );
+        using HttpResponseMessage response = new( (System.Net.HttpStatusCode)statusCode );
+        try {
+            Outcome<HttpResponseMessage> outcome = Outcome.FromResult( response );
+            RetryPredicateArguments<HttpResponseMessage> retryArguments = new( context, outcome, 0 );
+            CircuitBreakerPredicateArguments<HttpResponseMessage> circuitArguments = new(
+                context, Outcome.FromResult( response ) );
+
+            bool retryShouldHandle = await options.Retry.ShouldHandle( retryArguments );
+            bool circuitShouldHandle = await options.CircuitBreaker.ShouldHandle( circuitArguments );
+
+            Assert.IsTrue( retryShouldHandle );
+            Assert.IsTrue( circuitShouldHandle );
+        } finally {
+            ResilienceContextPool.Shared.Return( context );
+        }
+    }
+
+    /// <summary>Typed provider rate-limit signals bypass both strategies on every client.</summary>
+    [TestMethod]
+    public async Task ProviderRateLimitException_IsExcludedFromRetryAndCircuitBreaker( ) {
+        HttpStandardResilienceOptions options = new( );
+        AspireServiceExtensions.ExcludeProviderRateLimits( options );
+        ResilienceContext context = ResilienceContextPool.Shared.Get( CancellationToken.None );
+        try {
+            Outcome<HttpResponseMessage> outcome = Outcome.FromException<HttpResponseMessage>(
+                new ProviderRateLimitException(
+                    TimeSpan.FromSeconds( 30 ),
+                    new Uri( "https://api.spotify.com/v1/tracks/test" ),
+                    BridgeBeats.Contracts.Enums.SupportedProviders.Spotify ) );
+
+            bool retryShouldHandle = await options.Retry.ShouldHandle(
+                new RetryPredicateArguments<HttpResponseMessage>( context, outcome, 0 ) );
+            bool circuitShouldHandle = await options.CircuitBreaker.ShouldHandle(
+                new CircuitBreakerPredicateArguments<HttpResponseMessage>( context, outcome ) );
+
+            Assert.IsFalse( retryShouldHandle );
+            Assert.IsFalse( circuitShouldHandle );
+        } finally {
+            ResilienceContextPool.Shared.Return( context );
+        }
+    }
+
+    /// <summary>A production-shaped default pipeline sees the worker's typed 429 and does not retry it.</summary>
+    [TestMethod]
+    public async Task SpotifyWorkerHttpClient_ConvertsRaw429InsideSharedPipelineWithoutRetry( ) {
+        ServiceCollection services = new( );
+        _ = services.AddLogging( );
+        _ = services.ConfigureHttpClientDefaults( builder =>
+            builder.AddStandardResilienceHandler( options => {
+                options.Retry.MaxRetryAttempts = 3;
+                options.Retry.Delay = TimeSpan.FromMilliseconds( 1 );
+                options.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds( 10 );
+                options.AttemptTimeout.Timeout = TimeSpan.FromSeconds( 2 );
+                options.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds( 30 );
+                AspireServiceExtensions.ExcludeProviderRateLimits( options );
+            } ) );
+        _ = services.AddSpotifyWorkerHttpClient( [] );
+        CountingRateLimitHandler primaryHandler = new( );
+        _ = services
+            .AddHttpClient( ProviderServiceExtensions.SpotifyWorkerHttpClientName )
+            .ConfigurePrimaryHttpMessageHandler( ( ) => primaryHandler );
+
+        using ServiceProvider provider = services.BuildServiceProvider( );
+        using HttpClient client = provider.GetRequiredService<IHttpClientFactory>( )
+            .CreateClient( ProviderServiceExtensions.SpotifyWorkerHttpClientName );
+
+        ProviderRateLimitException exception = await Assert.ThrowsExactlyAsync<ProviderRateLimitException>(
+            ( ) => client.PostAsJsonAsync(
+                "/lookup/isrc",
+                new { isrc = "US-TEST-429" },
+                TestContext.CancellationToken ) );
+
+        Assert.AreEqual( 1, primaryHandler.CallCount );
+        Assert.AreEqual( TimeSpan.FromSeconds( 30 ), exception.RetryAfterValue );
+        Assert.AreEqual( ProviderEndpointConstants.ProviderWide, exception.Endpoint );
+        Assert.IsNotNull( primaryHandler.LastContent );
+        Assert.IsTrue( primaryHandler.LastContent.IsDisposed );
+    }
+
+    /// <summary>A direct provider 429 is converted before the shared pipeline can retry or count it.</summary>
+    [TestMethod]
+    public async Task SpotifyApiHttpClient_ConvertsRaw429InsideSharedPipelineWithoutRetry( ) {
+        ServiceCollection services = new( );
+        _ = services.AddLogging( );
+        _ = services.Configure<QueueSettings>( _ => { } );
+        _ = services.AddSingleton( new Mock<IRateLimitTracker>( ).Object );
+        _ = services.ConfigureHttpClientDefaults( builder =>
+            builder.AddStandardResilienceHandler( options => {
+                options.Retry.MaxRetryAttempts = 3;
+                options.Retry.Delay = TimeSpan.FromMilliseconds( 1 );
+                options.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds( 10 );
+                options.AttemptTimeout.Timeout = TimeSpan.FromSeconds( 2 );
+                options.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds( 30 );
+                AspireServiceExtensions.ExcludeProviderRateLimits( options );
+            } ) );
+        _ = services.AddSpotifyServices( "client", "secret", [] );
+        CountingRateLimitHandler primaryHandler = new( includeEnvelope: false );
+        _ = services
+            .AddHttpClient( "spotify-api" )
+            .ConfigurePrimaryHttpMessageHandler( ( ) => primaryHandler );
+
+        using ServiceProvider provider = services.BuildServiceProvider( );
+        using HttpClient client = provider.GetRequiredService<IHttpClientFactory>( ).CreateClient( "spotify-api" );
+
+        ProviderRateLimitException exception = await Assert.ThrowsExactlyAsync<ProviderRateLimitException>(
+            ( ) => client.GetAsync( "tracks/test", TestContext.CancellationToken ) );
+
+        Assert.AreEqual( 1, primaryHandler.CallCount );
+        Assert.AreEqual( TimeSpan.FromSeconds( 30 ), exception.RetryAfterValue );
+        Assert.AreEqual( SupportedProviders.Spotify, exception.Provider );
+        Assert.AreEqual( "tracks/:id", exception.Endpoint );
+    }
+
+    /// <summary>The direct provider client remains resolvable when shared Redis tracking is absent.</summary>
+    [TestMethod]
+    public void SpotifyApiHttpClient_WithoutRateLimitTracker_StillResolves( ) {
+        ServiceCollection services = new( );
+        _ = services.AddLogging( );
+        _ = services.Configure<QueueSettings>( _ => { } );
+        _ = services.AddSpotifyServices( "client", "secret", [] );
+
+        using ServiceProvider provider = services.BuildServiceProvider( );
+        using HttpClient client = provider.GetRequiredService<IHttpClientFactory>( )
+            .CreateClient( "spotify-api" );
+
+        Assert.IsNotNull( client );
     }
 
     /// <summary>
@@ -238,5 +388,39 @@ public class ResilienceWiringTests {
             HttpRequestMessage request,
             CancellationToken cancellationToken
         ) => Task.FromCanceled<HttpResponseMessage>( cancelledToken );
+    }
+
+    private sealed class CountingRateLimitHandler( bool includeEnvelope = true ) : HttpMessageHandler {
+        internal int CallCount { get; private set; }
+        internal TrackingStringContent? LastContent { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken
+        ) {
+            CallCount++;
+            HttpResponseMessage response = new( HttpStatusCode.TooManyRequests ) { RequestMessage = request };
+            _ = response.Headers.TryAddWithoutValidation( "Retry-After", "30" );
+            if (includeEnvelope) {
+                string json = System.Text.Json.JsonSerializer.Serialize( ProviderLookupResponse.Error(
+                    "Provider rate limit exceeded.",
+                    retryAfterSeconds: 30,
+                    retryThresholdSeconds: 120,
+                    rateLimitedEndpoint: ProviderEndpointConstants.ProviderWide ) );
+                LastContent = new TrackingStringContent( json );
+                response.Content = LastContent;
+            }
+            return Task.FromResult( response );
+        }
+    }
+
+    private sealed class TrackingStringContent( string content )
+        : StringContent( content, System.Text.Encoding.UTF8, "application/json" ) {
+        internal bool IsDisposed { get; private set; }
+
+        protected override void Dispose( bool disposing ) {
+            IsDisposed = true;
+            base.Dispose( disposing );
+        }
     }
 }

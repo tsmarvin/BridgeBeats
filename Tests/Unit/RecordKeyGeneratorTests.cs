@@ -1,5 +1,6 @@
 using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
+using BridgeBeats.Core.Domain.Services;
 using BridgeBeats.Core.Infrastructure.Storage;
 
 namespace BridgeBeats.Tests.Unit {
@@ -106,6 +107,67 @@ namespace BridgeBeats.Tests.Unit {
             // Assert
             Assert.IsNotNull( rkey );
             Assert.AreEqual( "track:US-RC1-23-45678", rkey );
+        }
+
+        /// <summary>Streaming and durable storage derive the same normalized external identity.</summary>
+        [TestMethod]
+        public void ExternalIdentity_WithSpecialCharacters_MatchesDurableRkey( ) {
+            MusicLookupResult result = new( ) {
+                ExternalId = " US-RC1-23-45678!@# ",
+                IsAlbum = false
+            };
+
+            string? streamIdentity = MediaLookupResultIdentity.GetExternalKey( result );
+            string durableIdentity = RecordKeyGenerator.GenerateRkey( result.ExternalId, false );
+
+            Assert.AreEqual( durableIdentity, streamIdentity );
+        }
+
+        /// <summary>An unusable first external id does not hide a later valid provider identity.</summary>
+        [TestMethod]
+        public void GenerateRkey_WithFirstInvalidExternalId_UsesLaterValidId( ) {
+            MediaLinkResult result = new( );
+            result.Results.Add( SupportedProviders.Spotify, new MusicLookupResult {
+                ExternalId = "@@@",
+                IsAlbum = false
+            } );
+            result.Results.Add( SupportedProviders.AppleMusic, new MusicLookupResult {
+                ExternalId = "USRC12345678",
+                IsAlbum = false
+            } );
+
+            string rkey = RecordKeyGenerator.GenerateRkey( result );
+
+            Assert.AreEqual( "track:USRC12345678", rkey );
+        }
+
+        /// <summary>A separator-only first id cannot hide a later durable provider identity.</summary>
+        [TestMethod]
+        public void GenerateRkey_WithHyphenOnlyFirstExternalId_UsesLaterValidId( ) {
+            MediaLinkResult result = new( );
+            result.Results.Add( SupportedProviders.Spotify, new MusicLookupResult {
+                ExternalId = "---",
+                IsAlbum = false
+            } );
+            result.Results.Add( SupportedProviders.AppleMusic, new MusicLookupResult {
+                ExternalId = "USRC12345678",
+                IsAlbum = false
+            } );
+
+            string rkey = RecordKeyGenerator.GenerateRkey( result );
+
+            Assert.AreEqual( "track:USRC12345678", rkey );
+        }
+
+        /// <summary>A direct separator-only id is rejected instead of becoming a shared durable key.</summary>
+        [TestMethod]
+        public void GenerateRkey_WithHyphenOnlyExternalId_ThrowsArgumentException( ) {
+            MusicLookupResult result = new( ) { ExternalId = "---", IsAlbum = false };
+
+            Assert.IsFalse( MediaLookupResultIdentity.IsPersistable( result ) );
+            Assert.IsNull( MediaLookupResultIdentity.GetExternalKey( result ) );
+            _ = Assert.ThrowsExactly<ArgumentException>( ( ) =>
+                RecordKeyGenerator.GenerateRkey( result.ExternalId, false ) );
         }
 
         /// <summary>

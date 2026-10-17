@@ -106,6 +106,7 @@ public class QueueMetricsTests {
     public void OperationalHealthInstruments_HaveExpectedNames( ) {
         Assert.AreEqual( "bridgebeats.queue.terminal.total", QueueMetrics.TerminalOutcomeTotal.Name );
         Assert.AreEqual( "bridgebeats.queue.saga.lifecycle.total", QueueMetrics.SagaLifecycleTotal.Name );
+        Assert.AreEqual( "bridgebeats.queue.saga.result_not_persisted.total", QueueMetrics.ResultNotPersistedTotal.Name );
         Assert.AreEqual( "bridgebeats.queue.refresh.outcome.total", QueueMetrics.MaintenanceOutcomeTotal.Name );
         Assert.AreEqual( "bridgebeats.queue.refresh.leg.enqueued.total", QueueMetrics.RefreshLegEnqueuedTotal.Name );
         Assert.AreEqual( "bridgebeats.queue.sojourn.duration", QueueMetrics.QueueSojournDuration.Name );

@@ -93,7 +93,7 @@ namespace BridgeBeats.Core.Infrastructure.Extensions {
 
             TimeSpan ttl = carCacheTtl ?? TimeSpan.FromMinutes( 5 );
 
-            _ = services.AddSingleton<IATProtoStorageService>( sp =>
+            _ = services.AddSingleton<ATProtoStorageService>( sp =>
                 new ATProtoStorageService(
                     sp.GetRequiredService<IATProtoSessionManager>( ),
                     sp.GetRequiredService<ILogger<ATProtoStorageService>>( ),
@@ -101,6 +101,10 @@ namespace BridgeBeats.Core.Infrastructure.Extensions {
                     ttl
                 )
             );
+            _ = services.AddSingleton<IATProtoStorageService>( sp =>
+                sp.GetRequiredService<ATProtoStorageService>( ) );
+            _ = services.AddSingleton<ITargetedATProtoStorageService>( sp =>
+                sp.GetRequiredService<ATProtoStorageService>( ) );
 
             return services;
         }

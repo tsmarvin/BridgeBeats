@@ -400,6 +400,16 @@ public sealed partial class CacheBootstrapBackgroundService(
         await ComputeAndPublishStatisticsAsync( accumulator, cancellationToken );
     }
 
+    /// <summary>
+    /// Runs one complete bootstrap pass without starting the periodic background loop. This entry
+    /// point exists for the manual live-PDS scale test, which exercises the production bootstrap
+    /// implementation against an isolated Redis instance.
+    /// </summary>
+    /// <param name="cancellationToken">A token that cancels the pass.</param>
+    /// <returns>A task that completes when the bootstrap and statistics writes finish.</returns>
+    internal Task RunBootstrapOnceAsync( CancellationToken cancellationToken ) =>
+        RunBootstrapAsync( cancellationToken );
+
     // -------------------------------------------------------------------------
     // Statistics pass — retry, coalescing guard, force-refresh variant
     // -------------------------------------------------------------------------

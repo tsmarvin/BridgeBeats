@@ -76,6 +76,25 @@ public interface IRequestQueue<T> where T : class, IQueueableRequest {
     Task RequeueAsync( string messageId, TimeSpan? delay = null, CancellationToken cancellationToken = default );
 
     /// <summary>
+    /// Atomically replaces a dequeued delivery with an updated request. The replacement is added
+    /// before the original is acknowledged and deleted, so an interrupted rate-limit handoff
+    /// cannot leave both deliveries active or lose the request.
+    /// </summary>
+    /// <param name="messageId">The broker message id of the delivery being replaced.</param>
+    /// <param name="replacement">The complete replacement payload.</param>
+    /// <param name="priority">The destination priority lane.</param>
+    /// <param name="cancellationToken">Token used to cancel the operation.</param>
+    /// <returns>
+    /// The atomic replacement outcome. A missing recovery record preserves the source delivery and
+    /// is reported explicitly rather than being treated as a successful replacement.
+    /// </returns>
+    Task<DeliveryReplacementOutcome> ReplaceAsync(
+        string messageId,
+        T replacement,
+        QueuePriority priority,
+        CancellationToken cancellationToken = default );
+
+    /// <summary>
     /// Reports the current queue depth broken down by priority lane.
     /// </summary>
     /// <param name="cancellationToken">Token used to cancel the operation.</param>

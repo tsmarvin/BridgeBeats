@@ -102,8 +102,12 @@ public static partial class WorkerEndpointExtensions {
                 ? ProviderLookupResponse.Error(
                     "Provider rate limit exceeded.",
                     retrySeconds,
-                    Math.Max( 0, exceeded.Threshold.TotalSeconds ) )
-                : ProviderLookupResponse.Error( "Provider rate limit exceeded.", retrySeconds );
+                    Math.Max( 0, exceeded.Threshold.TotalSeconds ),
+                    ex.Endpoint )
+                : ProviderLookupResponse.Error(
+                    "Provider rate limit exceeded.",
+                    retrySeconds,
+                    rateLimitedEndpoint: ex.Endpoint );
             return Results.Json(
                 envelope,
                 statusCode: StatusCodes.Status429TooManyRequests );

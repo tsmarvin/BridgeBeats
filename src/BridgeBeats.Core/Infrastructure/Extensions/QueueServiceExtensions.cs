@@ -25,15 +25,24 @@ public static class QueueServiceExtensions {
     /// gauges against the shared Redis connection. Pass <see langword="false"/> to skip metric
     /// registration.
     /// </param>
+    /// <param name="registerDispatchRelay">
+    /// When <see langword="true"/>, registers the lookup-dispatch outbox relay. Enable this only in
+    /// the host designated as the background relay owner; Saga Coordinator is the current owner.
+    /// </param>
     /// <returns>The same <paramref name="services"/> instance, to allow call chaining.</returns>
     /// <remarks>
     /// Registers <see cref="BridgeBeats.Contracts.Interfaces.IRequestDeduplicator"/>,
-    /// <see cref="BridgeBeats.Contracts.Interfaces.IRateLimitTracker"/>, and
+    /// <see cref="BridgeBeats.Contracts.Interfaces.IRateLimitTracker"/>,
+    /// <see cref="BridgeBeats.Contracts.Interfaces.ILookupDispatchOutbox"/>, and
     /// <see cref="BridgeBeats.Contracts.Interfaces.ISagaStateManager"/>, each with singleton
     /// lifetime and each resolving the shared <c>IConnectionMultiplexer</c> and a typed logger at
     /// activation time. The saga state manager additionally consumes the bound queue settings.
     /// </remarks>
-    public static IServiceCollection AddQueueInfrastructure( this IServiceCollection services, bool registerMetrics = true ) {
+    public static IServiceCollection AddQueueInfrastructure(
+        this IServiceCollection services,
+        bool registerMetrics = true,
+        bool registerDispatchRelay = false
+    ) {
         // Register singleton services that are shared across all providers
         _ = services.AddSingleton<IRequestDeduplicator>( sp => new RedisRequestDeduplicator(
             sp.GetRequiredService<IConnectionMultiplexer>( ),
@@ -42,8 +51,18 @@ public static class QueueServiceExtensions {
 
         _ = services.AddSingleton<IRateLimitTracker>( sp => new RedisRateLimitTracker(
             sp.GetRequiredService<IConnectionMultiplexer>( ),
+            sp.GetRequiredService<IOptions<QueueSettings>>( ),
             sp.GetRequiredService<ILogger<RedisRateLimitTracker>>( )
         ) );
+
+        _ = services.AddSingleton<ILookupDispatchOutbox>( sp => new RedisLookupDispatchOutbox(
+            sp.GetRequiredService<IConnectionMultiplexer>( ),
+            sp.GetRequiredService<IOptions<QueueSettings>>( ),
+            sp.GetRequiredService<ILogger<RedisLookupDispatchOutbox>>( )
+        ) );
+        if (registerDispatchRelay) {
+            _ = services.AddHostedService<LookupDispatchOutboxBackgroundService>( );
+        }
 
         _ = services.AddSingleton<ISagaStateManager>( sp => new RedisSagaStateManager(
             sp.GetRequiredService<IConnectionMultiplexer>( ),

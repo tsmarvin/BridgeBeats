@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Text.RegularExpressions;
+using BridgeBeats.Contracts.Constants;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
@@ -132,7 +133,9 @@ public partial class RedisRequestQueueTests {
         for (int i = 0; i < Count; i++) {
             await _queue.EnqueueAsync( CreateTestRequest( ) with { RateLimitedEndpoint = "IsrcLookup" }, QueuePriority.Interactive, TestContext.CancellationToken );
         }
-        QueuedLookupRequest tailRequest = CreateTestRequest( lookupType: LookupRequestType.SongIdLookup );
+        QueuedLookupRequest tailRequest = CreateTestRequest( lookupType: LookupRequestType.SongIdLookup ) with {
+            RateLimitedEndpoint = ProviderEndpointConstants.AuthToken
+        };
         await _queue.EnqueueAsync( tailRequest, QueuePriority.Interactive, TestContext.CancellationToken );
 
         // Seed the current consumer's PEL without using the rate-aware path: the first 505 entries
@@ -165,7 +168,9 @@ public partial class RedisRequestQueueTests {
         for (int i = 0; i < Count; i++) {
             await _queue.EnqueueAsync( CreateTestRequest( ) with { RateLimitedEndpoint = "IsrcLookup" }, QueuePriority.Interactive, TestContext.CancellationToken );
         }
-        QueuedLookupRequest tailRequest = CreateTestRequest( lookupType: LookupRequestType.SongIdLookup );
+        QueuedLookupRequest tailRequest = CreateTestRequest( lookupType: LookupRequestType.SongIdLookup ) with {
+            RateLimitedEndpoint = ProviderEndpointConstants.AuthToken
+        };
         await _queue.EnqueueAsync( tailRequest, QueuePriority.Interactive, TestContext.CancellationToken );
         StreamEntry[] claimed = await db.StreamReadGroupAsync( stream, "spotify-workers", "dead-consumer", StreamPosition.NewMessages, Count + 1, noAck: false );
         Assert.HasCount( Count + 1, claimed );
@@ -283,7 +288,9 @@ public partial class RedisRequestQueueTests {
     [Timeout( 30000, CooperativeCancellation = true )]
     public async Task AutoClaim_AgedBlockedEntry_RemainsPending( ) {
         string stream = $"queue:{s_runToken}:spotify:interactive";
-        await _queue.EnqueueAsync( CreateTestRequest( lookupType: LookupRequestType.IsrcLookup ), QueuePriority.Interactive, TestContext.CancellationToken );
+        QueuedLookupRequest blockedRequest = CreateTestRequest(
+            lookupType: LookupRequestType.IsrcLookup ) with { RateLimitedEndpoint = "tracks" };
+        await _queue.EnqueueAsync( blockedRequest, QueuePriority.Interactive, TestContext.CancellationToken );
         QueuedMessage<QueuedLookupRequest>? claimed = await _queue.DequeueAsync( TestContext.CancellationToken );
         Assert.IsNotNull( claimed );
         string id = claimed.MessageId[(claimed.MessageId.LastIndexOf( ':' ) + 1)..];
@@ -292,7 +299,7 @@ public partial class RedisRequestQueueTests {
         RedisRequestQueue<QueuedLookupRequest> second = NewQueue( "blocked-reclaimer" );
         Mock<BridgeBeats.Contracts.Interfaces.IRateLimitTracker> tracker = new( );
         _ = tracker.Setup( t => t.GetAllRateLimitedAsync( It.IsAny<SupportedProviders>( ), It.IsAny<CancellationToken>( ) ) )
-            .ReturnsAsync( [new RateLimitedEndpoint( "IsrcLookup", DateTimeOffset.UtcNow.AddMinutes( 5 ) )] );
+            .ReturnsAsync( [new RateLimitedEndpoint( "tracks", DateTimeOffset.UtcNow.AddMinutes( 5 ) )] );
         Assert.IsNull( await second.DequeueAsync( tracker.Object, TestContext.CancellationToken ) );
         RedisResult pending = await db.ExecuteAsync( "XPENDING", stream, "spotify-workers" );
         Assert.IsGreaterThan( 0, (long)((RedisResult[])pending!)[0] );
@@ -1163,10 +1170,13 @@ public partial class RedisRequestQueueTests {
         await testQueue.EnsureConsumerGroupsAsync( TestContext.CancellationToken );
 
         // Interactive request uses IsrcLookup (will be blocked)
-        string blockedEndpoint = LookupRequestType.IsrcLookup.ToString( );
-        QueuedLookupRequest interactiveRequest = CreateTestRequest( lookupType: LookupRequestType.IsrcLookup );
-        // Background request uses SongIdLookup (not blocked)
-        QueuedLookupRequest bgRequest = CreateTestRequest( lookupType: LookupRequestType.SongIdLookup );
+        const string BlockedEndpoint = "tracks";
+        QueuedLookupRequest interactiveRequest = CreateTestRequest(
+            lookupType: LookupRequestType.IsrcLookup ) with { RateLimitedEndpoint = BlockedEndpoint };
+        // Authentication has an independent cooldown from Spotify's provider-wide data API.
+        QueuedLookupRequest bgRequest = CreateTestRequest( lookupType: LookupRequestType.SongIdLookup ) with {
+            RateLimitedEndpoint = ProviderEndpointConstants.AuthToken
+        };
 
         await testQueue.EnqueueAsync( interactiveRequest, QueuePriority.Interactive, TestContext.CancellationToken );
         await testQueue.EnqueueAsync( bgRequest, QueuePriority.Background, TestContext.CancellationToken );
@@ -1176,7 +1186,7 @@ public partial class RedisRequestQueueTests {
         _ = trackerMock
             .Setup( t => t.GetAllRateLimitedAsync( SupportedProviders.Spotify, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( (IReadOnlyList<RateLimitedEndpoint>)[
-                new RateLimitedEndpoint( blockedEndpoint, DateTimeOffset.UtcNow.AddMinutes( 1 ) )
+                new RateLimitedEndpoint( BlockedEndpoint, DateTimeOffset.UtcNow.AddMinutes( 1 ) )
             ] );
 
         // Act — rate-limit-aware dequeue must skip interactive and serve background
@@ -1186,6 +1196,24 @@ public partial class RedisRequestQueueTests {
         Assert.IsNotNull( message );
         Assert.AreEqual( bgRequest.RequestId, message.Payload.RequestId,
             "Background message must be served when the interactive message's endpoint is rate-limited" );
+    }
+
+    /// <summary>A provider-wide cooldown blocks fresh work that has no carried endpoint yet.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProviderWideCooldown_BlocksNewWorkWithoutRateLimitedEndpoint( ) {
+        await _queue.EnqueueAsync( CreateTestRequest( ), QueuePriority.Interactive, TestContext.CancellationToken );
+        Mock<IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( value => value.GetAllRateLimitedAsync(
+                SupportedProviders.Spotify, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [new RateLimitedEndpoint(
+                ProviderEndpointConstants.ProviderWide,
+                DateTimeOffset.UtcNow.AddMinutes( 1 ) )] );
+
+        QueuedMessage<QueuedLookupRequest>? message = await _queue.DequeueAsync(
+            tracker.Object, TestContext.CancellationToken );
+
+        Assert.IsNull( message );
     }
 
     /// <summary>

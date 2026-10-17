@@ -168,7 +168,8 @@ public class SpotifyBulkRejectionFallbackIntegrationTests {
             lookupServiceMock.Object,
             requestQueueMock.Object,
             new Mock<ILogger<SpotifyBulkProcessorService>>( ).Object,
-            options );
+            options,
+            Options.Create( new QueueSettings( ) ) );
 
         // Act — calling ProcessBulkTrackLookupsAsync directly bypasses the linger/threshold gate in
         // ShouldProcessBulkTracksAsync, so both seeded entries are processed unconditionally.

@@ -51,17 +51,17 @@ public sealed class WorkerEndpointContractIntegrationTests {
         Assert.IsGreaterThan( 0, exception.RetryAfterValue.TotalSeconds );
     }
 
-    /// <summary>Missing or invalid rate-limit metadata remains a status-bearing failure.</summary>
+    /// <summary>Missing or invalid rate-limit metadata uses the configured durable fallback.</summary>
     [TestMethod]
     [DataRow( null )]
     [DataRow( "not-a-date" )]
-    public async Task ProductionProxy_429MissingOrInvalidRetryMetadata_ThrowsStatusBearingFailure( string? retryAfter ) {
+    public async Task ProductionProxy_429MissingOrInvalidRetryMetadata_UsesDefaultRateLimitWindow( string? retryAfter ) {
         using HttpResponseMessage response = new( HttpStatusCode.TooManyRequests );
         if (retryAfter is not null) _ = response.Headers.TryAddWithoutValidation( "Retry-After", retryAfter );
-        HttpRequestException exception = await Assert.ThrowsExactlyAsync<HttpRequestException>(
+        ProviderRateLimitException exception = await Assert.ThrowsExactlyAsync<ProviderRateLimitException>(
             ( ) => new HttpMusicLookupService( SupportedProviders.Spotify, CreateStaticFactory( response ), "spotify", NullLogger<HttpMusicLookupService>.Instance )
                 .GetInfoByISRCAsync( "US-429" ) );
-        Assert.AreEqual( HttpStatusCode.TooManyRequests, exception.StatusCode );
+        Assert.AreEqual( QueueSettings.DefaultRateLimitRetryAfter, exception.RetryAfterValue );
     }
 
     /// <summary>The precise envelope delay wins over the ceiling-rounded Retry-After header.</summary>
@@ -69,7 +69,10 @@ public sealed class WorkerEndpointContractIntegrationTests {
     public async Task ProductionProxy_429EnvelopePrecisionPreventsFalseThresholdExceeded( ) {
         using HttpResponseMessage response = new( HttpStatusCode.TooManyRequests ) {
             Content = JsonContent.Create( ProviderLookupResponse.Error(
-                "Provider rate limit exceeded.", retryAfterSeconds: 30.2, retryThresholdSeconds: 30.5 ) )
+                "Provider rate limit exceeded.",
+                retryAfterSeconds: 30.2,
+                retryThresholdSeconds: 30.5,
+                rateLimitedEndpoint: "tracks/:id" ) )
         };
         _ = response.Headers.TryAddWithoutValidation( "Retry-After", "31" );
 
@@ -82,6 +85,7 @@ public sealed class WorkerEndpointContractIntegrationTests {
                 .GetInfoByISRCAsync( "US-PRECISE-RETRY" ) );
 
         Assert.AreEqual( 30.2, exception.RetryAfterValue.TotalSeconds, 0.001 );
+        Assert.AreEqual( "tracks/:id", exception.Endpoint );
     }
 
     /// <summary>Non-JSON 503 and 200 responses become status-bearing protocol failures.</summary>
@@ -99,7 +103,9 @@ public sealed class WorkerEndpointContractIntegrationTests {
     private static IHttpClientFactory CreateStaticFactory( HttpResponseMessage response ) {
         Mock<IHttpClientFactory> factory = new( );
         _ = factory.Setup( value => value.CreateClient( It.IsAny<string>( ) ) )
-            .Returns( new HttpClient( new StaticResponseHandler( response ) ) { BaseAddress = new Uri( "https://worker.test" ) } );
+            .Returns( new HttpClient( new WorkerRateLimitHandler( SupportedProviders.Spotify, new QueueSettings( ) ) {
+                InnerHandler = new StaticResponseHandler( response )
+            } ) { BaseAddress = new Uri( "https://worker.test" ) } );
         return factory.Object;
     }
 
@@ -296,13 +302,14 @@ public sealed class WorkerEndpointContractIntegrationTests {
                 }
             } )
             .ReturnsAsync( true );
-        _ = queue.Setup( value => value.EnqueueAsync(
-                It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ) )
+        _ = queue.Setup( value => value.ReplaceAsync(
+                It.IsAny<string>( ), It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ) )
             .Callback( ( ) => {
                 if (expectedAction == "requeue") {
                     _ = terminalAction.TrySetResult( true );
                 }
-            } );
+            } )
+            .ReturnsAsync( DeliveryReplacementOutcome.Replaced );
         _ = queue.Setup( value => value.RequeueAsync(
                 It.IsAny<string>( ), It.IsAny<TimeSpan?>( ), It.IsAny<CancellationToken>( ) ) )
             .Callback( ( ) => { } );
@@ -334,8 +341,9 @@ public sealed class WorkerEndpointContractIntegrationTests {
                     It.IsAny<CancellationToken>( ) ), Times.Once );
                 break;
             case "requeue":
-                queue.Verify( value => value.EnqueueAsync(
-                    It.Is<QueuedLookupRequest>( value => value.AttemptCount == 1 && value.EnqueueOrigin == QueueEnqueueOrigin.Requeue ),
+                queue.Verify( value => value.ReplaceAsync(
+                    "contract-message",
+                    It.Is<QueuedLookupRequest>( value => value.AttemptCount == 0 && value.EnqueueOrigin == QueueEnqueueOrigin.Requeue ),
                     QueuePriority.Background, It.IsAny<CancellationToken>( ) ), Times.Once );
                 break;
             case "dlq":
@@ -347,7 +355,9 @@ public sealed class WorkerEndpointContractIntegrationTests {
     private static Mock<IHttpClientFactory> CreateFactory( WebApplication app ) {
         Mock<IHttpClientFactory> factory = new( );
         _ = factory.Setup( f => f.CreateClient( "spotify" ) )
-            .Returns( ( ) => new HttpClient( app.GetTestServer( ).CreateHandler( ) ) { BaseAddress = new Uri( "http://localhost" ) } );
+            .Returns( ( ) => new HttpClient( new WorkerRateLimitHandler( SupportedProviders.Spotify, new QueueSettings( ) ) {
+                InnerHandler = app.GetTestServer( ).CreateHandler( )
+            } ) { BaseAddress = new Uri( "http://localhost" ) } );
         return factory;
     }
 

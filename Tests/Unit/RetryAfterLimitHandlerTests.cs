@@ -1,7 +1,12 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using BridgeBeats.Contracts.Constants;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Exceptions;
+using BridgeBeats.Contracts.Interfaces;
+using BridgeBeats.Contracts.Records;
+using BridgeBeats.Contracts.Records.WorkerApi;
 using BridgeBeats.Core.Domain.Providers.Common;
 using BridgeBeats.Core.Infrastructure.Logging;
 using Microsoft.Extensions.Logging;
@@ -10,12 +15,11 @@ using Moq;
 namespace BridgeBeats.Tests.Unit;
 
 /// <summary>
-/// Unit tests for <see cref="RetryAfterLimitHandler"/>, the delegating handler that fails fast on an
-/// HTTP 429 whose <c>Retry-After</c> exceeds a configured threshold. Verify that non-429 responses and
-/// 429s with no or below-threshold <c>Retry-After</c> pass through; that a <c>Retry-After</c> above the
-/// threshold (in both delta-seconds and HTTP-date forms) throws <see cref="RetryAfterExceededException"/>
-/// carrying the retry-after and threshold; that the exception's provider is derived from the request
-/// host; that the fail-fast path logs a warning; and the zero- and large-threshold edge cases.
+/// Unit tests for <see cref="RetryAfterLimitHandler"/>, the delegating handler that converts provider
+/// backpressure into a typed queue deferral before resilience policies retry or count it. Verify that
+/// non-backpressure responses pass through; ordinary waits throw <see cref="ProviderRateLimitException"/>;
+/// excessive waits throw <see cref="RetryAfterExceededException"/>; and provider, timing, and logging
+/// details are preserved.
 /// </summary>
 [TestClass]
 public class RetryAfterLimitHandlerTests {
@@ -38,7 +42,7 @@ public class RetryAfterLimitHandlerTests {
     [TestMethod]
     public void Constructor_WithValidParameters_ShouldCreateInstance( ) {
         // Act
-        RetryAfterLimitHandler handler = new( DefaultMaxRetryAfterSeconds, _loggerMock.Object );
+        RetryAfterLimitHandler handler = new( DefaultMaxRetryAfterSeconds, new QueueSettings( ), _loggerMock.Object );
 
         // Assert
         Assert.IsNotNull( handler );
@@ -48,7 +52,7 @@ public class RetryAfterLimitHandlerTests {
     [TestMethod]
     public void Constructor_WithZeroThreshold_ShouldCreateInstance( ) {
         // Act - Zero means any Retry-After will exceed threshold
-        RetryAfterLimitHandler handler = new( 0, _loggerMock.Object );
+        RetryAfterLimitHandler handler = new( 0, new QueueSettings( ), _loggerMock.Object );
 
         // Assert
         Assert.IsNotNull( handler );
@@ -103,15 +107,28 @@ public class RetryAfterLimitHandlerTests {
         Assert.AreEqual( HttpStatusCode.NotFound, result.StatusCode );
     }
 
+    /// <summary>A 503 remains an outage response for the standard resilience pipeline.</summary>
+    [TestMethod]
+    public async Task SendAsync_With503AndRetryAfter_ShouldPassThrough( ) {
+        RetryAfterLimitHandler handler = CreateHandler( DefaultMaxRetryAfterSeconds );
+        HttpResponseMessage response = new( HttpStatusCode.ServiceUnavailable );
+        response.Headers.RetryAfter = new RetryConditionHeaderValue( TimeSpan.FromSeconds( 45 ) );
+        SetupInnerHandler( handler, response );
+
+        HttpResponseMessage result = await SendRequestAsync( handler );
+
+        Assert.AreEqual( HttpStatusCode.ServiceUnavailable, result.StatusCode );
+    }
+
     #endregion
 
     #region SendAsync Tests - 429 Without Retry-After
 
     /// <summary>
-    /// A 429 with no <c>Retry-After</c> header passes through (nothing to compare against the threshold).
+    /// A 429 with no <c>Retry-After</c> header uses the safe default deferral.
     /// </summary>
     [TestMethod]
-    public async Task SendAsync_With429_NoRetryAfterHeader_ShouldPassThrough( ) {
+    public async Task SendAsync_With429_NoRetryAfterHeader_ShouldUseDefaultTypedDelay( ) {
         // Arrange
         RetryAfterLimitHandler handler = CreateHandler( DefaultMaxRetryAfterSeconds );
         HttpResponseMessage rateLimitResponse = new( HttpStatusCode.TooManyRequests );
@@ -119,10 +136,11 @@ public class RetryAfterLimitHandlerTests {
         SetupInnerHandler( handler, rateLimitResponse );
 
         // Act
-        HttpResponseMessage result = await SendRequestAsync( handler );
+        ProviderRateLimitException exception = await Assert.ThrowsExactlyAsync<ProviderRateLimitException>(
+            ( ) => SendRequestAsync( handler ) );
 
-        // Assert - Should pass through without throwing
-        Assert.AreEqual( HttpStatusCode.TooManyRequests, result.StatusCode );
+        // Assert
+        Assert.AreEqual( TimeSpan.FromMinutes( 1 ), exception.RetryAfterValue );
     }
 
     #endregion
@@ -130,10 +148,10 @@ public class RetryAfterLimitHandlerTests {
     #region SendAsync Tests - 429 With Retry-After Below Threshold
 
     /// <summary>
-    /// A 429 whose <c>Retry-After</c> (60s) is below the threshold passes through.
+    /// A 429 whose <c>Retry-After</c> is below the threshold becomes a typed deferral.
     /// </summary>
     [TestMethod]
-    public async Task SendAsync_With429_RetryAfterBelowThreshold_ShouldPassThrough( ) {
+    public async Task SendAsync_With429_RetryAfterBelowThreshold_ShouldThrowTypedRateLimit( ) {
         // Arrange
         RetryAfterLimitHandler handler = CreateHandler( DefaultMaxRetryAfterSeconds );
         HttpResponseMessage rateLimitResponse = new( HttpStatusCode.TooManyRequests );
@@ -141,10 +159,11 @@ public class RetryAfterLimitHandlerTests {
         SetupInnerHandler( handler, rateLimitResponse );
 
         // Act
-        HttpResponseMessage result = await SendRequestAsync( handler );
+        ProviderRateLimitException exception = await Assert.ThrowsExactlyAsync<ProviderRateLimitException>(
+            ( ) => SendRequestAsync( handler ) );
 
-        // Assert - 60 seconds is below 120 threshold, should pass through
-        Assert.AreEqual( HttpStatusCode.TooManyRequests, result.StatusCode );
+        // Assert
+        Assert.AreEqual( TimeSpan.FromSeconds( 60 ), exception.RetryAfterValue );
     }
 
     /// <summary>
@@ -152,7 +171,7 @@ public class RetryAfterLimitHandlerTests {
     /// is inclusive; only values above the threshold throw).
     /// </summary>
     [TestMethod]
-    public async Task SendAsync_With429_RetryAfterExactlyAtThreshold_ShouldPassThrough( ) {
+    public async Task SendAsync_With429_RetryAfterExactlyAtThreshold_ShouldThrowTypedRateLimit( ) {
         // Arrange
         RetryAfterLimitHandler handler = CreateHandler( DefaultMaxRetryAfterSeconds );
         HttpResponseMessage rateLimitResponse = new( HttpStatusCode.TooManyRequests );
@@ -160,10 +179,11 @@ public class RetryAfterLimitHandlerTests {
         SetupInnerHandler( handler, rateLimitResponse );
 
         // Act
-        HttpResponseMessage result = await SendRequestAsync( handler );
+        ProviderRateLimitException exception = await Assert.ThrowsExactlyAsync<ProviderRateLimitException>(
+            ( ) => SendRequestAsync( handler ) );
 
-        // Assert - Exactly at threshold should pass through (not exceeded)
-        Assert.AreEqual( HttpStatusCode.TooManyRequests, result.StatusCode );
+        // Assert - Exactly at threshold is a normal typed deferral (not the exceeded subtype)
+        Assert.AreEqual( TimeSpan.FromSeconds( 120 ), exception.RetryAfterValue );
     }
 
     #endregion
@@ -263,7 +283,7 @@ public class RetryAfterLimitHandlerTests {
     /// threshold and passes through.
     /// </summary>
     [TestMethod]
-    public async Task SendAsync_With429_HttpDateRetryAfterBelowThreshold_ShouldPassThrough( ) {
+    public async Task SendAsync_With429_HttpDateRetryAfterBelowThreshold_ShouldThrowTypedRateLimit( ) {
         // Arrange - Use HTTP-date format (near future)
         RetryAfterLimitHandler handler = CreateHandler( DefaultMaxRetryAfterSeconds );
         HttpResponseMessage rateLimitResponse = new( HttpStatusCode.TooManyRequests );
@@ -272,15 +292,81 @@ public class RetryAfterLimitHandlerTests {
         SetupInnerHandler( handler, rateLimitResponse );
 
         // Act
-        HttpResponseMessage result = await SendRequestAsync( handler );
+        ProviderRateLimitException exception = await Assert.ThrowsExactlyAsync<ProviderRateLimitException>(
+            ( ) => SendRequestAsync( handler ) );
 
         // Assert - 30 seconds is below threshold
-        Assert.AreEqual( HttpStatusCode.TooManyRequests, result.StatusCode );
+        Assert.IsGreaterThan( 0, exception.RetryAfterValue.TotalSeconds );
+        Assert.IsLessThanOrEqualTo( 30, exception.RetryAfterValue.TotalSeconds );
+    }
+
+    /// <summary>An expired HTTP-date is clamped to a short delay so it cannot hot-loop the queue.</summary>
+    [TestMethod]
+    public async Task SendAsync_With429_ExpiredHttpDate_ShouldUseMinimumTypedDelay( ) {
+        RetryAfterLimitHandler handler = CreateHandler( DefaultMaxRetryAfterSeconds );
+        HttpResponseMessage rateLimitResponse = new( HttpStatusCode.TooManyRequests );
+        rateLimitResponse.Headers.RetryAfter = new RetryConditionHeaderValue( DateTimeOffset.UtcNow.AddMinutes( -1 ) );
+        SetupInnerHandler( handler, rateLimitResponse );
+
+        ProviderRateLimitException exception = await Assert.ThrowsExactlyAsync<ProviderRateLimitException>(
+            ( ) => SendRequestAsync( handler ) );
+
+        Assert.AreEqual( TimeSpan.FromSeconds( 5 ), exception.RetryAfterValue );
     }
 
     #endregion
 
     #region Provider Detection Tests
+
+    /// <summary>Provider URI templates map to stable, endpoint-specific protocol keys.</summary>
+    [TestMethod]
+    [DataRow( SupportedProviders.Spotify, "https://accounts.spotify.com/api/token", "auth/token" )]
+    [DataRow( SupportedProviders.Spotify, "https://api.spotify.com/v1/tracks?ids=1,2", "tracks" )]
+    [DataRow( SupportedProviders.Spotify, "https://api.spotify.com/v1/tracks/123", "tracks/:id" )]
+    [DataRow( SupportedProviders.Spotify, "https://api.spotify.com/v1/artists/123/top-tracks?market=US", "artists/:id/top-tracks" )]
+    [DataRow( SupportedProviders.Spotify, "https://api.spotify.com/v1/albums/123/tracks", "albums/:id/tracks" )]
+    [DataRow( SupportedProviders.Spotify, "https://api.spotify.com/v1/search?q=test&type=track%2Cartist", "search" )]
+    [DataRow( SupportedProviders.Spotify, "https://api.spotify.com/v1/search?q=test&type=track", "search:track" )]
+    [DataRow( SupportedProviders.AppleMusic, "https://api.music.apple.com/v1/catalog/us/songs/123", "songs/:id" )]
+    [DataRow( SupportedProviders.AppleMusic, "https://api.music.apple.com/v1/catalog/us/artists/123/albums", "artists/:id/albums" )]
+    [DataRow( SupportedProviders.AppleMusic, "https://api.music.apple.com/v1/catalog/us/search?term=test&types=songs", "search" )]
+    [DataRow( SupportedProviders.AppleMusic, "https://api.music.apple.com/v1/catalog/us", ProviderEndpointConstants.Unknown )]
+    [DataRow( SupportedProviders.Tidal, "https://auth.tidal.com/v1/oauth2/token", "auth/token" )]
+    [DataRow( SupportedProviders.Tidal, "https://openapi.tidal.com/v2/searchResults/abc", "search-results" )]
+    [DataRow( SupportedProviders.Tidal, "https://openapi.tidal.com/v2/artists/123/relationships/tracks", "artists/:id/relationships/tracks" )]
+    public void ProviderRateLimitEndpoint_FromRequest_ReturnsExpectedTemplate(
+        SupportedProviders provider,
+        string requestUri,
+        string expected
+    ) {
+        string endpoint = ProviderRateLimitEndpoint.FromRequest( provider, new Uri( requestUri ) );
+
+        Assert.AreEqual( expected, endpoint );
+    }
+
+    /// <summary>Legacy bulk endpoint keys normalize to the shared collection vocabulary.</summary>
+    [TestMethod]
+    [DataRow( "BulkTracks", "tracks" )]
+    [DataRow( "bulktracks", "tracks" )]
+    [DataRow( "BulkAlbums", "albums" )]
+    [DataRow( "BulkArtists", "artists" )]
+    [DataRow( "tracks/:id", "tracks/:id" )]
+    public void ProviderEndpointConstants_Normalize_ReturnsCanonicalKey( string input, string expected ) {
+        Assert.AreEqual( expected, ProviderEndpointConstants.Normalize( input ) );
+    }
+
+    /// <summary>Effective endpoint resolution prefers concrete reports and otherwise uses its fallback.</summary>
+    [TestMethod]
+    [DataRow( "tracks/:id", "albums/:id", "tracks/:id" )]
+    [DataRow( ProviderEndpointConstants.Unknown, "albums/:id", "albums/:id" )]
+    [DataRow( null, null, ProviderEndpointConstants.Unknown )]
+    public void ProviderEndpointConstants_ResolveEffective_ReturnsCanonicalEndpoint(
+        string? reported,
+        string? fallback,
+        string expected
+    ) {
+        Assert.AreEqual( expected, ProviderEndpointConstants.ResolveEffective( reported, fallback ) );
+    }
 
     /// <summary>
     /// A fail-fast exception for a Spotify request URI carries <see cref="SupportedProviders.Spotify"/>
@@ -300,6 +386,7 @@ public class RetryAfterLimitHandlerTests {
         );
 
         Assert.AreEqual( SupportedProviders.Spotify, exception.Provider );
+        Assert.AreEqual( "tracks/:id", exception.Endpoint );
         Assert.IsNotNull( exception.RequestUri );
         Assert.Contains( "spotify", exception.RequestUri.Host );
     }
@@ -362,6 +449,149 @@ public class RetryAfterLimitHandlerTests {
         Assert.IsNull( exception.Provider );
     }
 
+    /// <summary>A 429 publishes the concrete endpoint cooldown to the shared tracker.</summary>
+    [TestMethod]
+    public async Task SendAsync_With429_ShouldPublishConcreteEndpointCooldown( ) {
+        Mock<IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( value => value.GetAllRateLimitedAsync(
+                SupportedProviders.Tidal, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [] );
+        RetryAfterLimitHandler handler = CreateHandler( DefaultMaxRetryAfterSeconds, tracker.Object );
+        HttpResponseMessage response = new( HttpStatusCode.TooManyRequests );
+        response.Headers.RetryAfter = new RetryConditionHeaderValue( TimeSpan.FromSeconds( 45 ) );
+        SetupInnerHandler( handler, response );
+
+        ProviderRateLimitException exception = await Assert.ThrowsExactlyAsync<ProviderRateLimitException>(
+            ( ) => SendRequestAsync( handler, new Uri(
+                "https://openapi.tidal.com/v2/artists/123/relationships/tracks?countryCode=US" ) ) );
+
+        Assert.AreEqual( "artists/:id/relationships/tracks", exception.Endpoint );
+        tracker.Verify( value => value.SetRateLimitedAsync(
+            SupportedProviders.Tidal,
+            "artists/:id/relationships/tracks",
+            It.Is<DateTimeOffset>( retryAfter => retryAfter > DateTimeOffset.UtcNow ),
+            It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
+    /// <summary>A cooldown for one endpoint does not suppress a different endpoint on the provider.</summary>
+    [TestMethod]
+    public async Task SendAsync_WhenDifferentEndpointIsLimited_ShouldSendRequest( ) {
+        Mock<IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( value => value.GetAllRateLimitedAsync(
+                SupportedProviders.Tidal, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [new RateLimitedEndpoint( "tracks", DateTimeOffset.UtcNow.AddMinutes( 1 ) )] );
+        RetryAfterLimitHandler handler = CreateHandler( DefaultMaxRetryAfterSeconds, tracker.Object );
+        SetupInnerHandler( handler, new HttpResponseMessage( HttpStatusCode.OK ) );
+
+        HttpResponseMessage result = await SendRequestAsync(
+            handler,
+            new Uri( "https://openapi.tidal.com/v2/tracks/123?countryCode=US" ) );
+
+        Assert.AreEqual( HttpStatusCode.OK, result.StatusCode );
+    }
+
+    /// <summary>An active cooldown for the exact endpoint blocks the request before provider I/O.</summary>
+    [TestMethod]
+    public async Task SendAsync_WhenSameEndpointIsLimited_ShouldFailBeforeInnerHandler( ) {
+        Mock<IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( value => value.GetAllRateLimitedAsync(
+                SupportedProviders.Tidal, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [new RateLimitedEndpoint(
+                "tracks/:id", DateTimeOffset.UtcNow.AddMinutes( 1 ) )] );
+        RetryAfterLimitHandler handler = CreateHandler( DefaultMaxRetryAfterSeconds, tracker.Object );
+        handler.InnerHandler = new UnexpectedCallHandler( );
+
+        ProviderRateLimitException exception = await Assert.ThrowsExactlyAsync<ProviderRateLimitException>(
+            ( ) => SendRequestAsync(
+                handler,
+                new Uri( "https://openapi.tidal.com/v2/tracks/123?countryCode=US" ) ) );
+
+        Assert.AreEqual( "tracks/:id", exception.Endpoint );
+    }
+
+    /// <summary>A Spotify provider-wide cooldown blocks every data endpoint before provider I/O.</summary>
+    [TestMethod]
+    public async Task SendAsync_WhenSpotifyProviderIsLimited_ShouldBlockSingleItemLane( ) {
+        Mock<IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( value => value.GetAllRateLimitedAsync(
+                SupportedProviders.Spotify, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [new RateLimitedEndpoint(
+                ProviderEndpointConstants.ProviderWide,
+                DateTimeOffset.UtcNow.AddMinutes( 1 ) )] );
+        RetryAfterLimitHandler handler = CreateHandler( DefaultMaxRetryAfterSeconds, tracker.Object );
+        handler.InnerHandler = new UnexpectedCallHandler( );
+
+        ProviderRateLimitException exception = await Assert.ThrowsExactlyAsync<ProviderRateLimitException>(
+            ( ) => SendRequestAsync(
+                handler,
+                new Uri( "https://api.spotify.com/v1/tracks/123" ) ) );
+
+        Assert.AreEqual( "tracks/:id", exception.Endpoint );
+    }
+
+    /// <summary>A Spotify data-API cooldown does not suppress independent token acquisition.</summary>
+    [TestMethod]
+    public async Task SendAsync_WhenSpotifyProviderIsLimited_ShouldStillAllowAuthTokenRequest( ) {
+        Mock<IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( value => value.GetAllRateLimitedAsync(
+                SupportedProviders.Spotify, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [new RateLimitedEndpoint(
+                ProviderEndpointConstants.ProviderWide,
+                DateTimeOffset.UtcNow.AddMinutes( 1 ) )] );
+        RetryAfterLimitHandler handler = CreateHandler( DefaultMaxRetryAfterSeconds, tracker.Object );
+        SetupInnerHandler( handler, new HttpResponseMessage( HttpStatusCode.OK ) );
+
+        HttpResponseMessage result = await SendRequestAsync(
+            handler,
+            new Uri( "https://accounts.spotify.com/api/token" ) );
+
+        Assert.AreEqual( HttpStatusCode.OK, result.StatusCode );
+    }
+
+    /// <summary>A tracker read outage is best-effort and does not suppress provider I/O.</summary>
+    [TestMethod]
+    public async Task SendAsync_WhenCooldownReadFails_ShouldStillSendRequest( ) {
+        Mock<IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( value => value.GetAllRateLimitedAsync(
+                SupportedProviders.Tidal, It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new InvalidOperationException( "Redis unavailable" ) );
+        RetryAfterLimitHandler handler = CreateHandler( DefaultMaxRetryAfterSeconds, tracker.Object );
+        SetupInnerHandler( handler, new HttpResponseMessage( HttpStatusCode.OK ) );
+
+        HttpResponseMessage result = await SendRequestAsync(
+            handler,
+            new Uri( "https://openapi.tidal.com/v2/tracks/123?countryCode=US" ) );
+
+        Assert.AreEqual( HttpStatusCode.OK, result.StatusCode );
+    }
+
+    /// <summary>A tracker write outage cannot mask the provider's typed 429 signal.</summary>
+    [TestMethod]
+    public async Task SendAsync_WhenCooldownWriteFails_ShouldStillThrowTypedRateLimit( ) {
+        Mock<IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( value => value.GetAllRateLimitedAsync(
+                SupportedProviders.Tidal, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [] );
+        _ = tracker.Setup( value => value.SetRateLimitedAsync(
+                SupportedProviders.Tidal,
+                It.IsAny<string>( ),
+                It.IsAny<DateTimeOffset>( ),
+                It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new InvalidOperationException( "Redis unavailable" ) );
+        RetryAfterLimitHandler handler = CreateHandler( DefaultMaxRetryAfterSeconds, tracker.Object );
+        HttpResponseMessage response = new( HttpStatusCode.TooManyRequests );
+        response.Headers.RetryAfter = new RetryConditionHeaderValue( TimeSpan.FromSeconds( 45 ) );
+        SetupInnerHandler( handler, response );
+
+        ProviderRateLimitException exception = await Assert.ThrowsExactlyAsync<ProviderRateLimitException>(
+            ( ) => SendRequestAsync(
+                handler,
+                new Uri( "https://openapi.tidal.com/v2/tracks/123?countryCode=US" ) ) );
+
+        Assert.AreEqual( TimeSpan.FromSeconds( 45 ), exception.RetryAfterValue );
+        Assert.AreEqual( "tracks/:id", exception.Endpoint );
+    }
+
     #endregion
 
     #region Logging Tests
@@ -421,10 +651,10 @@ public class RetryAfterLimitHandlerTests {
     }
 
     /// <summary>
-    /// With a large threshold (3600s), a 30-minute <c>Retry-After</c> stays below it and passes through.
+    /// With a large threshold, a below-threshold wait remains a normal typed deferral.
     /// </summary>
     [TestMethod]
-    public async Task SendAsync_WithLargeThreshold_ShouldNotThrow( ) {
+    public async Task SendAsync_WithLargeThreshold_ShouldThrowTypedRateLimit( ) {
         // Arrange - Very large threshold (1 hour)
         RetryAfterLimitHandler handler = CreateHandler( 3600 );
         HttpResponseMessage rateLimitResponse = new( HttpStatusCode.TooManyRequests );
@@ -432,10 +662,35 @@ public class RetryAfterLimitHandlerTests {
         SetupInnerHandler( handler, rateLimitResponse );
 
         // Act
-        HttpResponseMessage result = await SendRequestAsync( handler );
+        ProviderRateLimitException exception = await Assert.ThrowsExactlyAsync<ProviderRateLimitException>(
+            ( ) => SendRequestAsync( handler ) );
 
-        // Assert - 30 minutes is below 1 hour threshold
-        Assert.AreEqual( HttpStatusCode.TooManyRequests, result.StatusCode );
+        // Assert
+        Assert.AreEqual( TimeSpan.FromMinutes( 30 ), exception.RetryAfterValue );
+    }
+
+    /// <summary>An extreme worker envelope saturates to a typed duration instead of overflowing.</summary>
+    [TestMethod]
+    public async Task WorkerHandler_WithExtremeEnvelopeDuration_ShouldThrowTypedRateLimit( ) {
+        HttpResponseMessage response = new( HttpStatusCode.TooManyRequests ) {
+            Content = JsonContent.Create( ProviderLookupResponse.Error(
+                "rate limited",
+                retryAfterSeconds: double.MaxValue,
+                retryThresholdSeconds: 5,
+                rateLimitedEndpoint: ProviderEndpointConstants.ProviderWide ) )
+        };
+        WorkerRateLimitHandler handler = new( SupportedProviders.Spotify, new QueueSettings( ) ) {
+            InnerHandler = new TestDelegatingHandler( response )
+        };
+        using HttpMessageInvoker invoker = new( handler );
+
+        RetryAfterExceededException exception = await Assert.ThrowsExactlyAsync<RetryAfterExceededException>(
+            ( ) => invoker.SendAsync(
+                new HttpRequestMessage( HttpMethod.Get, "https://worker.example/lookup/isrc/test" ),
+                CancellationToken.None ) );
+
+        Assert.AreEqual( QueueSettings.DefaultMaximumRateLimitRetryAfter, exception.RetryAfterValue );
+        Assert.AreEqual( TimeSpan.FromSeconds( 5 ), exception.Threshold );
     }
 
     #endregion
@@ -443,8 +698,15 @@ public class RetryAfterLimitHandlerTests {
     #region Helper Methods
 
     /// <summary>Builds a <see cref="RetryAfterLimitHandler"/> with the given threshold and the test logger.</summary>
-    private RetryAfterLimitHandler CreateHandler( int maxRetryAfterSeconds ) {
-        return new RetryAfterLimitHandler( maxRetryAfterSeconds, _loggerMock.Object );
+    private RetryAfterLimitHandler CreateHandler(
+        int maxRetryAfterSeconds,
+        IRateLimitTracker? rateLimitTracker = null
+    ) {
+        return new RetryAfterLimitHandler(
+            maxRetryAfterSeconds,
+            new QueueSettings( ),
+            _loggerMock.Object,
+            rateLimitTracker );
     }
 
     /// <summary>
@@ -470,6 +732,14 @@ public class RetryAfterLimitHandlerTests {
         protected override Task<HttpResponseMessage> SendAsync( HttpRequestMessage request, CancellationToken cancellationToken ) {
             return Task.FromResult( response );
         }
+    }
+
+    /// <summary>Fails a test if the request reaches provider I/O.</summary>
+    private sealed class UnexpectedCallHandler : HttpMessageHandler {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken
+        ) => throw new InvalidOperationException( "The inner handler must not be called." );
     }
 
     #endregion

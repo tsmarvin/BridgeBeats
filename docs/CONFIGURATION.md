@@ -86,7 +86,7 @@ The container entrypoint reads `REDIS_HOST` and `REDIS_PORT` (plus the `redis_pa
 
 The container image fixes `AllowedHosts` to `*` and reads no `ALLOWED_HOSTS` environment variable; host filtering is Caddy's responsibility in this topology.
 
-Job-queue tuning (`RateLimitRetryThreshold`, default `00:02:00`; `JobExpirationMinutes`, default `2880`) lives under the `BridgeBeats:Queue` configuration section. Set these through `appsettings.json` rather than the container environment. See the [Spotify Batch and Routing Guide](SPOTIFY_BATCH_AND_ROUTING.md) for the queue-tuning constants.
+Job-queue tuning (`RateLimitDefaultRetryAfter`, default `00:01:00`; `RateLimitMinimumRetryAfter`, default `00:00:05`; `RateLimitMaximumRetryAfter`, default `01:00:00`; and `JobExpirationMinutes`, default `2880`) lives under the `BridgeBeats:Queue` configuration section. The maximum bounds provider-controlled durable cooldowns and queued `NotBefore` values, preventing an extreme `Retry-After` from wedging a lane for the process lifetime. The typed `QueueSettings` defaults are authoritative when a key is omitted. AppHost forwards the default and minimum retry windows to Web and provider workers, and forwards the maximum retry window and job expiration to every queue participant, including Saga Coordinator, JetStream Watcher, and Maintenance, so validation, cooldown cleanup, expiration, and saga TTL decisions remain consistent. AppHost users can override `Parameters:QueueRateLimitDefaultRetryAfter`, `Parameters:QueueRateLimitMinimumRetryAfter`, `Parameters:QueueRateLimitMaximumRetryAfter`, and `Parameters:QueueJobExpirationMinutes`; standalone deployments can set the nested keys through `appsettings.json` or `BridgeBeats__Queue__*` environment variables. Retry durations and job expiration must be positive, the default retry window must not be shorter than the configured minimum, the maximum must be at least the default and no greater than job expiration, and job expiration must exceed `BridgeBeats:Spotify:Batch:LingerMs`. Initial provider deliveries are staged in a Redis outbox together with their saga legs; the Saga Coordinator is the single background relay owner, while Web, Saga Coordinator, and Maintenance may attempt an immediate relay after staging. Published envelopes are retained until completion and re-driven after five minutes when the leg remains incomplete. Queue admission is a coarse scheduling check; the outbound provider handler is authoritative for the concrete HTTP endpoint and rechecks the shared rate-limit tracker before each attempt. See the [Spotify Batch and Routing Guide](SPOTIFY_BATCH_AND_ROUTING.md) for the queue-tuning constants.
 
 **Note**: Environment variables use double underscores (`__`) to denote nested configuration sections (for example, `BridgeBeats__Domain` maps to `BridgeBeats:Domain` in configuration). The container entrypoint accepts the flat aliases shown above (`DOMAIN`, `CACHE_DAYS`, and so on) and maps them to the nested keys.
 
@@ -191,7 +191,9 @@ For local development, you can use an `appsettings.json` file instead of environ
       "TidalWorkerEnabled": false
     },
     "Queue": {
-      "RateLimitRetryThreshold": "00:02:00",
+      "RateLimitDefaultRetryAfter": "00:01:00",
+      "RateLimitMinimumRetryAfter": "00:00:05",
+      "RateLimitMaximumRetryAfter": "01:00:00",
       "JobExpirationMinutes": 2880
     }
   },

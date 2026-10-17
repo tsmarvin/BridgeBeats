@@ -25,22 +25,19 @@ public static class SpotifyConstants {
     public const int MaxArtistsPerBatchLookup = 50;
 
     /// <summary>
-    /// Rate-limit endpoint key <c>"BulkTracks"</c>, used to track bulk track lookups separately from
-    /// single-track lookups.
+    /// Stable rate-limit key for Spotify's <c>/tracks</c> endpoint.
     /// </summary>
-    public const string BulkTracksEndpoint = "BulkTracks";
+    public const string TracksEndpoint = ProviderEndpointConstants.Tracks;
 
     /// <summary>
-    /// Rate-limit endpoint key <c>"BulkAlbums"</c>, used to track bulk album lookups separately from
-    /// single-album lookups.
+    /// Stable rate-limit key for Spotify's <c>/albums</c> endpoint.
     /// </summary>
-    public const string BulkAlbumsEndpoint = "BulkAlbums";
+    public const string AlbumsEndpoint = ProviderEndpointConstants.Albums;
 
     /// <summary>
-    /// Rate-limit endpoint key <c>"BulkArtists"</c>, used to track bulk artist lookups separately from
-    /// single-artist lookups.
+    /// Stable rate-limit key for Spotify's <c>/artists</c> endpoint.
     /// </summary>
-    public const string BulkArtistsEndpoint = "BulkArtists";
+    public const string ArtistsEndpoint = ProviderEndpointConstants.Artists;
 
     // Type-specific bulk stream names
 

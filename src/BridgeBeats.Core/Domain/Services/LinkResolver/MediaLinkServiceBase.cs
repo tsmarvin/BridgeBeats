@@ -4,6 +4,7 @@ using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Core.Domain.Providers.Common;
+using BridgeBeats.Core.Domain.Services;
 using BridgeBeats.Core.Infrastructure.Logging;
 using BridgeBeats.Core.Infrastructure.Utilities;
 
@@ -269,8 +270,19 @@ namespace BridgeBeats.Services.LinkResolver {
             }
 
             foreach ((MusicLookupResult lookup, (SupportedProviders provider, string inputlink)) in linkResults) {
-                // Deduplicate MusicLookupResultDto's from output results.
-                if (results.Any( r => r.Results.Any( rr => rr.Key == provider && rr.Value == lookup ) )) {
+                // Different provider URLs can resolve to separately-created DTOs for the same
+                // ISRC/UPC. Deduplicate by normalized external identity before falling back to
+                // value equality for results that do not carry an external identifier.
+                string? externalIdentity = MediaLookupResultIdentity.GetExternalKey( lookup );
+                bool alreadyReturned = externalIdentity is not null
+                    ? results.Any( existing => existing.Results.Values.Any( value =>
+                        string.Equals(
+                            MediaLookupResultIdentity.GetExternalKey( value ),
+                            externalIdentity,
+                            StringComparison.OrdinalIgnoreCase ) ) )
+                    : results.Any( existing => existing.Results.Any( rr => rr.Key == provider && rr.Value == lookup ) );
+
+                if (alreadyReturned) {
                     continue;
                 }
 

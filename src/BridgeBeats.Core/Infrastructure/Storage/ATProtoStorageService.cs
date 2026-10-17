@@ -6,6 +6,7 @@ using System.Runtime.CompilerServices;
 using System.Text.Json;
 using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
+using BridgeBeats.Contracts.Exceptions;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
 using BridgeBeats.Core.Infrastructure.Logging;
@@ -44,7 +45,7 @@ public partial class ATProtoStorageService(
     ILogger<ATProtoStorageService> logger,
     IHttpClientFactory httpClientFactory,
     TimeSpan carCacheTtl = default
-) : IATProtoStorageService {
+) : ITargetedATProtoStorageService {
 
     /// <summary>
     /// Name of the configured <see cref="System.Net.Http.IHttpClientFactory"/> client used to stream
@@ -84,17 +85,70 @@ public partial class ATProtoStorageService(
     /// </remarks>
     /// <exception cref="InvalidOperationException">Thrown when the PDS rejects the create fallback.</exception>
     public async Task<string> StoreMediaLinkResultAsync( MediaLinkResult result, CancellationToken cancellationToken = default ) {
+        string rkey = RecordKeyGenerator.GenerateRkey( result );
+        return await StoreMediaLinkResultWithRkeyAsync( result, new RecordKey( rkey ), cancellationToken );
+    }
+
+    /// <inheritdoc/>
+    public async Task<string> StoreMediaLinkResultAtUriAsync(
+        MediaLinkResult result,
+        string targetRecordUri,
+        CancellationToken cancellationToken = default
+    ) {
+        if (string.IsNullOrWhiteSpace( targetRecordUri )) {
+            throw new InvalidTargetRecordException(
+                "Target URI cannot be null or whitespace.",
+                nameof( targetRecordUri ) );
+        }
         BlueskyAgent agent = await sessionManager.GetAuthenticatedAgentAsync( cancellationToken );
+        AtUri atUri;
+        try {
+            atUri = new AtUri( targetRecordUri );
+        } catch (Exception ex) when (ex is AtUriFormatException or ArgumentException or FormatException) {
+            throw new InvalidTargetRecordException(
+                "Target URI is not a valid AT-URI.",
+                nameof( targetRecordUri ),
+                ex );
+        }
+        if (atUri.Collection != s_mediaLinkResultCollection || atUri.RecordKey is null) {
+            throw new InvalidTargetRecordException(
+                "Target URI is not a BridgeBeats media-link record.",
+                nameof( targetRecordUri ) );
+        }
+        if (agent.Did is null) {
+            throw new InvalidOperationException(
+                "The authenticated ATProto session has no repository DID." );
+        }
+
+        string authority = atUri.Authority.ToString( );
+        string authorityDid = authority.StartsWith( "did:", StringComparison.OrdinalIgnoreCase )
+            ? authority
+            : (await agent.ResolveHandle( authority, cancellationToken ))?.ToString( )
+                ?? throw new InvalidOperationException(
+                    "Target URI handle could not currently be resolved to a repository DID." );
+        if (!string.Equals( authorityDid, agent.Did.ToString( ), StringComparison.Ordinal )) {
+            throw new InvalidTargetRecordException(
+                "Target URI does not belong to the authenticated ATProto repository.",
+                nameof( targetRecordUri ) );
+        }
+
+        return await StoreMediaLinkResultWithRkeyAsync( result, atUri.RecordKey, cancellationToken, agent );
+    }
+
+    private async Task<string> StoreMediaLinkResultWithRkeyAsync(
+        MediaLinkResult result,
+        RecordKey recordKey,
+        CancellationToken cancellationToken,
+        BlueskyAgent? authenticatedAgent = null
+    ) {
+        BlueskyAgent agent = authenticatedAgent
+            ?? await sessionManager.GetAuthenticatedAgentAsync( cancellationToken );
 
         try {
-            // Generate deterministic rkey based on externalId or metadata
-            string rkey = RecordKeyGenerator.GenerateRkey( result );
-
             // Convert MediaLinkResult DTO to custom record
             MediaLinkResultRecord record = ConvertToRecord( result );
 
             // Try to update existing record first (upsert logic)
-            RecordKey recordKey = new( rkey );
             AtProtoHttpResult<PutRecordResult> putResult = await agent.PutRecord(
                 record: record,
                 collection: s_mediaLinkResultCollection,

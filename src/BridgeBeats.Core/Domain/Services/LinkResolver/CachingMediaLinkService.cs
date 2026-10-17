@@ -2,6 +2,7 @@ using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
+using BridgeBeats.Core.Domain.Services;
 using BridgeBeats.Core.Infrastructure.Logging;
 
 namespace BridgeBeats.Core.Domain.Services.LinkResolver;
@@ -81,11 +82,54 @@ public sealed partial class CachingMediaLinkService(
     /// <param name="content">Free text that may contain one or more provider links.</param>
     /// <returns>An async stream of resolved results, one per link the orchestrator produced a result for.</returns>
     public async IAsyncEnumerable<MediaLinkResult> GetInfoAsync( string content ) {
+        HashSet<string> returnedCompleteIdentities = new( StringComparer.OrdinalIgnoreCase );
+        HashSet<string> returnedPartialIdentities = new( StringComparer.OrdinalIgnoreCase );
+        List<KeyValuePair<SupportedProviders, MusicLookupResult>> returnedCompleteValuesWithoutIdentity = [];
+        List<KeyValuePair<SupportedProviders, MusicLookupResult>> returnedPartialValuesWithoutIdentity = [];
+
         await foreach (LookupResult result in _orchestrator.LookupByContentAsync( content )) {
             MediaLinkResult? mediaResult = AddPartialMessage( result );
-            if (mediaResult is not null) {
-                yield return mediaResult;
+            if (mediaResult is null) {
+                continue;
             }
+
+            string[] externalIdentities = [.. mediaResult.Results.Values
+                .Select( MediaLookupResultIdentity.GetExternalKey )
+                .Where( identity => identity is not null )
+                .Select( identity => identity! )
+                .Distinct( StringComparer.OrdinalIgnoreCase )];
+            KeyValuePair<SupportedProviders, MusicLookupResult>[] valuesWithoutIdentity = [.. mediaResult.Results
+                .Where( result => MediaLookupResultIdentity.GetExternalKey( result.Value ) is null )];
+
+            // A partial result must not suppress a later complete result for the same identity.
+            // Complete results remain authoritative; equivalent partials are emitted at most once.
+            // Provider/value equality is the fallback for catalog items without an ISRC or UPC,
+            // matching the in-process resolver's deduplication contract.
+            bool duplicatesCompleteValue = valuesWithoutIdentity.Any( candidate =>
+                returnedCompleteValuesWithoutIdentity.Any( returned =>
+                    returned.Key == candidate.Key && returned.Value.Equals( candidate.Value ) ) );
+            bool duplicatesPartialValue = valuesWithoutIdentity.Any( candidate =>
+                returnedPartialValuesWithoutIdentity.Any( returned =>
+                    returned.Key == candidate.Key && returned.Value.Equals( candidate.Value ) ) );
+            bool duplicate = mediaResult.IsPartial
+                ? externalIdentities.Any( returnedCompleteIdentities.Contains )
+                    || externalIdentities.Any( returnedPartialIdentities.Contains )
+                    || duplicatesCompleteValue
+                    || duplicatesPartialValue
+                : externalIdentities.Any( returnedCompleteIdentities.Contains )
+                    || duplicatesCompleteValue;
+            if (duplicate) {
+                continue;
+            }
+
+            if (mediaResult.IsPartial) {
+                returnedPartialIdentities.UnionWith( externalIdentities );
+                returnedPartialValuesWithoutIdentity.AddRange( valuesWithoutIdentity );
+            } else {
+                returnedCompleteIdentities.UnionWith( externalIdentities );
+                returnedCompleteValuesWithoutIdentity.AddRange( valuesWithoutIdentity );
+            }
+            yield return mediaResult;
         }
     }
 

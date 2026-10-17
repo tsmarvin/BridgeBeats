@@ -27,7 +27,7 @@ namespace BridgeBeats.Worker.Maintenance;
 /// </remarks>
 /// <param name="atProtoStorage">Streams every stored record from the user's ATProto PDS.</param>
 /// <param name="sagaManager">Creates and initializes sagas for re-lookup jobs.</param>
-/// <param name="queueResolver">Resolves the per-provider queue used to enqueue re-lookup requests.</param>
+/// <param name="dispatchOutbox">Atomically stages and relays refresh provider legs.</param>
 /// <param name="redis">The Redis connection used to read the durable schedule marker.</param>
 /// <param name="enabledProviders">The set of providers that participate in re-lookups.</param>
 /// <param name="settings">Configuration: PDS URI, user DID, cache freshness window, refresh interval, max records per run, and retry interval.</param>
@@ -36,7 +36,7 @@ namespace BridgeBeats.Worker.Maintenance;
 public sealed partial class StaleCacheRefreshBackgroundService(
     IATProtoStorageService atProtoStorage,
     ISagaStateManager sagaManager,
-    IProviderQueueResolver<QueuedLookupRequest> queueResolver,
+    ILookupDispatchOutbox dispatchOutbox,
     IConnectionMultiplexer redis,
     HashSet<SupportedProviders> enabledProviders,
     CacheBootstrapSettings settings,
@@ -387,23 +387,7 @@ public sealed partial class StaleCacheRefreshBackgroundService(
         }
         string instanceToken = seededSaga.InstanceToken;
 
-        // Initialize exactly the providers we are enqueuing legs for — the mode-B fix.
-        if (!await sagaManager.TryInitializeProviderStatesAsync(
-            sagaId,
-            legs.Select( l => l.Provider ).Distinct( ),
-            instanceToken,
-            cancellationToken
-        )) {
-            LogRefreshRecordSkipped( logger, atUri );
-            return false;
-        }
-
-        await refreshReviewStore.RegisterPendingAsync( recordContext with { InstanceToken = instanceToken },
-            cancellationToken
-        );
-
-        foreach (RefreshLeg leg in legs) {
-            QueuedLookupRequest request = new( ) {
+        List<QueuedLookupRequest> requests = [.. legs.Select( leg => new QueuedLookupRequest {
                 RequestId = Guid.NewGuid( ).ToString( "N" ),
                 Provider = leg.Provider,
                 LookupType = leg.LookupType,
@@ -418,33 +402,33 @@ public sealed partial class StaleCacheRefreshBackgroundService(
                 FallbackLookupType = leg.FallbackLookupType,
                 FallbackLookupValue = leg.FallbackLookupValue,
                 EnqueueOrigin = QueueEnqueueOrigin.RefreshSweep
-            };
+            } )];
 
-            IRequestQueue<QueuedLookupRequest> queue = queueResolver.GetQueue( leg.Provider );
+        IReadOnlyDictionary<SupportedProviders, ProviderDispatchStageOutcome> outcomes =
+            await dispatchOutbox.StageRefreshBatchAsync(
+                requests,
+                QueuePriority.Bulk,
+                recordContext with { InstanceToken = instanceToken },
+                cancellationToken );
+        if (outcomes.Values.Any(
+            outcome => outcome == ProviderDispatchStageOutcome.SagaInstanceMismatch )) {
+            LogRefreshRecordSkipped( logger, atUri );
+            return false;
+        }
+
+        foreach ((SupportedProviders provider, ProviderDispatchStageOutcome outcome) in outcomes) {
+            if (outcome != ProviderDispatchStageOutcome.Staged) {
+                continue;
+            }
+            QueueMetrics.RecordRefreshLegEnqueued( provider, sweepAttempt > 1 );
             try {
-                await queue.EnqueueAsync( request, QueuePriority.Bulk, cancellationToken );
-                QueueMetrics.RecordRefreshLegEnqueued( leg.Provider, sweepAttempt > 1 );
+                _ = await dispatchOutbox.DispatchAsync( sagaId, provider, cancellationToken );
             } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
                 throw;
             } catch (Exception ex) {
-                LogRefreshLegEnqueueFailed( logger, ex, atUri, leg.Provider );
-                QueueMetrics.RecordMaintenanceOutcome( "leg_enqueue_failure", leg.Provider );
-                if (!await sagaManager.TryUpdateProviderStateAsync(
-                    sagaId,
-                    new ProviderLookupState(
-                        Provider: leg.Provider,
-                        IsComplete: true,
-                        IsSuccess: false,
-                        ResultJson: null,
-                        CompletedAt: DateTimeOffset.UtcNow,
-                        ErrorMessage: $"Refresh leg enqueue failed: {ex.Message}"
-                    ),
-                    instanceToken,
-                    cancellationToken
-                )) {
-                    LogRefreshRecordSkipped( logger, atUri );
-                    return false;
-                }
+                // The durable outbox record remains pending for the coordinator-owned relay.
+                LogRefreshLegEnqueueFailed( logger, ex, atUri, provider );
+                QueueMetrics.RecordMaintenanceOutcome( "leg_immediate_relay_failure", provider );
             }
         }
 

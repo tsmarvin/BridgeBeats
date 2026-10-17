@@ -1,3 +1,4 @@
+using System.Text.Json;
 using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Interfaces;
@@ -100,7 +101,7 @@ public class SagaWriteGenerationIntegrationTests {
 
         // Shared PDS write counter — the discriminator
         int pdsWriteCount = 0;
-        Mock<IATProtoStorageService> storageDouble = new( );
+        Mock<ITargetedATProtoStorageService> storageDouble = new( );
         _ = storageDouble
             .Setup( s => s.StoreMediaLinkResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( ( ) => {
@@ -109,7 +110,7 @@ public class SagaWriteGenerationIntegrationTests {
                 return $"at://did:plc:test/com.bridgebeats.medialink/{rkey}";
             } );
 
-        string resultJson = """{"isrc":"USRC99999002","trackName":"Race Test","artistName":"Test","url":"https://spotify.com/t/1"}""";
+        string resultJson = BuildResultJson( );
         LookupSagaState completeSaga = new( ) {
             SagaId = TestSagaId,
             LookupKey = TestLookupKey,
@@ -184,10 +185,10 @@ public class SagaWriteGenerationIntegrationTests {
                 cacheMock.Object,
                 deduplicatorMock.Object,
                 resultCombiner,
-                queueResolverMock.Object,
+                new Mock<ILookupDispatchOutbox>( ).Object,
                 enabledProviders,
                 loggerMock.Object,
-                Mock.Of<IRefreshReviewStore>( )
+                CreateRefreshReviewStore( )
             );
         }
 
@@ -238,7 +239,7 @@ public class SagaWriteGenerationIntegrationTests {
 
         // Shared PDS write counter — the discriminator
         int pdsWriteCount = 0;
-        Mock<IATProtoStorageService> storageDouble = new( );
+        Mock<ITargetedATProtoStorageService> storageDouble = new( );
         _ = storageDouble
             .Setup( s => s.StoreMediaLinkResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( ( ) => {
@@ -248,7 +249,7 @@ public class SagaWriteGenerationIntegrationTests {
             } );
 
         // One successful Spotify provider result — generation = Results.Count = 1
-        string resultJson = """{"isrc":"USRC99999002","trackName":"Race Test","artistName":"Test","url":"https://spotify.com/t/1"}""";
+        string resultJson = BuildResultJson( );
         LookupSagaState partialSaga = new( ) {
             SagaId = TestSagaId,
             LookupKey = TestLookupKey,
@@ -317,10 +318,10 @@ public class SagaWriteGenerationIntegrationTests {
                 cacheMock.Object,
                 deduplicatorMock.Object,
                 resultCombiner,
-                queueResolverMock.Object,
+                new Mock<ILookupDispatchOutbox>( ).Object,
                 enabledProviders,
                 loggerMock.Object,
-                Mock.Of<IRefreshReviewStore>( )
+                CreateRefreshReviewStore( )
             );
         }
 
@@ -494,4 +495,21 @@ public class SagaWriteGenerationIntegrationTests {
         Assert.IsTrue( advanceTo4,
             "Advancing to 4 from stored=3 must succeed, confirming the stale reset did not corrupt the generation" );
     }
+
+    private static IRefreshReviewStore CreateRefreshReviewStore( ) {
+        Mock<IRefreshReviewStore> store = new( );
+        _ = store.Setup( candidate => candidate.GetPendingForSagaAsync(
+                It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [] );
+        return store.Object;
+    }
+
+    /// <summary>Serializes the provider result fixture through the production DTO contract.</summary>
+    private static string BuildResultJson( )
+        => JsonSerializer.Serialize( new MusicLookupResult {
+            ExternalId = "USRC99999002",
+            Title = "Race Test",
+            Artist = "Test",
+            URL = "https://spotify.com/t/1"
+        }, JsonSerializerOptions.Web );
 }

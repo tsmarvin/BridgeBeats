@@ -56,4 +56,12 @@ public partial class HomeController {
         Level = LogLevel.Error,
         Message = "Error during lookup stream for URI: {Uri}" )]
     private partial void LogStreamError( Exception ex, string uri );
+
+    /// <summary>Logs an expected client disconnect while streaming lookup results.</summary>
+    /// <param name="uri">The sanitized URI being processed.</param>
+    [LoggerMessage(
+        EventId = Logging.LogEventIds.Controllers.HomeControllerStreamClientDisconnected,
+        Level = LogLevel.Debug,
+        Message = "Client disconnected during lookup stream for URI: {Uri}" )]
+    private partial void LogStreamClientDisconnected( string uri );
 }

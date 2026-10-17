@@ -25,17 +25,18 @@ namespace BridgeBeats.Worker.JetStreamWatcher;
 /// subjects of quote posts and reposts (hydrating those via the Bluesky API). Each recognized
 /// Spotify, Tidal, or Apple Music link is turned into a <see cref="QueuedLookupRequest"/> with
 /// <see cref="QueuePriority.Bulk"/> origin priority and enqueued through the
-/// <see cref="IProviderQueueResolver{T}"/>, so firehose-discovered links use the lowest-priority lane
-/// and never starve interactive traffic. This worker is producer-only: it feeds the queue and never
-/// consumes results. The connection is self-healing, reconnecting after a short backoff on failure.
+/// durable dispatch staging component, so firehose-discovered links use the lowest-priority lane
+/// and remain recoverable if publication is interrupted. This worker is producer-only: it feeds the
+/// queue and never consumes results. The connection is self-healing, reconnecting after a short
+/// backoff on failure.
 /// </summary>
 /// <param name="logger">The logger for connection lifecycle and processing diagnostics.</param>
-/// <param name="queueResolver">Resolves the per-provider queue a discovered link is enqueued to.</param>
 /// <param name="sagaManager">Creates the fenced saga before its queue delivery is published.</param>
+/// <param name="dispatchOutbox">Stages and publishes the provider delivery for crash recovery.</param>
 public sealed partial class JetStreamWatcherService(
     ILogger<JetStreamWatcherService> logger,
-    IProviderQueueResolver<QueuedLookupRequest> queueResolver,
-    ISagaStateManager sagaManager
+    ISagaStateManager sagaManager,
+    ILookupDispatchOutbox dispatchOutbox
 ) : BackgroundService {
 
     /// <summary>
@@ -335,7 +336,7 @@ public sealed partial class JetStreamWatcherService(
     /// <param name="link">The raw candidate link discovered in a post.</param>
     /// <param name="cancellationToken">Signals host shutdown.</param>
     /// <returns>A task that completes once the link has been enqueued or skipped.</returns>
-    private async Task EnqueueMusicLinkAsync( string link, CancellationToken cancellationToken ) {
+    internal async Task EnqueueMusicLinkAsync( string link, CancellationToken cancellationToken ) {
         // Normalize link by removing query parameters (except Apple Music song IDs)
         string normalizedLink = NormalizeMusicLink( link );
 
@@ -373,14 +374,16 @@ public sealed partial class JetStreamWatcherService(
             OriginPriority = QueuePriority.Bulk
         };
 
-        // Fire-and-forget: enqueue at bulk priority.
-        // For Spotify SongIdLookup/AlbumIdLookup, the SpotifyBulkQueueDecorator registered
-        // on the Spotify IRequestQueue intercepts the call and routes to the type-specific
-        // bulk stream (queue:spotify:bulk:track-id / queue:spotify:bulk:album-id) instead
-        // of the generic queue:spotify:bulk stream.
+        // Stage before publication so a process interruption cannot leave the saga without work.
+        // The dispatch component applies the same Spotify type-specific bulk routing as the queue
+        // decorator and the coordinator relay retries any interrupted immediate publication.
         try {
-            IRequestQueue<QueuedLookupRequest> queue = queueResolver.GetQueue( provider.Value );
-            await queue.EnqueueAsync( request, QueuePriority.Bulk, cancellationToken );
+            ProviderDispatchStageOutcome outcome = await dispatchOutbox.StageAsync(
+                request, QueuePriority.Bulk, cancellationToken );
+            if (outcome == ProviderDispatchStageOutcome.Staged) {
+                _ = await dispatchOutbox.DispatchAsync(
+                    sagaId, provider.Value, cancellationToken );
+            }
         } catch (Exception ex) {
             LogEnqueueError( logger, ex, normalizedLink );
         }

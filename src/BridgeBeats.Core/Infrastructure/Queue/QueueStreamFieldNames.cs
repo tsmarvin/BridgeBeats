@@ -10,7 +10,8 @@ namespace BridgeBeats.Core.Infrastructure.Queue;
 /// <remarks>
 /// These literals are a wire contract: the values must not change without migrating in-flight
 /// stream entries. A queued stream entry carries a <see cref="Payload"/> field (the serialized
-/// request) and an <see cref="EnqueuedAt"/> field (when it was added). Dead-letter entries add
+/// request), an <see cref="EnqueuedAt"/> field (when it was added), and optionally a
+/// <see cref="DispatchOutboxKey"/> field tying a durable dispatch to its recovery record. Dead-letter entries add
 /// further fields that are defined privately on the request queue rather than here. Keep stream
 /// NAMES (e.g. <c>SpotifyConstants.BulkTrackIdStream</c>) in their provider-specific constants
 /// class; only the field names — which are generic queue wire format — live here.
@@ -28,4 +29,11 @@ public static class QueueStreamFieldNames {
     /// Literal value: <c>"enqueuedAt"</c>.
     /// </summary>
     public const string EnqueuedAt = "enqueuedAt";
+
+    /// <summary>
+    /// Optional stream entry field containing the durable lookup-dispatch outbox key. Delivery
+    /// transitions carry this value forward so acknowledgement and quarantine can retire the
+    /// exact recovery record without reconstructing identity from a potentially malformed payload.
+    /// </summary>
+    public const string DispatchOutboxKey = "dispatchOutboxKey";
 }

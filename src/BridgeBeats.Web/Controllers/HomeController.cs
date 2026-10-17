@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Encodings.Web;
 using BridgeBeats.Contracts.Constants;
 using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
@@ -7,6 +8,7 @@ using BridgeBeats.Contracts.Records;
 using BridgeBeats.Core.Infrastructure.Storage;
 using BridgeBeats.Core.Infrastructure.Utilities;
 using BridgeBeats.Web.Models;
+using BridgeBeats.Web.Streaming;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.ViewEngines;
@@ -388,7 +390,7 @@ namespace BridgeBeats.Web.Controllers {
         /// <returns>
         /// HTTP POST <c>/Home/LookupResultsStream</c>. Writes a chunked <c>text/html</c> stream directly to the
         /// response; sets status <c>503</c> when the service is unavailable or <c>400</c> when the URI is missing
-        /// before writing an error fragment. Requires a valid anti-forgery token.
+        /// before writing a JSON error response. Requires a valid anti-forgery token.
         /// </returns>
         [HttpPost]
         [ValidateAntiForgeryToken]
@@ -396,13 +398,19 @@ namespace BridgeBeats.Web.Controllers {
         public async Task LookupResultsStream( string uri ) {
             if (mediaLinkService == null) {
                 Response.StatusCode = 503;
-                await Response.WriteAsync( "<div class=\"alert alert-danger\">Music lookup service not available</div>" );
+                await Response.WriteAsJsonAsync( new {
+                    error = "Service unavailable",
+                    message = "Music lookup service is not available."
+                } );
                 return;
             }
 
             if (string.IsNullOrWhiteSpace( uri )) {
                 Response.StatusCode = 400;
-                await Response.WriteAsync( "<div class=\"alert alert-danger\">URI is required</div>" );
+                await Response.WriteAsJsonAsync( new {
+                    error = "Invalid request",
+                    message = "URI is required."
+                } );
                 return;
             }
 
@@ -422,9 +430,9 @@ namespace BridgeBeats.Web.Controllers {
                             if (result.Messages is { Count: > 0 }) {
                                 rateLimitCount++;
                                 string warningHtml = "<div class=\"alert alert-warning\"><strong>Rate Limited</strong><br/>"
-                                    + string.Join( "<br/>", result.Messages )
+                                    + string.Join( "<br/>", result.Messages.Select( HtmlEncoder.Default.Encode ) )
                                     + "</div>";
-                                await Response.WriteAsync( warningHtml );
+                                await Response.WriteAsync( warningHtml + StreamFraming.ItemDelimiter );
                                 await Response.Body.FlushAsync( );
                             } else {
                                 errorCount++;
@@ -479,11 +487,13 @@ namespace BridgeBeats.Web.Controllers {
 
                         // Render partial view to string and stream it
                         string html = await RenderViewToStringAsync( "_LookupResultCard", item );
-                        await Response.WriteAsync( html );
+                        await Response.WriteAsync( html + StreamFraming.ItemDelimiter );
                         await Response.Body.FlushAsync( );
 
                         processedCount++;
 
+                    } catch (OperationCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested) {
+                        throw;
                     } catch (Exception ex) {
                         LogStreamResultError( ex, uri.SanitizeForLogging( ) );
                         errorCount++;
@@ -492,20 +502,40 @@ namespace BridgeBeats.Web.Controllers {
 
                 // Send completion status as a hidden data element
                 if (processedCount == 0 && errorCount > 0) {
-                    await Response.WriteAsync( $"<div class=\"alert alert-warning\" data-stream-complete=\"true\" data-processed=\"0\" data-errors=\"{errorCount}\" data-rate-limited=\"{rateLimitCount}\">No results found</div>" );
+                    await Response.WriteAsync( $"<div class=\"alert alert-warning\" data-stream-complete=\"true\" data-processed=\"0\" data-errors=\"{errorCount}\" data-rate-limited=\"{rateLimitCount}\">No results found</div>{StreamFraming.ItemDelimiter}" );
                 } else if (processedCount == 0 && rateLimitCount > 0) {
-                    await Response.WriteAsync( $"<div class=\"d-none\" data-stream-complete=\"true\" data-processed=\"0\" data-errors=\"{errorCount}\" data-rate-limited=\"{rateLimitCount}\"></div>" );
+                    await Response.WriteAsync( $"<div class=\"d-none\" data-stream-complete=\"true\" data-processed=\"0\" data-errors=\"{errorCount}\" data-rate-limited=\"{rateLimitCount}\"></div>{StreamFraming.ItemDelimiter}" );
                 } else if (processedCount == 0) {
-                    await Response.WriteAsync( "<div class=\"alert alert-info\" data-stream-complete=\"true\" data-processed=\"0\" data-errors=\"0\" data-rate-limited=\"0\">No results found</div>" );
+                    await Response.WriteAsync( "<div class=\"alert alert-info\" data-stream-complete=\"true\" data-processed=\"0\" data-errors=\"0\" data-rate-limited=\"0\">No results found</div>" + StreamFraming.ItemDelimiter );
                 } else if (errorCount > 0) {
-                    await Response.WriteAsync( $"<div class=\"d-none\" data-stream-complete=\"true\" data-processed=\"{processedCount}\" data-errors=\"{errorCount}\" data-rate-limited=\"{rateLimitCount}\"></div>" );
+                    await Response.WriteAsync( $"<div class=\"d-none\" data-stream-complete=\"true\" data-processed=\"{processedCount}\" data-errors=\"{errorCount}\" data-rate-limited=\"{rateLimitCount}\"></div>{StreamFraming.ItemDelimiter}" );
                 } else {
-                    await Response.WriteAsync( $"<div class=\"d-none\" data-stream-complete=\"true\" data-processed=\"{processedCount}\" data-errors=\"0\" data-rate-limited=\"{rateLimitCount}\"></div>" );
+                    await Response.WriteAsync( $"<div class=\"d-none\" data-stream-complete=\"true\" data-processed=\"{processedCount}\" data-errors=\"0\" data-rate-limited=\"{rateLimitCount}\"></div>{StreamFraming.ItemDelimiter}" );
                 }
 
+            } catch (OperationCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested) {
+                // The client disconnected; there is no response stream left to complete.
+                if (logger.IsEnabled( LogLevel.Debug )) {
+                    string sanitizedUri = uri.SanitizeForLogging( );
+                    LogStreamClientDisconnected( sanitizedUri );
+                }
+            } catch (IOException) when (HttpContext.RequestAborted.IsCancellationRequested) {
+                // Some servers surface a disconnected response body as IOException instead of
+                // request cancellation. Keep it out of the error channel.
+                if (logger.IsEnabled( LogLevel.Debug )) {
+                    string sanitizedUri = uri.SanitizeForLogging( );
+                    LogStreamClientDisconnected( sanitizedUri );
+                }
+            } catch (Exception) when (HttpContext.RequestAborted.IsCancellationRequested) {
+                // Once the request is aborted, response-body implementations may surface other
+                // transport-specific exceptions. Treat them consistently as client disconnects.
+                if (logger.IsEnabled( LogLevel.Debug )) {
+                    string sanitizedUri = uri.SanitizeForLogging( );
+                    LogStreamClientDisconnected( sanitizedUri );
+                }
             } catch (Exception ex) {
                 LogStreamError( ex, uri.SanitizeForLogging( ) );
-                await Response.WriteAsync( $"<div class=\"alert alert-danger\" data-stream-complete=\"true\" data-processed=\"{processedCount}\" data-errors=\"{errorCount + 1}\">An error occurred during lookup: {ex.Message}</div>" );
+                await Response.WriteAsync( $"<div class=\"alert alert-danger\" data-stream-complete=\"true\" data-processed=\"{processedCount}\" data-errors=\"{errorCount + 1}\" data-rate-limited=\"{rateLimitCount}\">An error occurred during lookup. Please try again.</div>{StreamFraming.ItemDelimiter}" );
             }
         }
 

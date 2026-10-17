@@ -15,13 +15,15 @@ namespace BridgeBeats.Contracts.Records.WorkerApi;
 /// </param>
 /// <param name="RetryAfterSeconds">The provider retry delay in seconds, when rate limited.</param>
 /// <param name="RetryThresholdSeconds">The retry threshold in seconds, when rate limited.</param>
+/// <param name="RateLimitedEndpoint">The stable provider endpoint key, when rate limited.</param>
 /// <remarks>Construct instances through the factory methods rather than the primary constructor.</remarks>
 public sealed record ProviderLookupResponse(
     bool Success,
     MusicLookupResult? Result,
     string? ErrorMessage,
     double? RetryAfterSeconds = null,
-    double? RetryThresholdSeconds = null
+    double? RetryThresholdSeconds = null,
+    string? RateLimitedEndpoint = null
 ) {
     /// <summary>
     /// Creates a successful response from a lookup result. A null result has the same successful
@@ -40,6 +42,7 @@ public sealed record ProviderLookupResponse(
     /// <param name="errorMessage">The human-readable reason the lookup failed.</param>
     /// <param name="retryAfterSeconds">The retry delay in seconds, when rate limited.</param>
     /// <param name="retryThresholdSeconds">The retry threshold in seconds, when rate limited.</param>
+    /// <param name="rateLimitedEndpoint">The stable endpoint key that produced the rate limit.</param>
     /// <returns>
     /// A response with <see cref="Success"/> set to <see langword="false"/>, no result, and the
     /// supplied <paramref name="errorMessage"/>.
@@ -47,8 +50,9 @@ public sealed record ProviderLookupResponse(
     public static ProviderLookupResponse Error(
         string errorMessage,
         double? retryAfterSeconds = null,
-        double? retryThresholdSeconds = null
-    ) => new( false, null, errorMessage, retryAfterSeconds, retryThresholdSeconds );
+        double? retryThresholdSeconds = null,
+        string? rateLimitedEndpoint = null
+    ) => new( false, null, errorMessage, retryAfterSeconds, retryThresholdSeconds, rateLimitedEndpoint );
 
     /// <summary>
     /// Creates a "nothing matched" response: the lookup ran without error but found no item.

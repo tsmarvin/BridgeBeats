@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using BridgeBeats.Contracts.Constants;
 using BridgeBeats.Core.Infrastructure.Queue;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -136,10 +138,12 @@ public class RedisRequestDeduplicatorTests {
         string requestKey = "isrc:USRC12345678";
         string resultUri = "at://did:plc:test/link.bridgebeats.lookup/track:USRC12345678";
 
-        _ = await _deduplicator.TryAcquireAsync( requestKey, TimeSpan.FromMinutes( 5 ), TestContext.CancellationToken );
+        Contracts.Records.DeduplicationResult acquired = await _deduplicator.TryAcquireAsync(
+            requestKey, TimeSpan.FromMinutes( 5 ), TestContext.CancellationToken );
 
         // Act
-        await _deduplicator.ReleaseAsync( requestKey, resultUri, TestContext.CancellationToken );
+        Assert.IsTrue( await _deduplicator.ReleaseOwnedAsync(
+            requestKey, acquired.LeaseToken!, resultUri, TestContext.CancellationToken ) );
 
         // Assert - lock should be released, can acquire again
         Contracts.Records.DeduplicationResult result = await _deduplicator.TryAcquireAsync(
@@ -183,7 +187,8 @@ public class RedisRequestDeduplicatorTests {
         string requestKey = "isrc:USRC12345678";
 
         // Acquire lock but don't release
-        _ = await _deduplicator.TryAcquireAsync( requestKey, TimeSpan.FromMinutes( 5 ), TestContext.CancellationToken );
+        Contracts.Records.DeduplicationResult acquired = await _deduplicator.TryAcquireAsync(
+            requestKey, TimeSpan.FromMinutes( 5 ), TestContext.CancellationToken );
 
         // Create second deduplicator to wait
         Mock<ILogger<RedisRequestDeduplicator>> logger2 = new( );
@@ -211,7 +216,8 @@ public class RedisRequestDeduplicatorTests {
         string requestKey = "isrc:USRC12345678";
         string expectedUri = "at://did:plc:test/link.bridgebeats.lookup/track:USRC12345678";
 
-        _ = await _deduplicator.TryAcquireAsync( requestKey, TimeSpan.FromMinutes( 5 ), TestContext.CancellationToken );
+        Contracts.Records.DeduplicationResult acquired = await _deduplicator.TryAcquireAsync(
+            requestKey, TimeSpan.FromMinutes( 5 ), TestContext.CancellationToken );
 
         // Create second deduplicator to wait
         Mock<ILogger<RedisRequestDeduplicator>> logger2 = new( );
@@ -228,11 +234,142 @@ public class RedisRequestDeduplicatorTests {
         await Task.Delay( 100, TestContext.CancellationToken );
 
         // Act - release with result
-        await _deduplicator.ReleaseAsync( requestKey, expectedUri, TestContext.CancellationToken );
+        Assert.IsTrue( await _deduplicator.ReleaseOwnedAsync(
+            requestKey, acquired.LeaseToken!, expectedUri, TestContext.CancellationToken ) );
 
         // Assert
         string? result = await waitTask;
         Assert.AreEqual( expectedUri, result );
+    }
+
+    /// <summary>A no-result release wakes another instance immediately instead of timing out.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task WaitForCompletionAsync_NoResultRelease_ReturnsNullPromptly( ) {
+        const string RequestKey = "isrc:NORESULT123";
+        Contracts.Records.DeduplicationResult acquired = await _deduplicator.TryAcquireAsync(
+            RequestKey, TimeSpan.FromMinutes( 5 ), TestContext.CancellationToken );
+        RedisRequestDeduplicator waiter = new(
+            s_redis!, new Mock<ILogger<RedisRequestDeduplicator>>( ).Object );
+        Stopwatch stopwatch = Stopwatch.StartNew( );
+        Task<string?> waitTask = waiter.WaitForCompletionAsync(
+            RequestKey, TimeSpan.FromSeconds( 5 ), TestContext.CancellationToken );
+        await Task.Delay( 100, TestContext.CancellationToken );
+
+        Assert.IsTrue( await _deduplicator.ReleaseOwnedAsync(
+            RequestKey, acquired.LeaseToken!, null, TestContext.CancellationToken ) );
+        string? result = await waitTask;
+        stopwatch.Stop( );
+
+        Assert.IsNull( result );
+        Assert.IsLessThan( TimeSpan.FromSeconds( 2 ), stopwatch.Elapsed );
+
+        // A caller arriving after the terminal publication must not inherit the old five-minute
+        // lease. It can immediately become the next owner and re-drive a zero-result lookup.
+        Contracts.Records.DeduplicationResult next = await waiter.TryAcquireAsync(
+            RequestKey, TimeSpan.FromMinutes( 5 ), TestContext.CancellationToken );
+        Assert.IsTrue( next.Acquired );
+        Assert.IsTrue( await waiter.ReleaseOwnedAsync(
+            RequestKey, next.LeaseToken!, null, TestContext.CancellationToken ) );
+    }
+
+    /// <summary>A state-change release immediately returns the recheck signal to the waiter.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task WaitForCompletionAsync_StateChanged_ReturnsRecheckSignal( ) {
+        const string RequestKey = "isrc:STATE-CHANGED";
+        Contracts.Records.DeduplicationResult owner = await _deduplicator.TryAcquireAsync(
+            RequestKey, TimeSpan.FromMinutes( 5 ), TestContext.CancellationToken );
+        RedisRequestDeduplicator waiter = new(
+            s_redis!, new Mock<ILogger<RedisRequestDeduplicator>>( ).Object );
+        Task<string?> waitTask = waiter.WaitForCompletionAsync(
+            RequestKey, TimeSpan.FromSeconds( 5 ), TestContext.CancellationToken );
+        await Task.Delay( 100, TestContext.CancellationToken );
+
+        Assert.IsTrue( await _deduplicator.ReleaseOwnedForStateRecheckAsync(
+            RequestKey, owner.LeaseToken!, TestContext.CancellationToken ) );
+        Assert.AreEqual( LookupConstants.StateChangedSentinel, await waitTask );
+    }
+
+    /// <summary>The final-completion waiter rechecks state and returns the signal when no result exists.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task WaitForFinalCompletionAsync_StateChanged_ReturnsRecheckSignal( ) {
+        const string RequestKey = "isrc:FINAL-STATE-CHANGED";
+        Contracts.Records.DeduplicationResult owner = await _deduplicator.TryAcquireAsync(
+            RequestKey, TimeSpan.FromMinutes( 5 ), TestContext.CancellationToken );
+        RedisRequestDeduplicator waiter = new(
+            s_redis!, new Mock<ILogger<RedisRequestDeduplicator>>( ).Object );
+        Task<string?> waitTask = waiter.WaitForFinalCompletionAsync(
+            RequestKey, TimeSpan.FromSeconds( 5 ), cancellationToken: TestContext.CancellationToken );
+        await Task.Delay( 100, TestContext.CancellationToken );
+
+        Assert.IsTrue( await _deduplicator.ReleaseOwnedForStateRecheckAsync(
+            RequestKey, owner.LeaseToken!, TestContext.CancellationToken ) );
+        Assert.AreEqual( LookupConstants.StateChangedSentinel, await waitTask );
+    }
+
+    /// <summary>A coordinator publication wakes waiters but cannot delete a caller-owned lease.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ReleaseAsync_PublisherOnly_DoesNotDeleteCallerLease( ) {
+        const string RequestKey = "isrc:PUBLISHER-ONLY";
+        Contracts.Records.DeduplicationResult owner = await _deduplicator.TryAcquireAsync(
+            RequestKey, TimeSpan.FromMinutes( 5 ), TestContext.CancellationToken );
+
+        await _deduplicator.ReleaseAsync(
+            RequestKey,
+            "at://did:plc:test/link.bridgebeats.lookup/track:PUBLISHER-ONLY",
+            TestContext.CancellationToken );
+
+        Contracts.Records.DeduplicationResult contender = await _deduplicator.TryAcquireAsync(
+            RequestKey, TimeSpan.FromMinutes( 5 ), TestContext.CancellationToken );
+        Assert.IsFalse( contender.Acquired );
+
+        Assert.IsTrue( await _deduplicator.ReleaseOwnedAsync(
+            RequestKey, owner.LeaseToken!, null, TestContext.CancellationToken ) );
+    }
+
+    /// <summary>A stale lease cannot delete or publish completion for a replacement acquisition.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ReleaseOwnedAsync_StaleLease_DoesNotTerminateReplacement( ) {
+        const string RequestKey = "isrc:LEASE-ROTATION";
+        Contracts.Records.DeduplicationResult first = await _deduplicator.TryAcquireAsync(
+            RequestKey, TimeSpan.FromMilliseconds( 50 ), TestContext.CancellationToken );
+        await Task.Delay( 100, TestContext.CancellationToken );
+        Contracts.Records.DeduplicationResult replacement = await _deduplicator.TryAcquireAsync(
+            RequestKey, TimeSpan.FromMinutes( 5 ), TestContext.CancellationToken );
+        Assert.IsTrue( replacement.Acquired );
+
+        bool released = await _deduplicator.ReleaseOwnedAsync(
+            RequestKey, first.LeaseToken!, null, TestContext.CancellationToken );
+
+        Assert.IsFalse( released );
+        Contracts.Records.DeduplicationResult contender = await _deduplicator.TryAcquireAsync(
+            RequestKey, TimeSpan.FromMinutes( 5 ), TestContext.CancellationToken );
+        Assert.IsFalse( contender.Acquired );
+        Assert.IsTrue( await _deduplicator.ReleaseOwnedAsync(
+            RequestKey, replacement.LeaseToken!, null, TestContext.CancellationToken ) );
+    }
+
+    /// <summary>A persistence-failure release wakes waiters without masquerading as a record URI.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task WaitForCompletionAsync_ResultNotPersistedRelease_ReturnsNullPromptly( ) {
+        const string RequestKey = "isrc:NOTPERSISTED123";
+        _ = await _deduplicator.TryAcquireAsync(
+            RequestKey, TimeSpan.FromMinutes( 5 ), TestContext.CancellationToken );
+        RedisRequestDeduplicator waiter = new(
+            s_redis!, new Mock<ILogger<RedisRequestDeduplicator>>( ).Object );
+        Task<string?> waitTask = waiter.WaitForCompletionAsync(
+            RequestKey, TimeSpan.FromSeconds( 5 ), TestContext.CancellationToken );
+        await Task.Delay( 100, TestContext.CancellationToken );
+
+        await _deduplicator.ReleaseResultNotPersistedAsync(
+            RequestKey, TestContext.CancellationToken );
+
+        Assert.IsNull( await waitTask );
     }
 
     /// <summary>

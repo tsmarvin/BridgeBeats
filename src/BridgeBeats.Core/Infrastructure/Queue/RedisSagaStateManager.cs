@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Exceptions;
 using BridgeBeats.Contracts.Interfaces;
@@ -20,8 +22,9 @@ namespace BridgeBeats.Core.Infrastructure.Queue;
 /// <remarks>
 /// A saga's core fields live in hash <c>saga:{sagaId}</c>; each provider's progress lives in
 /// <c>saga:{sagaId}:provider:{provider}</c>; sagas awaiting finalization are tracked in the set
-/// <c>saga:pending</c>. Every write refreshes the saga's TTL to the configured job-expiration
-/// window, so a stalled saga self-expires and can be retried. Saga completeness is not stored: it
+/// <c>saga:pending</c>. State-changing writes normally refresh the saga TTL to the configured
+/// job-expiration window. Provider initialization does not renew the core saga, but it does renew
+/// every initialized provider leg, including an existing one. Saga completeness is not stored: it
 /// is computed from the per-provider hashes at read time, so a saga reads as complete when all of
 /// its initialized providers report complete. Redis here is transport and working state, not the
 /// system of record — final results live in the ATProto PDS, referenced by the URIs stored here.
@@ -42,10 +45,10 @@ public sealed partial class RedisSagaStateManager(
     private readonly QueueSettings _settings = settings?.Value ?? throw new ArgumentNullException( nameof( settings ) );
 
     /// <summary>Key prefix for saga hashes. Literal value: <c>"saga:"</c>.</summary>
-    private const string SagaPrefix = "saga:";
+    internal const string SagaPrefix = "saga:";
 
     /// <summary>Infix between saga id and provider in a provider key. Literal value: <c>":provider:"</c>.</summary>
-    private const string ProviderSuffix = ":provider:";
+    internal const string ProviderSuffix = ":provider:";
 
     /// <summary>Key of the set indexing sagas awaiting finalization. Literal value: <c>"saga:pending"</c>.</summary>
     private const string PendingSagaSetKey = "saga:pending";
@@ -80,7 +83,7 @@ public sealed partial class RedisSagaStateManager(
     private const string FieldRateLimitInfo = "rateLimitInfo";
 
     /// <summary>Core hash field: the priority the lookup originated at. Literal: <c>"originPriority"</c>.</summary>
-    private const string FieldOriginPriority = "originPriority";
+    internal const string FieldOriginPriority = "originPriority";
 
     /// <summary>Core hash field: single-winner marker that secondary lookups were queued. Literal: <c>"secondariesQueued"</c>.</summary>
     private const string FieldSecondariesQueued = "secondariesQueued";
@@ -91,7 +94,15 @@ public sealed partial class RedisSagaStateManager(
 
     /// <summary>Core hash field: the highest provider-count already durably written to the PDS. Literal: <c>"writeGeneration"</c>.</summary>
     private const string FieldWriteGeneration = "writeGeneration";
-    private const string FieldInstanceToken = "instanceToken";
+    internal const string FieldInstanceToken = "instanceToken";
+
+    /// <summary>JSON shape consumed by the atomic Redis rate-limit merge script.</summary>
+    private sealed record RateLimitInfoStorage(
+        [property: JsonPropertyName( "provider" )] int Provider,
+        [property: JsonPropertyName( "retryAfter" )] DateTimeOffset RetryAfter,
+        [property: JsonPropertyName( "retryAfterUnixMilliseconds" )] long RetryAfterUnixMilliseconds,
+        [property: JsonPropertyName( "endpoint" )] string? Endpoint );
+
     private const string TokenGuardedUriScript =
         "if redis.call('exists', KEYS[1]) == 0 or redis.call('hget', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end; " +
         "redis.call('hset', KEYS[1], ARGV[3], ARGV[4]); redis.call('expire', KEYS[1], tonumber(ARGV[5])); return 1";
@@ -108,6 +119,41 @@ public sealed partial class RedisSagaStateManager(
         "if redis.call('exists', KEYS[1]) == 0 or redis.call('hget', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end; " +
         "local removed = redis.call('hdel', KEYS[1], ARGV[3]); redis.call('hdel', KEYS[1], ARGV[4]); " +
         "if removed == 1 then redis.call('expire', KEYS[1], tonumber(ARGV[5])) end; return removed";
+    private const string TokenGuardedMergeRateLimitInfoScript = """
+        if redis.call('exists', KEYS[1]) == 0 or redis.call('hget', KEYS[1], ARGV[1]) ~= ARGV[2] then
+            return 0
+        end
+        local current = {}
+        local currentJson = redis.call('hget', KEYS[1], ARGV[3])
+        if currentJson and currentJson ~= '' then
+            local ok, decoded = pcall(cjson.decode, currentJson)
+            if ok and type(decoded) == 'table' then current = decoded end
+        end
+        local incoming = cjson.decode(ARGV[4])
+        for _, candidate in ipairs(incoming) do
+            local replaced = false
+            for index, existing in ipairs(current) do
+                local existingProvider = tonumber(existing.provider)
+                local candidateProvider = tonumber(candidate.provider)
+                if existingProvider and candidateProvider and existingProvider == candidateProvider then
+                    local existingRetryAfter = tonumber(existing.retryAfterUnixMilliseconds)
+                    local candidateRetryAfter = tonumber(candidate.retryAfterUnixMilliseconds)
+                    if not existingRetryAfter or candidateRetryAfter >= existingRetryAfter then
+                        current[index] = candidate
+                    end
+                    replaced = true
+                    break
+                end
+            end
+            if not replaced then table.insert(current, candidate) end
+        end
+        -- The C# boundary rejects an empty incoming list. Keep the Redis boundary defensive too:
+        -- cjson encodes an empty Lua table as {}, which cannot deserialize as the expected JSON list.
+        if #current == 0 then return 0 end
+        redis.call('hset', KEYS[1], ARGV[3], cjson.encode(current))
+        redis.call('expire', KEYS[1], tonumber(ARGV[5]))
+        return 1
+        """;
     private const string TokenGuardedResetScript =
         "if redis.call('exists', KEYS[1]) == 0 or redis.call('hget', KEYS[1], ARGV[4]) ~= ARGV[5] then return 0 end; " +
         "local cur = tonumber(redis.call('hget', KEYS[1], ARGV[1]) or '0'); if cur == tonumber(ARGV[2]) then " +
@@ -121,8 +167,8 @@ public sealed partial class RedisSagaStateManager(
         "redis.call('expire', KEYS[1], tonumber(ARGV[7])); redis.call('sadd', KEYS[2], ARGV[8]); return 1";
     private const string TokenGuardedProviderInitScript =
         "if redis.call('exists', KEYS[1]) == 0 or redis.call('hget', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end; " +
-        "if redis.call('exists', KEYS[2]) == 0 then redis.call('hset', KEYS[2], 'isComplete', 'False', 'isSuccess', 'False', 'resultJson', '', 'completedAt', '', 'errorMessage', ''); end; " +
-        "redis.call('expire', KEYS[1], tonumber(ARGV[3])); redis.call('expire', KEYS[2], tonumber(ARGV[3])); return 1";
+        "if redis.call('exists', KEYS[2]) == 0 then redis.call('hset', KEYS[2], 'isComplete', 'False', 'isSuccess', 'False', 'resultJson', '', 'completedAt', '', 'errorMessage', ''); " +
+        "end; redis.call('expire', KEYS[2], tonumber(ARGV[3])); return 1";
     private const string TokenGuardedProviderUpdateScript =
         "if redis.call('exists', KEYS[1]) == 0 or redis.call('hget', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end; " +
         "redis.call('hset', KEYS[2], 'isComplete', ARGV[3], 'isSuccess', ARGV[4], 'resultJson', ARGV[5], 'completedAt', ARGV[6], 'errorMessage', ARGV[7]); " +
@@ -144,19 +190,19 @@ public sealed partial class RedisSagaStateManager(
     // Hash field names for provider state
 
     /// <summary>Provider hash field: whether the provider has finished. Literal: <c>"isComplete"</c>.</summary>
-    private const string FieldIsComplete = "isComplete";
+    internal const string FieldIsComplete = "isComplete";
 
     /// <summary>Provider hash field: whether the provider succeeded. Literal: <c>"isSuccess"</c>.</summary>
-    private const string FieldIsSuccess = "isSuccess";
+    internal const string FieldIsSuccess = "isSuccess";
 
     /// <summary>Provider hash field: serialized provider result. Literal: <c>"resultJson"</c>.</summary>
-    private const string FieldResultJson = "resultJson";
+    internal const string FieldResultJson = "resultJson";
 
     /// <summary>Provider hash field: when the provider completed (ISO-8601). Literal: <c>"completedAt"</c>.</summary>
-    private const string FieldCompletedAt = "completedAt";
+    internal const string FieldCompletedAt = "completedAt";
 
     /// <summary>Provider hash field: an error message if the provider failed. Literal: <c>"errorMessage"</c>.</summary>
-    private const string FieldErrorMessage = "errorMessage";
+    internal const string FieldErrorMessage = "errorMessage";
 
     /// <summary>
     /// Returns the existing saga for an id, refreshing its TTL, or creates a new one.
@@ -305,9 +351,7 @@ public sealed partial class RedisSagaStateManager(
                 ? parsedProvider
                 : null;
 
-        List<ProviderRateLimitInfo>? rateLimitInfo = !string.IsNullOrEmpty( rateLimitInfoJson )
-            ? System.Text.Json.JsonSerializer.Deserialize<List<ProviderRateLimitInfo>>( rateLimitInfoJson )
-            : null;
+        List<ProviderRateLimitInfo>? rateLimitInfo = DeserializeRateLimitInfo( rateLimitInfoJson, sagaId );
 
         // Missing field (sagas persisted before this field existed) defaults to Background
         // so old sagas are never promoted to interactive.
@@ -430,15 +474,25 @@ public sealed partial class RedisSagaStateManager(
         return (int)result == 1;
     }
 
-    /// <summary>Stores rate-limit information only when the saga instance token still matches.</summary>
+    /// <summary>
+    /// Atomically merges per-provider rate-limit information while the saga token still matches.
+    /// Concurrent provider legs therefore cannot erase a sibling provider's cooldown entry.
+    /// </summary>
     public async Task<bool> TrySetRateLimitInfoAsync( string sagaId, List<ProviderRateLimitInfo> rateLimitInfo, string expectedInstanceToken, CancellationToken cancellationToken = default ) {
         ArgumentException.ThrowIfNullOrWhiteSpace( sagaId );
         ArgumentNullException.ThrowIfNull( rateLimitInfo );
         ArgumentException.ThrowIfNullOrWhiteSpace( expectedInstanceToken );
-        string json = System.Text.Json.JsonSerializer.Serialize( rateLimitInfo );
+        if (rateLimitInfo.Count == 0) {
+            throw new ArgumentException( "At least one rate-limit entry is required.", nameof( rateLimitInfo ) );
+        }
+        string json = JsonSerializer.Serialize( rateLimitInfo.Select( info => new RateLimitInfoStorage(
+            (int)info.Provider,
+            info.RetryAfter.ToUniversalTime( ),
+            info.RetryAfter.ToUnixTimeMilliseconds( ),
+            info.Endpoint ) ) );
         TimeSpan ttl = TimeSpan.FromMinutes( _settings.JobExpirationMinutes );
         RedisResult result = await _redis.GetDatabase( ).ScriptEvaluateAsync(
-            "if redis.call('exists', KEYS[1]) == 0 or redis.call('hget', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end; redis.call('hset', KEYS[1], ARGV[3], ARGV[4]); redis.call('expire', KEYS[1], ARGV[5]); return 1",
+            TokenGuardedMergeRateLimitInfoScript,
             [GetSagaKey( sagaId )], [FieldInstanceToken, expectedInstanceToken, FieldRateLimitInfo, json, (long)ttl.TotalSeconds] );
         bool updated = (int)result == 1;
         if (updated) LogRateLimitInfoSet( _logger, sagaId, rateLimitInfo.Count );
@@ -766,14 +820,32 @@ public sealed partial class RedisSagaStateManager(
     /// <summary>Builds the core saga hash key: <c>saga:{sagaId}</c>.</summary>
     /// <param name="sagaId">The saga id.</param>
     /// <returns>The core saga key.</returns>
-    private static string GetSagaKey( string sagaId ) => $"{SagaPrefix}{sagaId}";
+    internal static string GetSagaKey( string sagaId ) => $"{SagaPrefix}{sagaId}";
 
     /// <summary>Builds a provider hash key: <c>saga:{sagaId}:provider:{provider}</c>.</summary>
     /// <param name="sagaId">The saga id.</param>
     /// <param name="provider">The provider.</param>
     /// <returns>The provider key.</returns>
-    private static string GetProviderKey( string sagaId, SupportedProviders provider ) =>
+    internal static string GetProviderKey( string sagaId, SupportedProviders provider ) =>
         $"{SagaPrefix}{sagaId}{ProviderSuffix}{provider}";
+
+    private List<ProviderRateLimitInfo>? DeserializeRateLimitInfo(
+        string? rateLimitInfoJson,
+        string sagaId
+    ) {
+        if (string.IsNullOrEmpty( rateLimitInfoJson )) {
+            return null;
+        }
+
+        try {
+            return JsonSerializer.Deserialize<List<ProviderRateLimitInfo>>( rateLimitInfoJson );
+        } catch (Exception ex) when (ex is JsonException or NotSupportedException) {
+            // Rate-limit metadata is advisory. A damaged auxiliary field must not make the saga's
+            // provider progress, result URI, and fencing token permanently unreadable.
+            LogMalformedRateLimitInfo( _logger, ex, sagaId );
+            return null;
+        }
+    }
 
     #region LoggerMessage Methods
 
@@ -815,6 +887,19 @@ public sealed partial class RedisSagaStateManager(
         Level = LogLevel.Warning,
         Message = "Saga {SagaId} has invalid lookup type: {Type}" )]
     internal static partial void LogInvalidLookupType( ILogger logger, string sagaId, string type );
+
+    /// <summary>Logs that malformed advisory rate-limit metadata was ignored while reading a saga.</summary>
+    /// <param name="logger">The logger to write to.</param>
+    /// <param name="exception">The JSON parsing failure.</param>
+    /// <param name="sagaId">The affected saga id.</param>
+    [LoggerMessage(
+        EventId = LogEventIds.Infrastructure.Queue.RedisSagaStateManagerMalformedRateLimitInfo,
+        Level = LogLevel.Warning,
+        Message = "Saga {SagaId} has malformed rate-limit metadata; ignoring the auxiliary field" )]
+    internal static partial void LogMalformedRateLimitInfo(
+        ILogger logger,
+        Exception exception,
+        string sagaId );
 
     /// <summary>Logs that a provider's state was updated.</summary>
     /// <param name="logger">The logger to write to.</param>

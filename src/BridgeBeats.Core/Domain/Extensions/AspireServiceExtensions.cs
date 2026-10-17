@@ -10,6 +10,7 @@ using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using Polly;
+using Polly.CircuitBreaker;
 using Polly.Retry;
 using Serilog;
 
@@ -60,16 +61,13 @@ public static class AspireServiceExtensions {
                 options.Retry.MaxRetryAttempts = maxRetryAttempts;
                 options.Retry.Delay = TimeSpan.FromSeconds( 3 );
                 options.Retry.MaxDelay = TimeSpan.FromMinutes( 5 );
+                // Non-provider clients continue to honor Retry-After. Direct provider and worker-
+                // proxy clients convert 429 responses into ProviderRateLimitException before this
+                // strategy sees them.
                 options.Retry.ShouldRetryAfterHeader = true;
                 options.Retry.DisableForUnsafeHttpMethods( );
 
-                // Exclude ProviderRateLimitException (including RetryAfterExceededException) from
-                // retry logic; these are handled by the provider queue's rate-limit path.
-                Func<RetryPredicateArguments<HttpResponseMessage>, ValueTask<bool>> originalShouldHandle = options.Retry.ShouldHandle;
-                options.Retry.ShouldHandle = args => {
-                    // ProviderRateLimitException is intentionally handled by the queue consumer.
-                    return args.Outcome.Exception is ProviderRateLimitException ? ValueTask.FromResult( false ) : originalShouldHandle( args );
-                };
+                ExcludeProviderRateLimits( options );
 
                 options.TotalRequestTimeout.Timeout = TimeSpan.FromMinutes( totalTimeoutMinutes );
                 options.AttemptTimeout.Timeout = TimeSpan.FromSeconds( attemptTimeoutSeconds );
@@ -152,16 +150,13 @@ public static class AspireServiceExtensions {
                 options.Retry.MaxRetryAttempts = maxRetryAttempts;
                 options.Retry.Delay = TimeSpan.FromSeconds( 3 );
                 options.Retry.MaxDelay = TimeSpan.FromMinutes( 5 );
+                // Non-provider clients continue to honor Retry-After. Direct-provider and worker-
+                // proxy handlers convert 429 responses into ProviderRateLimitException before this
+                // strategy evaluates the outcome.
                 options.Retry.ShouldRetryAfterHeader = true;
                 options.Retry.DisableForUnsafeHttpMethods( );
 
-                // Exclude ProviderRateLimitException (including RetryAfterExceededException) from
-                // retry logic; these are handled by the provider queue's rate-limit path.
-                Func<RetryPredicateArguments<HttpResponseMessage>, ValueTask<bool>> originalShouldHandle = options.Retry.ShouldHandle;
-                options.Retry.ShouldHandle = args => {
-                    // ProviderRateLimitException is intentionally handled by the queue consumer.
-                    return args.Outcome.Exception is ProviderRateLimitException ? ValueTask.FromResult( false ) : originalShouldHandle( args );
-                };
+                ExcludeProviderRateLimits( options );
 
                 options.TotalRequestTimeout.Timeout = TimeSpan.FromMinutes( totalTimeoutMinutes );
                 options.AttemptTimeout.Timeout = TimeSpan.FromSeconds( attemptTimeoutSeconds );
@@ -201,6 +196,23 @@ public static class AspireServiceExtensions {
 
         return builder;
     }
+
+    internal static void ExcludeProviderRateLimits( HttpStandardResilienceOptions options ) {
+        Func<RetryPredicateArguments<HttpResponseMessage>, ValueTask<bool>> originalRetryPredicate =
+            options.Retry.ShouldHandle;
+        options.Retry.ShouldHandle = args => IsProviderRateLimit( args.Outcome )
+            ? ValueTask.FromResult( false )
+            : originalRetryPredicate( args );
+
+        Func<CircuitBreakerPredicateArguments<HttpResponseMessage>, ValueTask<bool>> originalCircuitPredicate =
+            options.CircuitBreaker.ShouldHandle;
+        options.CircuitBreaker.ShouldHandle = args => IsProviderRateLimit( args.Outcome )
+            ? ValueTask.FromResult( false )
+            : originalCircuitPredicate( args );
+    }
+
+    private static bool IsProviderRateLimit( Outcome<HttpResponseMessage> outcome ) =>
+        outcome.Exception is ProviderRateLimitException;
 
     /// <summary>
     /// Configures OpenTelemetry for a web-application host. Wires logging, tracing, and metrics

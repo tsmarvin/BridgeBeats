@@ -1,3 +1,4 @@
+using System.Text.Json;
 using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Interfaces;
@@ -182,7 +183,7 @@ public class StaleCacheRefreshSagaCompletionIntegrationTests {
 
         // Drive the terminal write path.
         MediaLinkResult? capturedResult = null;
-        (Mock<IATProtoStorageService> storageDouble, Func<int> getPdsWriteCount) = BuildCountingStorageDouble( r => capturedResult = r );
+        (Mock<ITargetedATProtoStorageService> storageDouble, Func<int> getPdsWriteCount) = BuildCountingStorageDouble( r => capturedResult = r );
 
         SagaCoordinatorBackgroundService coordinator = BuildCoordinator(
             _sagaManager, storageDouble.Object, enabledProviders );
@@ -239,7 +240,7 @@ public class StaleCacheRefreshSagaCompletionIntegrationTests {
         Assert.IsNull( saga.FinalResultUri,
             "Pre-condition: FinalResultUri must be null (this is a fresh refresh, not a reuse)." );
 
-        (Mock<IATProtoStorageService> storageDouble, Func<int> getPdsWriteCount) = BuildCountingStorageDouble( );
+        (Mock<ITargetedATProtoStorageService> storageDouble, Func<int> getPdsWriteCount) = BuildCountingStorageDouble( );
         SagaCoordinatorBackgroundService coordinator = BuildCoordinator(
             _sagaManager, storageDouble.Object, [SupportedProviders.Spotify] );
 
@@ -277,7 +278,7 @@ public class StaleCacheRefreshSagaCompletionIntegrationTests {
         Assert.IsNotNull( saga.FinalResultUri,
             "Pre-condition: FinalResultUri must be set to simulate a warm saga." );
 
-        (Mock<IATProtoStorageService> storageDouble, Func<int> getPdsWriteCount) = BuildCountingStorageDouble( );
+        (Mock<ITargetedATProtoStorageService> storageDouble, Func<int> getPdsWriteCount) = BuildCountingStorageDouble( );
         SagaCoordinatorBackgroundService coordinator = BuildCoordinator(
             _sagaManager, storageDouble.Object, [SupportedProviders.Spotify] );
 
@@ -522,6 +523,57 @@ public class StaleCacheRefreshSagaCompletionIntegrationTests {
             queueResolver = resolverMock.Object;
         }
 
+        IRefreshReviewStore refreshReviewStore = CreateRefreshReviewStore( );
+        Dictionary<SupportedProviders, QueuedLookupRequest> stagedRequests = [];
+        Mock<ILookupDispatchOutbox> dispatchOutbox = new( );
+        _ = dispatchOutbox.Setup( outbox => outbox.StageRefreshBatchAsync(
+                It.IsAny<IReadOnlyList<QueuedLookupRequest>>( ),
+                It.IsAny<QueuePriority>( ),
+                It.IsAny<RefreshReviewEntry>( ),
+                It.IsAny<CancellationToken>( ) ) )
+            .Returns( async (
+                IReadOnlyList<QueuedLookupRequest> requests,
+                QueuePriority _,
+                RefreshReviewEntry reviewEntry,
+                CancellationToken cancellationToken ) => {
+                    bool initialized = await sagaManager.TryInitializeProviderStatesAsync(
+                        requests[0].SagaId,
+                        requests.Select( request => request.Provider ),
+                        requests[0].SagaInstanceToken!,
+                        cancellationToken );
+                    if (!initialized) {
+                        return (IReadOnlyDictionary<SupportedProviders, ProviderDispatchStageOutcome>)
+                            requests.ToDictionary(
+                                request => request.Provider,
+                                _ => ProviderDispatchStageOutcome.SagaInstanceMismatch );
+                    }
+                    await refreshReviewStore.RegisterPendingAsync( reviewEntry, cancellationToken );
+                    foreach (QueuedLookupRequest request in requests) {
+                        stagedRequests[request.Provider] = request;
+                    }
+
+                    return (IReadOnlyDictionary<SupportedProviders, ProviderDispatchStageOutcome>)
+                        requests.ToDictionary(
+                            request => request.Provider,
+                            _ => ProviderDispatchStageOutcome.Staged );
+                } );
+        _ = dispatchOutbox.Setup( outbox => outbox.DispatchAsync(
+                It.IsAny<string>( ),
+                It.IsAny<SupportedProviders>( ),
+                It.IsAny<CancellationToken>( ) ) )
+            .Returns( async (
+                string _,
+                SupportedProviders provider,
+                CancellationToken cancellationToken ) => {
+                    if (!stagedRequests.TryGetValue( provider, out QueuedLookupRequest? request )) {
+                        return false;
+                    }
+
+                    await queueResolver.GetQueue( provider ).EnqueueAsync(
+                        request, QueuePriority.Bulk, cancellationToken );
+                    return true;
+                } );
+
         CacheBootstrapSettings settings = new(
             new Uri( "https://pds.test.example" ),
             "did:plc:testuser",
@@ -545,12 +597,12 @@ public class StaleCacheRefreshSagaCompletionIntegrationTests {
         return new StaleCacheRefreshBackgroundService(
             _atProtoStorageMock.Object,
             sagaManager,
-            queueResolver,
+            dispatchOutbox.Object,
             redisMock.Object,
             enabledProviders,
             settings,
             new Mock<ILogger<StaleCacheRefreshBackgroundService>>( ).Object,
-            CreateRefreshReviewStore( )
+            refreshReviewStore
         );
     }
 
@@ -559,7 +611,7 @@ public class StaleCacheRefreshSagaCompletionIntegrationTests {
     /// assertions. <see cref="SetupAtProtoListForRecord"/> adds a <c>ListAllRecordsAsync</c> setup to
     /// the same instance that <see cref="BuildRefreshService"/> captures, so the sweep sees the record.
     /// </summary>
-    private readonly Mock<IATProtoStorageService> _atProtoStorageMock = new( );
+    private readonly Mock<ITargetedATProtoStorageService> _atProtoStorageMock = new( );
 
     /// <summary>
     /// Wires the ATProto storage mock to yield the given record when <c>ListAllRecordsAsync</c> is called.
@@ -577,11 +629,11 @@ public class StaleCacheRefreshSagaCompletionIntegrationTests {
     /// Builds a PDS write-counter storage double. Write count is tracked via an <see cref="Interlocked"/>
     /// increment on a shared box and exposed through the returned <c>GetCount</c> delegate.
     /// </summary>
-    private static (Mock<IATProtoStorageService> Mock, Func<int> GetCount) BuildCountingStorageDouble(
+    private static (Mock<ITargetedATProtoStorageService> Mock, Func<int> GetCount) BuildCountingStorageDouble(
         Action<MediaLinkResult>? captureResult = null
     ) {
         int[] box = [0];
-        Mock<IATProtoStorageService> storageDouble = new( );
+        Mock<ITargetedATProtoStorageService> storageDouble = new( );
         _ = storageDouble
             .Setup( s => s.StoreMediaLinkResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( ( MediaLinkResult r, CancellationToken ct ) => {
@@ -595,7 +647,7 @@ public class StaleCacheRefreshSagaCompletionIntegrationTests {
     /// <summary>Builds the saga coordinator wired to the given dependencies.</summary>
     private static SagaCoordinatorBackgroundService BuildCoordinator(
         ISagaStateManager sagaManager,
-        IATProtoStorageService storageDouble,
+        ITargetedATProtoStorageService storageDouble,
         HashSet<SupportedProviders> enabledProviders
     ) {
         Mock<IConnectionMultiplexer> redisMock = new( );
@@ -613,7 +665,6 @@ public class StaleCacheRefreshSagaCompletionIntegrationTests {
             .Setup( d => d.ReleaseAsync( It.IsAny<string>( ), It.IsAny<string?>( ), It.IsAny<CancellationToken>( ) ) )
             .Returns( Task.CompletedTask );
 
-        Mock<IProviderQueueResolver<QueuedLookupRequest>> queueResolverMock = new( );
         SagaResultCombiner resultCombiner = new( new Mock<ILogger<SagaResultCombiner>>( ).Object );
 
         return new SagaCoordinatorBackgroundService(
@@ -623,7 +674,7 @@ public class StaleCacheRefreshSagaCompletionIntegrationTests {
             cacheMock.Object,
             deduplicatorMock.Object,
             resultCombiner,
-            queueResolverMock.Object,
+            new Mock<ILookupDispatchOutbox>( ).Object,
             enabledProviders,
             new Mock<ILogger<SagaCoordinatorBackgroundService>>( ).Object,
             CreateRefreshReviewStore( )
@@ -633,6 +684,9 @@ public class StaleCacheRefreshSagaCompletionIntegrationTests {
     private static IRefreshReviewStore CreateRefreshReviewStore( ) {
         Mock<IRefreshReviewStore> store = new( );
         _ = store.Setup( candidate => candidate.GetUnresolvedAsync( It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [] );
+        _ = store.Setup( candidate => candidate.GetPendingForSagaAsync(
+                It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( [] );
         _ = store.Setup( candidate => candidate.RegisterPendingAsync(
                 It.IsAny<RefreshReviewEntry>( ), It.IsAny<CancellationToken>( ) ) )
@@ -654,6 +708,11 @@ public class StaleCacheRefreshSagaCompletionIntegrationTests {
             SupportedProviders.Tidal      => TidalTrackUrl,
             _                             => "https://example.com/track/1"
         };
-        return $$$"""{"isrc":"{{{isrc}}}","trackName":"Test Track","artistName":"Test Artist","url":"{{{url}}}"}""";
+        return JsonSerializer.Serialize( new MusicLookupResult {
+            ExternalId = isrc,
+            Title = "Test Track",
+            Artist = "Test Artist",
+            URL = url
+        }, JsonSerializerOptions.Web );
     }
 }

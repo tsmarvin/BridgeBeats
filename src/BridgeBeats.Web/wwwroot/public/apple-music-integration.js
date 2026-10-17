@@ -181,23 +181,30 @@ async function processSelectedPlaylist() {
             credentials: 'same-origin',
             body: JSON.stringify(processData.trackIds)
         });
-        if (!streamResponse.ok) throw new Error('Failed to lookup track information');
+        if (!streamResponse.ok) {
+            const errorData = await streamResponse.json().catch(() => null);
+            throw new Error(errorData?.message || 'Failed to lookup track information');
+        }
         const reader = streamResponse.body.getReader();
         const decoder = new TextDecoder();
+        const streamItemDelimiter = document.documentElement.dataset.streamItemDelimiter;
+        if (!streamItemDelimiter) throw new Error('Streaming protocol configuration is missing');
         let buffer = '';
         let cardCount = 0;
+        let streamCompleted = false;
         while (true) {
             const { done, value } = await reader.read();
             if (value) {
                 buffer += decoder.decode(value, { stream: !done });
-                let lastClosingDiv = buffer.lastIndexOf('</div>');
-                if (lastClosingDiv !== -1) {
-                    const completeHTML = buffer.substring(0, lastClosingDiv + 6);
-                    buffer = buffer.substring(lastClosingDiv + 6);
+                let lastDelimiter = buffer.lastIndexOf(streamItemDelimiter);
+                if (lastDelimiter !== -1) {
+                    const completeHTML = buffer.substring(0, lastDelimiter);
+                    buffer = buffer.substring(lastDelimiter + streamItemDelimiter.length);
                     const tempDiv = document.createElement('div');
                     tempDiv.innerHTML = completeHTML;
                     const completionMarker = tempDiv.querySelector('[data-stream-complete="true"]');
                     if (completionMarker) {
+                        streamCompleted = true;
                         const errors = parseInt(completionMarker.getAttribute('data-errors') || '0');
                         const rateLimited = parseInt(completionMarker.getAttribute('data-rate-limited') || '0');
                         completionMarker.remove();
@@ -245,9 +252,10 @@ async function processSelectedPlaylist() {
             }
             if (done) break;
         }
+        if (!streamCompleted) throw new Error('The playlist stream ended before its completion frame.');
     } catch (err) {
         processingLoading.classList.add('d-none');
-        processingError.innerHTML = `<strong>Error:</strong> ${err.message}`;
+        processingError.textContent = `Error: ${err instanceof Error ? err.message : String(err)}`;
         processingError.classList.remove('d-none');
     } finally {
         processPlaylistBtn.disabled = false;

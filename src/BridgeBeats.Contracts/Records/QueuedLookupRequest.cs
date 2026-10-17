@@ -71,8 +71,8 @@ public sealed record QueuedLookupRequest : IQueueableRequest {
 
     /// <summary>
     /// Earliest instant at which a consumer may retry this delivery. A null value is immediately
-    /// eligible. Transient provider failures use this to avoid occupying a worker slot while the
-    /// retry backoff elapses.
+    /// eligible. Scheduled deferrals use this to avoid occupying a worker slot before their retry
+    /// window opens.
     /// </summary>
     [JsonPropertyName( "notBefore" )]
     [JsonIgnore( Condition = JsonIgnoreCondition.WhenWritingNull )]

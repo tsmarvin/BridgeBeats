@@ -334,6 +334,12 @@ The script will:
 
 ### Manual Update
 
+> **Compatibility ordering:** this release adds the `NO_RESULT` and `RESULT_NOT_PERSISTED`
+> completion payloads shared by Saga Coordinator publishers and Web consumers. During a rolling
+> update, deploy Web before Saga Coordinator (or update them atomically). An older Web instance can
+> otherwise interpret a new sentinel as a record URI. The standard Compose command below recreates
+> the stack as one update; avoid separately upgrading Saga Coordinator first.
+
 ```bash
 # From the deployment directory, pull the latest images and recreate
 docker compose pull

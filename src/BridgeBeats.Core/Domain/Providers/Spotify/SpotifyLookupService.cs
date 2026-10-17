@@ -166,8 +166,7 @@ namespace BridgeBeats.Core.Domain.Providers.Spotify {
         /// network) signals the caller to requeue without writing saga state.
         /// </returns>
         /// <remarks>
-        /// Uses a separate rate-limit endpoint key (<see cref="SpotifyConstants.BulkTracksEndpoint"/>)
-        /// from single-track lookups to allow independent rate-limit tracking.
+        /// Uses the shared <c>/tracks</c> rate-limit key (<see cref="SpotifyConstants.TracksEndpoint"/>).
         /// </remarks>
         /// <exception cref="ArgumentException">
         /// Thrown when more than <see cref="SpotifyConstants.MaxTracksPerBatchLookup"/> track IDs are provided.
@@ -188,7 +187,7 @@ namespace BridgeBeats.Core.Domain.Providers.Spotify {
             }
 
             string requestUri = SpotifyLinkParser.GetBulkTracksUri( idList );
-            string? body = await NewBulkMusicApiRequest( requestUri, SpotifyConstants.BulkTracksEndpoint );
+            string? body = await NewBulkMusicApiRequest( requestUri, SpotifyConstants.TracksEndpoint );
 
             Dictionary<string, MusicLookupResult?> results = [];
 
@@ -246,8 +245,7 @@ namespace BridgeBeats.Core.Domain.Providers.Spotify {
         /// caller to requeue without writing saga state.
         /// </returns>
         /// <remarks>
-        /// Uses a separate rate-limit endpoint key (<see cref="SpotifyConstants.BulkAlbumsEndpoint"/>)
-        /// from single-album lookups to allow independent rate-limit tracking.
+        /// Uses the shared <c>/albums</c> rate-limit key (<see cref="SpotifyConstants.AlbumsEndpoint"/>).
         /// </remarks>
         /// <exception cref="ArgumentException">
         /// Thrown when more than <see cref="SpotifyConstants.MaxAlbumsPerBatchLookup"/> album IDs are provided.
@@ -268,7 +266,7 @@ namespace BridgeBeats.Core.Domain.Providers.Spotify {
             }
 
             string requestUri = SpotifyLinkParser.GetBulkAlbumsUri( idList );
-            string? body = await NewBulkMusicApiRequest( requestUri, SpotifyConstants.BulkAlbumsEndpoint );
+            string? body = await NewBulkMusicApiRequest( requestUri, SpotifyConstants.AlbumsEndpoint );
 
             Dictionary<string, MusicLookupResult?> results = [];
 
@@ -322,8 +320,7 @@ namespace BridgeBeats.Core.Domain.Providers.Spotify {
         /// classified. An empty dictionary is returned for an empty input or an empty/unparseable response body.
         /// </returns>
         /// <remarks>
-        /// Uses a separate rate-limit endpoint key (<see cref="SpotifyConstants.BulkArtistsEndpoint"/>)
-        /// from other lookups to allow independent rate-limit tracking.
+        /// Uses the shared <c>/artists</c> rate-limit key (<see cref="SpotifyConstants.ArtistsEndpoint"/>).
         /// </remarks>
         /// <exception cref="ArgumentException">
         /// Thrown when more than <see cref="SpotifyConstants.MaxArtistsPerBatchLookup"/> artist IDs are provided.
@@ -344,7 +341,7 @@ namespace BridgeBeats.Core.Domain.Providers.Spotify {
             }
 
             string requestUri = SpotifyLinkParser.GetBulkArtistsUri( idList );
-            string? body = await NewBulkMusicApiRequest( requestUri, SpotifyConstants.BulkArtistsEndpoint );
+            string? body = await NewBulkMusicApiRequest( requestUri, SpotifyConstants.ArtistsEndpoint );
 
             Dictionary<string, List<string>?> results = [];
 

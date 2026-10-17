@@ -109,6 +109,12 @@ public class SpotifyBulkFlushTests {
         _ = _dbMock.Setup( d => d.ScriptEvaluateAsync(
                 It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)(int)DeliveryReplacementOutcome.Replaced ) );
+        _ = _dbMock.Setup( d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ),
+                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 5 ),
+                It.IsAny<RedisValue[]?>( ),
+                It.IsAny<CommandFlags>( ) ) )
             .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"1234567890-1" ) );
 
         // StreamLength returns 0 by default
@@ -632,7 +638,7 @@ public class SpotifyBulkFlushTests {
         SpotifyBulkProcessorService service = CreateService( );
 
         // Act
-        await service.HandleBulkRateLimitAsync( messages, SpotifyConstants.BulkTracksEndpoint, ex, TestContext.CancellationToken );
+        await service.HandleBulkRateLimitAsync( messages, SpotifyConstants.TracksEndpoint, ex, TestContext.CancellationToken );
 
         _sagaManagerMock.Verify( m => m.GetAsync( request.SagaId, It.IsAny<CancellationToken>( ) ), Times.AtLeastOnce );
         _sagaManagerMock.Verify( m => m.TrySetIsPartialAsync(
@@ -685,7 +691,7 @@ public class SpotifyBulkFlushTests {
         meterListener.SetMeasurementEventCallback<double>( ( _, _, _, _ ) => wallSamples++ );
         meterListener.Start( );
 
-        await CreateService( ).HandleBulkRateLimitAsync( messages, SpotifyConstants.BulkTracksEndpoint, ex, TestContext.CancellationToken );
+        await CreateService( ).HandleBulkRateLimitAsync( messages, SpotifyConstants.TracksEndpoint, ex, TestContext.CancellationToken );
 
         Assert.AreEqual( 2, wallSamples );
         Assert.HasCount( 2, wallSpans );
@@ -954,7 +960,8 @@ public class SpotifyBulkFlushTests {
             _lookupServiceMock.Object,
             _innerQueueMock.Object,
             _serviceLoggerMock.Object,
-            options );
+            options,
+            Options.Create( new QueueSettings( ) ) );
     }
 
     /// <summary>
@@ -1096,8 +1103,8 @@ public class SpotifyBulkFlushTests {
             } );
         _ = _dbMock.Setup( d => d.ScriptEvaluateAsync(
                 It.IsAny<string>( ),
-                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == TrackStream ),
-                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 2 ),
+                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 3 && keys[0] == TrackStream ),
+                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 3 ),
                 It.IsAny<CommandFlags>( ) ) )
             .ThrowsAsync( new RedisServerException( "atomic acknowledgement unavailable" ) );
 
@@ -1220,7 +1227,7 @@ public class SpotifyBulkFlushTests {
         static int CountAtomicAcks( Mock mock ) => mock.Invocations.Count( invocation =>
             invocation.Method.Name == nameof( IDatabase.ScriptEvaluateAsync )
             && invocation.Arguments[2] is RedisValue[] arguments
-            && arguments.Length == 2 );
+            && arguments.Length == 3 );
         async Task<(int Gets, int Updates, int Acks)> RunAsync( bool listen ) {
             using MeterListener? listener = listen ? new MeterListener( ) : null;
             if (listener is not null) {
@@ -1572,6 +1579,7 @@ public class SpotifyBulkFlushTests {
         public Task<QueuedMessage<QueuedLookupRequest>?> DequeueAsync( IRateLimitTracker rateLimitTracker, CancellationToken cancellationToken = default ) => Task.FromResult<QueuedMessage<QueuedLookupRequest>?>( null );
         public Task AcknowledgeAsync( string messageId, CancellationToken cancellationToken = default ) => Task.CompletedTask;
         public Task RequeueAsync( string messageId, TimeSpan? delay = null, CancellationToken cancellationToken = default ) => Task.CompletedTask;
+        public Task<DeliveryReplacementOutcome> ReplaceAsync( string messageId, QueuedLookupRequest replacement, QueuePriority priority, CancellationToken cancellationToken = default ) => Task.FromResult( DeliveryReplacementOutcome.Replaced );
         public Task<QueueDepth> GetDepthAsync( CancellationToken cancellationToken = default ) => Task.FromResult( new QueueDepth( 0, 0, 0, 0 ) );
         public Task<IReadOnlyList<QueuedMessage<QueuedLookupRequest>>> GetDlqMessagesAsync( int limit, CancellationToken cancellationToken = default ) => Task.FromResult<IReadOnlyList<QueuedMessage<QueuedLookupRequest>>>( [] );
         public Task RequeueFromDlqAsync( string messageId, QueuePriority priority, CancellationToken cancellationToken = default ) => Task.CompletedTask;

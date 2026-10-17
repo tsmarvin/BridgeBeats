@@ -22,10 +22,8 @@ namespace BridgeBeats.Tests.Unit;
 [TestClass]
 public class JetStreamWatcherServiceTests {
 
-    /// <summary>Mocked provider queue resolver injected into the service under test.</summary>
-    private Mock<IProviderQueueResolver<QueuedLookupRequest>> _queueResolverMock = null!;
-    /// <summary>Mocked per-provider queue the resolver returns.</summary>
-    private Mock<IRequestQueue<QueuedLookupRequest>> _queueMock = null!;
+    /// <summary>Mocked durable dispatch staging component injected into the service under test.</summary>
+    private Mock<ILookupDispatchOutbox> _dispatchOutboxMock = null!;
     /// <summary>Mocked logger used to assert log-level and EventId assertions.</summary>
     private Mock<ILogger<JetStreamWatcherService>> _loggerMock = null!;
     private Mock<ISagaStateManager> _sagaManagerMock = null!;
@@ -36,8 +34,7 @@ public class JetStreamWatcherServiceTests {
     /// <summary>Creates fresh mocks before each test.</summary>
     [TestInitialize]
     public void Initialize( ) {
-        _queueResolverMock = new Mock<IProviderQueueResolver<QueuedLookupRequest>>( );
-        _queueMock = new Mock<IRequestQueue<QueuedLookupRequest>>( );
+        _dispatchOutboxMock = new Mock<ILookupDispatchOutbox>( );
         _loggerMock = new Mock<ILogger<JetStreamWatcherService>>( );
         _sagaManagerMock = new Mock<ISagaStateManager>( );
         _ = _sagaManagerMock.Setup( manager => manager.GetOrCreateAsync(
@@ -58,14 +55,14 @@ public class JetStreamWatcherServiceTests {
         // IsEnabled(); without this setup Moq returns false and Times.Once is vacuously unsatisfied.
         _ = _loggerMock.Setup( l => l.IsEnabled( It.IsAny<LogLevel>( ) ) ).Returns( true );
 
-        // Stub the resolver to return the queue mock for any provider
-        _ = _queueResolverMock.Setup( r => r.GetQueue( It.IsAny<SupportedProviders>( ) ) )
-            .Returns( _queueMock.Object );
-        _ = _queueMock.Setup( q => q.EnqueueAsync(
+        _ = _dispatchOutboxMock.Setup( outbox => outbox.StageAsync(
                 It.IsAny<QueuedLookupRequest>( ),
                 It.IsAny<QueuePriority>( ),
                 It.IsAny<CancellationToken>( ) ) )
-            .Returns( Task.CompletedTask );
+            .ReturnsAsync( ProviderDispatchStageOutcome.Staged );
+        _ = _dispatchOutboxMock.Setup( outbox => outbox.DispatchAsync(
+                It.IsAny<string>( ), It.IsAny<SupportedProviders>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
     }
 
     /// <summary>
@@ -85,8 +82,8 @@ public class JetStreamWatcherServiceTests {
         await service.HandleCommitRecordAsync( record, "app.bsky.feed.repost", agent, TestContext.CancellationToken );
 
         // Assert: nothing enqueued — skipped cleanly
-        _queueMock.Verify(
-            q => q.EnqueueAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ),
+        _dispatchOutboxMock.Verify(
+            outbox => outbox.StageAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ),
             Times.Never );
 
         // Assert: the error log must NOT fire for a graceful early-return (this is not a crash path)
@@ -116,8 +113,8 @@ public class JetStreamWatcherServiceTests {
         await service.HandleCommitRecordAsync( record, "app.bsky.feed.repost", agent, TestContext.CancellationToken );
 
         // Assert: nothing enqueued
-        _queueMock.Verify(
-            q => q.EnqueueAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ),
+        _dispatchOutboxMock.Verify(
+            outbox => outbox.StageAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ),
             Times.Never );
 
         _loggerMock.Verify(
@@ -147,8 +144,8 @@ public class JetStreamWatcherServiceTests {
         await service.HandleCommitRecordAsync( record, "app.bsky.feed.post", agent, TestContext.CancellationToken );
 
         // Assert: nothing enqueued
-        _queueMock.Verify(
-            q => q.EnqueueAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ),
+        _dispatchOutboxMock.Verify(
+            outbox => outbox.StageAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ),
             Times.Never );
 
         // Assert: the error log must NOT fire — null deserialization is handled by early-return
@@ -178,8 +175,8 @@ public class JetStreamWatcherServiceTests {
         await service.HandleCommitRecordAsync( record, "app.bsky.graph.follow", agent, TestContext.CancellationToken );
 
         // Assert
-        _queueMock.Verify(
-            q => q.EnqueueAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ),
+        _dispatchOutboxMock.Verify(
+            outbox => outbox.StageAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ),
             Times.Never );
 
         _loggerMock.Verify(
@@ -252,8 +249,8 @@ public class JetStreamWatcherServiceTests {
         await service.HandleCommitRecordAsync( record, "app.bsky.feed.repost", agent, TestContext.CancellationToken );
 
         // Assert: nothing enqueued — skipped cleanly
-        _queueMock.Verify(
-            q => q.EnqueueAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ),
+        _dispatchOutboxMock.Verify(
+            outbox => outbox.StageAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ),
             Times.Never );
 
         // Assert: the IsEnabled(true) stub ensures this Times.Never check is non-vacuous.
@@ -287,8 +284,8 @@ public class JetStreamWatcherServiceTests {
         await service.HandleCommitRecordAsync( record, "app.bsky.feed.repost", agent, TestContext.CancellationToken );
 
         // Assert: nothing enqueued — skipped cleanly
-        _queueMock.Verify(
-            q => q.EnqueueAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ),
+        _dispatchOutboxMock.Verify(
+            outbox => outbox.StageAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ),
             Times.Never );
 
         // Assert: the IsEnabled(true) stub ensures this Times.Never check is non-vacuous.
@@ -304,11 +301,35 @@ public class JetStreamWatcherServiceTests {
             Times.Never );
     }
 
+    /// <summary>A recognized firehose link is durably staged before immediate publication.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task EnqueueMusicLink_WithSpotifyUrl_StagesAndDispatchesBulkWork( ) {
+        JetStreamWatcherService service = CreateService( );
+
+        await service.EnqueueMusicLinkAsync(
+            "https://open.spotify.com/track/3n3Ppam7vgaVa1iaRUc9Lp",
+            TestContext.CancellationToken );
+
+        _dispatchOutboxMock.Verify( outbox => outbox.StageAsync(
+            It.Is<QueuedLookupRequest>( request =>
+                request.Provider == SupportedProviders.Spotify
+                && request.LookupType == LookupRequestType.SongIdLookup
+                && request.OriginPriority == QueuePriority.Bulk
+                && request.SagaInstanceToken == "jetstream-instance" ),
+            QueuePriority.Bulk,
+            TestContext.CancellationToken ), Times.Once );
+        _dispatchOutboxMock.Verify( outbox => outbox.DispatchAsync(
+            It.IsAny<string>( ),
+            SupportedProviders.Spotify,
+            TestContext.CancellationToken ), Times.Once );
+    }
+
     /// <summary>
     /// Builds a <see cref="JetStreamWatcherService"/> with mocked dependencies.
     /// </summary>
     private JetStreamWatcherService CreateService( ) =>
-        new( _loggerMock.Object, _queueResolverMock.Object, _sagaManagerMock.Object );
+        new( _loggerMock.Object, _sagaManagerMock.Object, _dispatchOutboxMock.Object );
 }
 
 #pragma warning restore CS1591

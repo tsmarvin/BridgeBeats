@@ -36,6 +36,12 @@ public interface IRefreshReviewStore {
     /// <summary>Clears the sweep observation count after a successful refresh.</summary>
     Task ClearSweepAttemptsAsync( string sourceRecordUri, CancellationToken cancellationToken = default );
 
+    /// <summary>Increments the targeted PDS-write failure count and returns the new value.</summary>
+    Task<int> IncrementTargetWriteAttemptAsync( string sourceRecordUri, CancellationToken cancellationToken = default );
+
+    /// <summary>Clears the targeted PDS-write failure count after a successful write.</summary>
+    Task ClearTargetWriteAttemptsAsync( string sourceRecordUri, CancellationToken cancellationToken = default );
+
     /// <summary>Lists all records currently awaiting operator review.</summary>
     Task<IReadOnlyList<RefreshReviewEntry>> GetUnresolvedAsync( CancellationToken cancellationToken = default );
 

@@ -26,7 +26,7 @@ RUN DOTNET_RID="linux-x64"; \
     DASHBOARD_PACKAGE_DIR=$(ls -d /root/.nuget/packages/aspire.dashboard.sdk.${DOTNET_RID}/* | sort -V | tail -n 1) && \
     cp -r "${DCP_PACKAGE_DIR}/tools"/* /build/publish/tools/dcp/ && \
     cp -r "${DASHBOARD_PACKAGE_DIR}/tools"/* /build/publish/tools/dashboard/ && \
-    chmod +x /build/publish/tools/dcp/dcp
+    chmod +x /build/publish/tools/dcp/dcp /build/publish/tools/dashboard/Aspire.Dashboard
 
 
 # Final runtime stage
@@ -54,11 +54,11 @@ RUN chown -R $APP_UID:$APP_UID /src && \
     chown -R $APP_UID:$APP_UID /app/ && \
     chown $APP_UID:$APP_UID /entrypoint.sh && \
     chmod +x /entrypoint.sh && \
-    chmod +x /app/tools/dcp/dcp
+    chmod +x /app/tools/dcp/dcp /app/tools/dashboard/Aspire.Dashboard
 
 USER $APP_UID
 
-# Aspire Dashboard configuration (13.1)
+# Aspire Dashboard configuration
 # Dashboard binds to all interfaces on 18888 for reverse proxy access
 # ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS disables all dashboard auth (Frontend, OTLP, MCP)
 # Auth is handled externally by Caddy forward_auth in production

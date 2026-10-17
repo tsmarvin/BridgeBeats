@@ -13,7 +13,7 @@ using BridgeBeats.Core.Infrastructure.Storage;
 using BridgeBeats.Web.Authentication;
 using BridgeBeats.Web.Middleware;
 using BridgeBeats.Web.Services;
-using idunno.Security;
+using idunno.Bluesky.AspNet.Authentication;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.EntityFrameworkCore;
@@ -192,6 +192,10 @@ namespace BridgeBeats.Web.Configuration {
             if (!app.Environment.IsDevelopment( )) {
                 _ = app.UseExceptionHandler( "/Home/Error" );
                 _ = app.UseHsts( );
+            }
+
+            if (!string.IsNullOrWhiteSpace( settings.Domain )) {
+                _ = app.UseBlueskyOAuthClientMetadata( );
             }
 
             _ = app.UseHttpsRedirection( );
@@ -423,7 +427,7 @@ namespace BridgeBeats.Web.Configuration {
 
         /// <summary>
         /// Singleton factory that injects the token protector into every <see cref="ApplicationDbContext"/>
-        /// it creates, enabling the EF value converter for the four credential columns at rest.
+        /// it creates, enabling the EF value converter for the Apple Music credential column at rest.
         /// Thread-safe: <c>CreateDbContext</c> allocates a new context per call; the shared options and
         /// protector are immutable.
         /// </summary>
@@ -451,14 +455,8 @@ namespace BridgeBeats.Web.Configuration {
         /// <param name="services">The service collection to populate.</param>
         /// <param name="settings">The settings supplying the Data Protection key path and domain.</param>
         private static void ConfigureIdentity( IServiceCollection services, AppSettings settings ) {
-            // Use the centralized Identity configuration from Infrastructure project.
-            // This registers Data Protection (shared with workers), Identity Core, and
-            // AddPersonalDataProtection — which makes IPersonalDataProtector available for the ATProto
-            // OAuth service's OAuth-state encrypt/decrypt path. The four credential columns
-            // (AppleMusicUserToken, AtProtoAccessToken, AtProtoRefreshToken, AtProtoDPoPKey) are
-            // encrypted separately via the EF value converter in ApplicationDbContext.OnModelCreating
-            // using a dedicated IDataProtector with purpose BridgeBeats.ApplicationUser.Tokens.v1 —
-            // not via [ProtectedPersonalData], which has been removed from those fields.
+            // Identity and SDK OAuth stores share the persisted Data Protection key ring.
+            // ApplicationDbContext separately encrypts the Apple Music user token.
             _ = services.AddBridgeBeatsIdentity( settings.DataProtectionKeyPath );
 
             _ = services.ConfigureApplicationCookie( options => {
@@ -524,7 +522,10 @@ namespace BridgeBeats.Web.Configuration {
                         ? InternalServiceDefaults.AuthenticationScheme
                         : context.Request.Headers.ContainsKey( "X-API-Key" )
                             ? ApiKeyDefaults.AuthenticationScheme
-                            : IdentityConstants.ApplicationScheme;
+                            : !string.IsNullOrWhiteSpace( settings.Domain ) &&
+                              context.Request.Cookies.ContainsKey( BlueskyAuthenticationConfiguration.CookieName )
+                                ? BlueskyAuthenticationDefaults.AuthenticationScheme
+                                : IdentityConstants.ApplicationScheme;
             } )
             .AddApiKeyInHeader<ApiKeyProvider>( options => {
                 options.Realm = "BridgeBeats API";
@@ -577,9 +578,8 @@ namespace BridgeBeats.Web.Configuration {
 
         /// <summary>
         /// Wires the ATProto integration when configured. When a domain is set, registers the OAuth signing
-        /// key (if its JWK file exists and is non-empty), the SSRF-guarded OAuth HTTP client, the OAuth
-        /// service, and the OAuth state cleanup hosted service. When service-account credentials are also
-        /// present, validates the user DID and registers the session manager, storage, media-link cache,
+        /// keys, SDK authentication handler, persistent SQLite stores and generated client metadata.
+        /// When service-account credentials are also present, validates the user DID and registers the session manager, storage, media-link cache,
         /// statistics services, and queue infrastructure.
         /// </summary>
         /// <param name="services">The service collection to populate.</param>
@@ -591,37 +591,7 @@ namespace BridgeBeats.Web.Configuration {
             if (!string.IsNullOrWhiteSpace( domainWithScheme )) {
                 string clientId = $"{domainWithScheme}/.well-known/client-metadata.json";
 
-                // Load the OAuth signing key for confidential client authentication if configured
-                ATProtoSigningKeyProvider? signingKeyProvider = null;
-                if (!string.IsNullOrWhiteSpace( settings.ATProtoOAuthSigningKeyPath ) &&
-                    File.Exists( settings.ATProtoOAuthSigningKeyPath )) {
-                    string jwkJson = File.ReadAllText( settings.ATProtoOAuthSigningKeyPath );
-                    if (!string.IsNullOrWhiteSpace( jwkJson ) && jwkJson.Trim( ) != "{}") {
-                        signingKeyProvider = new ATProtoSigningKeyProvider( jwkJson );
-                    }
-                }
-
-                // Register the signing key provider as a singleton (used by WellKnownController for JWKS endpoint)
-                if (signingKeyProvider is not null) {
-                    _ = services.AddSingleton( signingKeyProvider );
-                }
-
-                // Register HTTP client for OAuth token endpoint with standard resilience
-                _ = services.AddATProtoOAuthHttpClient( );
-
-                _ = services.AddScoped<IATProtoOAuthService>( sp =>
-                    new ATProtoOAuthService(
-                        sp.GetRequiredService<IDbContextFactory<ApplicationDbContext>>( ),
-                        sp.GetRequiredService<ILogger<ATProtoOAuthService>>( ),
-                        clientId,
-                        sp.GetRequiredService<IHttpClientFactory>( ),
-                        sp.GetRequiredService<IPersonalDataProtector>( ),
-                        signingKeyProvider
-                    )
-                );
-
-                // Register background service for cleaning up expired OAuth states
-                _ = services.AddHostedService<OAuthStateCleanupService>( );
+                _ = services.AddBridgeBeatsBluesky( settings, clientId, domainWithScheme );
             }
 
             if (string.IsNullOrWhiteSpace( settings.ATProtoIdentifier ) ||
@@ -656,23 +626,6 @@ namespace BridgeBeats.Web.Configuration {
             _ = services.AddAllProviderQueues<QueuedLookupRequest>( );
             _ = services.AddScoped<IRefreshReviewDispositionService, RefreshReviewDispositionService>( );
 
-        }
-
-        // SSRF guard (default block-list): auth-server metadata + token-endpoint hosts are
-        // derived from an attacker-supplied handle on the anonymous POST account/login-atproto
-        // path, so gate outbound connects at the socket layer.
-        /// <summary>
-        /// Registers the named <c>ATProtoOAuth</c> HTTP client with an SSRF-guarded primary handler (10-second
-        /// connect timeout) and the standard resilience pipeline.
-        /// </summary>
-        /// <param name="services">The service collection to populate.</param>
-        /// <returns>The HTTP client builder for the registered client.</returns>
-        internal static IHttpClientBuilder AddATProtoOAuthHttpClient( this IServiceCollection services ) {
-            IHttpClientBuilder builder = services.AddHttpClient( "ATProtoOAuth" )
-                .ConfigurePrimaryHttpMessageHandler( ( ) =>
-                    SsrfSocketsHttpHandlerFactory.Create( connectTimeout: TimeSpan.FromSeconds( 10 ) ) );
-            _ = builder.AddStandardResilienceHandler( );
-            return builder;
         }
 
         /// <summary>

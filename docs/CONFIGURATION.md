@@ -43,7 +43,22 @@ The installation script auto-generates `internal_service_key.txt`. When configur
 
 \* Required only when using ATProto PDS storage for caching lookup results. See the [ATProto Lexicon Resolution Setup Guide](ATPROTO_LEXICON.md) for complete configuration instructions.
 
-The ATProto OAuth signing key is supplied separately as the `atproto_oauth_key` Docker secret (an ES256 JWK). The container reads it from `/run/secrets/atproto_oauth_key`; the application setting is `ATProtoOAuthSigningKeyPath`. When the file is absent, empty, or `{}`, the ATProto OAuth service runs as a public client.
+The ATProto OAuth signing key is supplied separately as the `atproto_oauth_key` Docker secret. The container reads it from `/run/secrets/atproto_oauth_key`; the application setting is `ATProtoOAuthSigningKeyPath`. Existing ES256 JWK files remain supported, including their original key IDs. Unencrypted P-256 PEM keys are also accepted. When the file is absent, empty, or `{}`, OAuth runs as a public client.
+
+Bluesky sign-in uses `idunno.Bluesky.AspNet.Authentication` with the SQLite identity and correlation stores in the existing Identity database. Its credentials and pending-login secrets are encrypted with the shared ASP.NET Data Protection key ring. Keep both the database and `DataProtectionKeyPath` persistent across restarts. Access tokens are refreshed by the authentication handler as requests arrive, with SQLite refresh locks coordinating concurrent requests and instances.
+
+The requested permissions are `atproto repo:link.bridgebeats.playlist`. The required `atproto` scope identifies the account by its stable DID; BridgeBeats maps that DID to its existing local user ID, so changes to a handle retain the same account and API keys. The playlist scope permits records in the BridgeBeats playlist collection. Profile permissions and broad Bluesky app permissions are not requested.
+
+The SDK publishes generated client metadata at `/.well-known/client-metadata.json`, including public signing keys inline in `jwks` for confidential clients. This replaces the former separate `/.well-known/jwks.json` endpoint. The callback remains `/account/atproto-callback`.
+
+For signing-key rotation, configure previous JWK or PEM file paths in `BridgeBeats:ATProtoOAuthAdditionalSigningKeyPaths`. Keep each old key available until sessions created with it have expired. Mount these files in the container, update `ATProtoOAuthSigningKeyPath` to the new active key, and restart every instance after changing the configuration. New sessions use the active key; refresh and revocation of existing sessions use their recorded key ID. For example:
+
+```json
+"ATProtoOAuthSigningKeyPath": "/run/secrets/atproto_oauth_key",
+"ATProtoOAuthAdditionalSigningKeyPaths": [ "/run/secrets/atproto_oauth_previous_key" ]
+```
+
+When upgrading from the custom OAuth implementation, the application applies a migration that creates the SDK stores and removes the old pending-login table and user-token columns. Users, DIDs, API keys, playlists and Apple Music credentials are retained. Existing Bluesky users must sign in again to establish an SDK-managed OAuth session; logins already in progress must be restarted. Back up the database and Data Protection keys before deployment. Rolling the schema back cannot restore removed OAuth credentials.
 
 ### Discord Worker Configuration
 

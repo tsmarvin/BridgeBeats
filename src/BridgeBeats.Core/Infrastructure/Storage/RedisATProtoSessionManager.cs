@@ -261,7 +261,7 @@ public sealed partial class RedisATProtoSessionManager : IATProtoSessionManager,
 
         try {
             // Double-check after acquiring the distributed lock: another process may have
-            // refreshed and the in-process _agent may have been updated via OnCredentialsUpdated.
+            // refreshed and the in-process _agent may have been updated via the awaited credential callback.
             if (_agent is { IsAuthenticated: true }) {
                 return _agent;
             }
@@ -418,64 +418,20 @@ public sealed partial class RedisATProtoSessionManager : IATProtoSessionManager,
     /// </summary>
     /// <param name="agent">The agent to subscribe to.</param>
     private void SubscribeToAgentEvents( BlueskyAgent agent ) {
-        agent.Authenticated += OnAuthenticated;
-        agent.CredentialsUpdated += OnCredentialsUpdated;
+        agent.CredentialsUpdatedAsync = async ( args, cancellationToken ) => {
+            // Pending agents are persisted explicitly by login/restore while this gate is held.
+            if (!ReferenceEquals( agent, _agent ) || args.AccessCredentials is null) { return; }
+            await _agentLock.WaitAsync( cancellationToken );
+            try {
+                if (ReferenceEquals( agent, _agent )) {
+                    await PersistCredentialsAsync( args.AccessCredentials );
+                }
+            } finally {
+                _ = _agentLock.Release( );
+            }
+        };
         agent.TokenRefreshFailed += OnTokenRefreshFailed;
         agent.Unauthenticated += OnUnauthenticated;
-    }
-
-    /// <summary>
-    /// Handles the agent's authenticated event by persisting the new credentials to Redis on a
-    /// background task.
-    /// </summary>
-    /// <param name="sender">The agent that raised the event.</param>
-    /// <param name="e">The event arguments.</param>
-    private void OnAuthenticated( object? sender, AuthenticatedEventArgs e ) {
-        LogAgentAuthenticated( _identifier );
-
-        if (sender is BlueskyAgent agent) {
-            // Fire and forget - don't block the event
-            _ = Task.Run( async ( ) => {
-                try {
-                    await PersistCredentialsFromAgentAsync( agent );
-                } catch (Exception ex) {
-                    LogPersistAfterAuthFailed( ex, _identifier );
-                }
-            } );
-        }
-    }
-
-    /// <summary>
-    /// Handles the agent's credentials-updated event (for example after a token refresh) by
-    /// persisting the updated credentials, but only when the event came from the currently adopted
-    /// agent.
-    /// </summary>
-    /// <param name="sender">The agent that raised the event.</param>
-    /// <param name="e">The event arguments.</param>
-    private void OnCredentialsUpdated( object? sender, CredentialsUpdatedEventArgs e ) {
-        LogCredentialsUpdated( _identifier );
-
-        if (sender is BlueskyAgent agent) {
-            // Check if this agent is still the current agent before persisting
-            // This prevents ObjectDisposedException when a stale agent fires events
-            if (!ReferenceEquals( agent, _agent )) {
-                return;
-            }
-
-            // Fire and forget - don't block the event
-            _ = Task.Run( async ( ) => {
-                try {
-                    // Double-check inside the task in case agent was swapped during scheduling
-                    if (!ReferenceEquals( agent, _agent )) {
-                        return;
-                    }
-
-                    await PersistCredentialsFromAgentAsync( agent );
-                } catch (Exception ex) {
-                    LogPersistUpdateFailed( ex, _identifier );
-                }
-            } );
-        }
     }
 
     /// <summary>
@@ -605,7 +561,10 @@ public sealed partial class RedisATProtoSessionManager : IATProtoSessionManager,
             return;
         }
 
-        AccessCredentials credentials = agent.Credentials;
+        await PersistCredentialsAsync( agent.Credentials );
+    }
+
+    private async Task PersistCredentialsAsync( AccessCredentials credentials ) {
 
         // Extract DPoP fields if available
         string? dPoPProofKey = null;

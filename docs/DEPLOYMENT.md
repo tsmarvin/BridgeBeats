@@ -243,7 +243,7 @@ NODE_NUMBER=1
 All persistent state lives under the host `./data/` bind-mount tree, alongside `./secrets/` and `.env`. Backup is a host-side file copy — no `docker cp` is needed.
 
 Key paths:
-- `./data/app/bridgebeats.db` — SQLite Identity store (users, API keys, ATProto OAuth state)
+- `./data/app/bridgebeats.db` — SQLite Identity store (users, API keys, encrypted Bluesky OAuth credentials and login state)
 - `./data/dp-keys/` — Data Protection key ring (losing these forces a session re-auth for all users)
 - `./data/pds/` — PDS repo SQLite databases, DID/key material, and blob store
 - `./data/redis/` — Redis AOF/RDB persistence (cache, queue, rate-limit, saga state)

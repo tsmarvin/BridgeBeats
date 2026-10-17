@@ -1,4 +1,7 @@
 using System.Net;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using idunno.AtProto.Authentication;
 using System.Reflection;
 using System.Text.Json;
 using BridgeBeats.Contracts.Records;
@@ -100,6 +103,32 @@ public class RedisATProtoSessionManagerTests {
         // Default: persist/clear succeed
         SetupPersist( );
         SetupClear( );
+    }
+
+    /// <summary>Credential updates await durable persistence and surface Redis failures to the SDK.</summary>
+    [TestMethod]
+    public async Task CredentialUpdates_AwaitPersistence_AndSurfaceFailures( ) {
+        using RedisATProtoSessionManager manager = CreateManager( );
+        using DisposableTrackingAgent agent = new( );
+        SetAgent( manager, agent );
+        SubscribeToAgentEvents( manager, agent );
+        Assert.IsNotNull( agent.CredentialsUpdatedAsync );
+        TaskCompletionSource<bool> stored = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        _ = _dbMock.Setup( d => d.StringSetAsync( It.IsAny<RedisKey>( ), It.IsAny<RedisValue>( ),
+            It.IsAny<Expiration>( ), It.IsAny<ValueCondition>( ), It.IsAny<CommandFlags>( ) ) ).Returns( stored.Task );
+        string jwt = new JwtSecurityTokenHandler( ).WriteToken( new JwtSecurityToken(
+            claims: [new Claim( "sub", TestDid )], expires: DateTime.UtcNow.AddHours( 1 ) ) );
+        AccessCredentials credentials = new( new Uri( "https://pds.example" ), AuthenticationType.UsernamePassword, jwt, "rotated-refresh" );
+        CredentialsUpdatedEventArgs args = new( credentials.Did, credentials.Service, credentials );
+        Task persistence = agent.CredentialsUpdatedAsync( args, TestContext.CancellationToken );
+        Assert.IsFalse( persistence.IsCompleted, "The SDK must wait for the Redis write." );
+        stored.SetResult( true );
+        await persistence;
+        _ = _dbMock.Setup( d => d.StringSetAsync( It.IsAny<RedisKey>( ), It.IsAny<RedisValue>( ),
+            It.IsAny<Expiration>( ), It.IsAny<ValueCondition>( ), It.IsAny<CommandFlags>( ) ) )
+            .ThrowsAsync( new InvalidOperationException( "Redis unavailable" ) );
+        _ = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            ( ) => agent.CredentialsUpdatedAsync( args, TestContext.CancellationToken ) );
     }
 
     /// <summary>

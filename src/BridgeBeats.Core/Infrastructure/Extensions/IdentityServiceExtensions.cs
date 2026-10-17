@@ -32,10 +32,7 @@ namespace BridgeBeats.Core.Infrastructure.Extensions {
         /// level. It adds roles, the Entity Framework user store backed by the application database
         /// context, the sign-in manager, default token providers, and personal-data protection. The
         /// <see cref="DataProtectionLookupProtector"/> and <see cref="DataProtectionKeyRing"/> are
-        /// registered so that <c>IPersonalDataProtector</c> is available — it is used by the ATProto
-        /// OAuth service to protect and unprotect OAuth-state fields. Column-level token encryption for
-        /// the four credential fields (<c>AppleMusicUserToken</c>, <c>AtProtoAccessToken</c>,
-        /// <c>AtProtoRefreshToken</c>, <c>AtProtoDPoPKey</c>) uses a separate
+        /// registered for Identity personal-data support. The Apple Music token uses a separate
         /// <c>IDataProtector</c> wired in <c>ApplicationDbContext.OnModelCreating</c> via a value
         /// converter — not <c>[ProtectedPersonalData]</c>. A scoped application database context is
         /// also registered, created from the registered context factory.

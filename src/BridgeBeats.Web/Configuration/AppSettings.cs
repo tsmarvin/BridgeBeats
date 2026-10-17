@@ -134,11 +134,15 @@ namespace BridgeBeats.Web.Configuration {
         }
 
         /// <summary>
-        /// Filesystem path to the JWK file holding the ATProto OAuth client-assertion signing key. When the
+        /// Filesystem path to the JWK or PEM file holding the ATProto OAuth client signing key. When the
         /// file is absent, empty, or <c>{}</c>, client-assertion signing is not configured and the ATProto
         /// OAuth service operates as a public client.
         /// </summary>
         public string ATProtoOAuthSigningKeyPath { get; set; } = string.Empty;
+
+        /// <summary>Previous OAuth signing keys retained for refresh and revocation of existing sessions.</summary>
+        public string[] ATProtoOAuthAdditionalSigningKeyPaths { get; set; } = [];
+
 
         /// <summary>
         /// Directory where application log files are written. Defaults to <c>./logs</c>.

@@ -4,7 +4,7 @@ namespace BridgeBeats.Contracts.Records;
 
 /// <summary>
 /// The persisted, serialized form of a user's AT Protocol credentials, written to storage
-/// as camelCase JSON. This is the at-rest counterpart to the live <see cref="ATProtoOAuthResult"/>
+/// as camelCase JSON. This is the at-rest counterpart to the live end-user OAuth credentials
 /// produced during an OAuth exchange.
 /// </summary>
 /// <remarks>

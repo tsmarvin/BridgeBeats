@@ -6,6 +6,7 @@ using System.Net.Http.Json;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text.Json;
+using BridgeBeats.Contracts.Constants;
 using BridgeBeats.Core.Infrastructure.Extensions;
 using BridgeBeats.Core.Infrastructure.Identity;
 using BridgeBeats.Web.Authentication;
@@ -79,7 +80,9 @@ public class BlueskyAuthenticationIntegrationTests {
         _service = _authorizationServer.Urls.Single( ).TrimEnd( '/' );
         _oauth.Service = _service;
         _oauth.TokenFactory = ( ) => CreateCredentials( DateTime.UtcNow.AddHours( 1 ), "rotated-refresh" ).AccessJwt;
-        WebApplicationBuilder builder = WebApplication.CreateBuilder( );
+        WebApplicationBuilder builder = WebApplication.CreateBuilder( new WebApplicationOptions {
+            WebRootPath = Path.GetFullPath( Path.Combine( AppContext.BaseDirectory, "../../../../src/BridgeBeats.Web/wwwroot" ) )
+        } );
         builder.Configuration["AllowedHosts"] = "*";
         builder.Logging.ClearProviders( );
         _ = builder.Logging.AddConsole( );
@@ -106,7 +109,7 @@ public class BlueskyAuthenticationIntegrationTests {
         _ = builder.Services.AddSingleton( _handles.Object );
         AppSettings settings = new( ) { IdentityConnectionString = connection, Domain = "bridgebeats.example" };
         _ = builder.Services.AddBridgeBeatsBluesky( settings,
-            "https://bridgebeats.example/.well-known/client-metadata.json", "https://bridgebeats.example" );
+            "https://bridgebeats.example" + BlueskyAuthenticationConfiguration.ClientMetadataPath, "https://bridgebeats.example" );
         _ = builder.Services.PostConfigure<BlueskyAgentOptions>( options => {
             options.OAuthOptions!.AllowInsecureProtocols = true;
             options.OAuthOptions.AllowLoopback = true;
@@ -116,6 +119,7 @@ public class BlueskyAuthenticationIntegrationTests {
         _ = builder.Services.AddSingleton<IHttpClientFactory>( new TestHttpClientFactory( _oauth ) );
         _app = builder.Build( );
         _ = _app.UseBlueskyOAuthClientMetadata( );
+        _ = _app.UseStaticFiles( );
         // Metadata is generated from the production URLs above. The SDK's discovery development mode
         // additionally requires an HTTP callback when talking to the local HTTP authorization server.
         _app.Services.GetRequiredService<IOptionsMonitor<BlueskyAgentOptions>>( ).CurrentValue.OAuthOptions!.ReturnUri = new Uri( _service + "/account/atproto-callback" );
@@ -134,6 +138,7 @@ public class BlueskyAuthenticationIntegrationTests {
             agentAuthenticated = agent.IsAuthenticated
         } ) );
         _ = _app.MapControllers( );
+        _ = _app.MapDefaultControllerRoute( );
         await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
             ApplicationDbContext db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>( );
             await db.Database.MigrateAsync( TestContext.CancellationToken );
@@ -299,12 +304,34 @@ public class BlueskyAuthenticationIntegrationTests {
 
     [TestMethod]
     public async Task Metadata_DeclaresIdentityAndOnlyPlaylistPermissions( ) {
-        JsonElement metadata = await _client.GetFromJsonAsync<JsonElement>( "/.well-known/client-metadata.json", TestContext.CancellationToken );
+        JsonElement metadata = await _client.GetFromJsonAsync<JsonElement>( "/oauth-client-metadata.json", TestContext.CancellationToken );
+        Assert.AreEqual( "https://bridgebeats.example/oauth-client-metadata.json", metadata.GetProperty( "client_id" ).GetString( ) );
+        Assert.AreEqual( "BridgeBeats", metadata.GetProperty( "client_name" ).GetString( ) );
+        Assert.AreEqual( "https://bridgebeats.example", metadata.GetProperty( "client_uri" ).GetString( ) );
         Assert.AreEqual( "atproto repo:link.bridgebeats.playlist", metadata.GetProperty( "scope" ).GetString( ) );
         Assert.AreEqual( "none", metadata.GetProperty( "token_endpoint_auth_method" ).GetString( ) );
         Assert.AreEqual( "https://bridgebeats.example/account/atproto-callback", metadata.GetProperty( "redirect_uris" )[0].GetString( ) );
-        using HttpResponseMessage head = await _client.SendAsync( new HttpRequestMessage( HttpMethod.Head, "/.well-known/client-metadata.json" ), TestContext.CancellationToken );
+        using HttpResponseMessage head = await _client.SendAsync( new HttpRequestMessage( HttpMethod.Head, "/oauth-client-metadata.json" ), TestContext.CancellationToken );
         Assert.AreEqual( HttpStatusCode.OK, head.StatusCode );
+    }
+
+    [TestMethod]
+    public async Task Metadata_AdvertisesReachableLogoAndDistinctLegalPages( ) {
+        JsonElement metadata = await _client.GetFromJsonAsync<JsonElement>( "/oauth-client-metadata.json", TestContext.CancellationToken );
+        Uri logo = new( metadata.GetProperty( "logo_uri" ).GetString( )! );
+        Assert.AreEqual( "https://bridgebeats.example/public/Icons/BridgeBeats_FullColor.svg", logo.AbsoluteUri );
+        using HttpResponseMessage image = await _client.GetAsync( logo.PathAndQuery, TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.OK, image.StatusCode );
+        Assert.AreEqual( "image/svg+xml", image.Content.Headers.ContentType?.MediaType );
+        Assert.Contains( "<svg", await image.Content.ReadAsStringAsync( TestContext.CancellationToken ) );
+        Uri terms = new( metadata.GetProperty( "tos_uri" ).GetString( )! );
+        Uri privacy = new( metadata.GetProperty( "policy_uri" ).GetString( )! );
+        Assert.AreEqual( "/Home/Tos", terms.AbsolutePath );
+        Assert.AreEqual( "/Home/Privacy", privacy.AbsolutePath );
+        using HttpResponseMessage termsPage = await _client.GetAsync( terms.PathAndQuery, TestContext.CancellationToken );
+        using HttpResponseMessage privacyPage = await _client.GetAsync( privacy.PathAndQuery, TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.OK, termsPage.StatusCode );
+        Assert.AreEqual( HttpStatusCode.OK, privacyPage.StatusCode );
     }
 
     [TestMethod]
@@ -316,11 +343,16 @@ public class BlueskyAuthenticationIntegrationTests {
         }
         JsonElement who = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
         Assert.IsFalse( who.GetProperty( "authenticated" ).GetBoolean( ) );
-        Assert.IsNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+        Assert.IsFalse( who.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+        Assert.AreEqual( 0, _oauth.Revocations, "A stale reference cannot authorize session cleanup; account deletion performs that cleanup explicitly." );
     }
 
     [TestMethod]
-    public async Task DeletedAndRecreatedAccount_RejectsOldCookieWithoutRevokingReplacementSession( ) {
+    [DataRow( false, false )]
+    [DataRow( true, false )]
+    [DataRow( false, true )]
+    [DataRow( true, true )]
+    public async Task DeletedAndRecreatedAccount_RejectsOldCookieWithoutRevokingReplacementSession( bool expired, bool logout ) {
         using HttpResponseMessage originalLogin = await SignInAsync( );
         string oldCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
         string originalId = await LocalUserIdAsync( );
@@ -334,6 +366,14 @@ public class BlueskyAuthenticationIntegrationTests {
         string replacementId = await LocalUserIdAsync( );
         Assert.AreNotEqual( originalId, replacementId );
         int revocations = _oauth.Revocations;
+        int refreshes = _oauth.Refreshes;
+        await Options( ).IdentityStore!.Update( CreateCredentials( DateTime.UtcNow.AddMinutes( -1 ) ), TestContext.CancellationToken );
+
+        if (expired) {
+            AuthenticationTicket ticket = Options( ).TicketDataFormat.Unprotect( oldCookie.Split( '=', 2 )[1] )!;
+            ticket.Properties.ExpiresUtc = DateTimeOffset.UtcNow.AddMinutes( -1 );
+            oldCookie = BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket );
+        }
 
         _client.DefaultRequestHeaders.Remove( "Cookie" );
         _client.DefaultRequestHeaders.Add( "Cookie", oldCookie );
@@ -341,7 +381,14 @@ public class BlueskyAuthenticationIntegrationTests {
         Assert.IsFalse( replay.GetProperty( "authenticated" ).GetBoolean( ) );
         Assert.IsNull( replay.GetProperty( "userId" ).GetString( ) );
         Assert.IsFalse( replay.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+        if (logout) {
+            // Keep replaying the original request cookie even after the response clears it.
+            await AddAntiforgeryHeaderAsync( );
+            using HttpResponseMessage result = await _client.PostAsync( "/account/logout", null, TestContext.CancellationToken );
+            Assert.AreEqual( HttpStatusCode.OK, result.StatusCode );
+        }
         Assert.AreEqual( revocations, _oauth.Revocations, "An obsolete cookie must not revoke the replacement account's credentials." );
+        Assert.AreEqual( refreshes, _oauth.Refreshes, "An obsolete cookie must not refresh the replacement account's credentials." );
         Assert.IsNotNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
 
         _client.DefaultRequestHeaders.Remove( "Cookie" );
@@ -352,8 +399,13 @@ public class BlueskyAuthenticationIntegrationTests {
     }
 
     [TestMethod]
-    public async Task ChangedSecurityStamp_RejectsOldCookieAndAllowsFreshSignIn( ) {
+    [DataRow( false, false )]
+    [DataRow( true, false )]
+    [DataRow( false, true )]
+    [DataRow( true, true )]
+    public async Task ChangedSecurityStamp_RejectsOldCookieAndAllowsFreshSignIn( bool expired, bool logout ) {
         using HttpResponseMessage originalLogin = await SignInAsync( );
+        string oldCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
         string id = await LocalUserIdAsync( );
         await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
             UserManager<ApplicationUser> users = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>( );
@@ -365,9 +417,76 @@ public class BlueskyAuthenticationIntegrationTests {
         Assert.IsFalse( replay.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
 
         using HttpResponseMessage freshLogin = await SignInAsync( );
+        string freshCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        int revocations = _oauth.Revocations;
+        if (expired) {
+            AuthenticationTicket ticket = Options( ).TicketDataFormat.Unprotect( oldCookie.Split( '=', 2 )[1] )!;
+            ticket.Properties.ExpiresUtc = DateTimeOffset.UtcNow.AddMinutes( -1 );
+            oldCookie = BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket );
+        }
+        _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", oldCookie );
+        JsonElement obsolete = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsFalse( obsolete.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.IsFalse( obsolete.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+        if (logout) {
+            await AddAntiforgeryHeaderAsync( );
+            using HttpResponseMessage result = await _client.PostAsync( "/account/logout", null, TestContext.CancellationToken );
+            Assert.AreEqual( HttpStatusCode.OK, result.StatusCode );
+        }
+        Assert.AreEqual( revocations, _oauth.Revocations );
+        Assert.IsNotNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+        _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", freshCookie );
         JsonElement current = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
         Assert.IsTrue( current.GetProperty( "authenticated" ).GetBoolean( ) );
         Assert.AreEqual( id, current.GetProperty( "userId" ).GetString( ) );
+    }
+
+    [TestMethod]
+    public async Task ExpiredCookie_RejectsWithoutRevokingNewerSessionForSameAccount( ) {
+        using HttpResponseMessage login = await SignInAsync( );
+        string cookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        AuthenticationTicket ticket = Options( ).TicketDataFormat.Unprotect( cookie.Split( '=', 2 )[1] )!;
+        ticket.Properties.ExpiresUtc = DateTimeOffset.UtcNow.AddMinutes( -1 );
+        _client.DefaultRequestHeaders.Remove( "Cookie" );
+        using HttpResponseMessage freshLogin = await SignInAsync( );
+        _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket ) );
+        JsonElement replay = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsFalse( replay.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.IsFalse( replay.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+        Assert.AreEqual( 0, _oauth.Revocations );
+        Assert.IsNotNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+    }
+
+    [TestMethod]
+    [DataRow( false )]
+    [DataRow( true )]
+    public async Task DashboardSubdomain_ReceivesBlueskyCookieAndRequiresDashboardRole( bool hasRole ) {
+        using HttpResponseMessage login = await SignInAsync( );
+        string cookie = login.Headers.GetValues( "Set-Cookie" )
+            .Single( c => c.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=", StringComparison.Ordinal ) );
+        CookieContainer browser = new( );
+        browser.SetCookies( _client.BaseAddress!, cookie );
+        Uri dashboard = new( "https://dashboard.bridgebeats.example/api/dashboard/authorize" );
+        string dashboardCookies = browser.GetCookieHeader( dashboard );
+        Assert.StartsWith( "__Secure-", BlueskyAuthenticationConfiguration.CookieName );
+        Assert.Contains( BlueskyAuthenticationConfiguration.CookieName + "=", dashboardCookies );
+        Assert.AreEqual( "", browser.GetCookieHeader( new Uri( "https://unrelated.example" ) ) );
+        if (hasRole) {
+            await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
+            RoleManager<IdentityRole> roles = scope.ServiceProvider.GetRequiredService<RoleManager<IdentityRole>>( );
+            Assert.IsTrue( (await roles.CreateAsync( new IdentityRole( Roles.AspireDashboardAccess ) )).Succeeded );
+            UserManager<ApplicationUser> users = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>( );
+            ApplicationUser user = (await users.FindByIdAsync( await LocalUserIdAsync( ) ))!;
+            Assert.IsTrue( (await users.AddToRoleAsync( user, Roles.AspireDashboardAccess )).Succeeded );
+        }
+        _client.DefaultRequestHeaders.Remove( "Cookie" );
+        using HttpRequestMessage request = new( HttpMethod.Get, dashboard );
+        request.Headers.Add( "Cookie", dashboardCookies );
+        using HttpResponseMessage authorization = await _client.SendAsync( request, TestContext.CancellationToken );
+        Assert.AreEqual( hasRole ? HttpStatusCode.OK : HttpStatusCode.Forbidden, authorization.StatusCode );
     }
 
     [TestMethod]
@@ -599,9 +718,11 @@ public class BlueskyAuthenticationIntegrationTests {
         JsonElement data = await tokenResponse.Content.ReadFromJsonAsync<JsonElement>( TestContext.CancellationToken );
         string cookies = _client.DefaultRequestHeaders.TryGetValues( "Cookie", out IEnumerable<string>? existing )
             ? existing.Single( ) + "; " : "";
-        cookies += tokenResponse.Headers.GetValues( "Set-Cookie" ).First( ).Split( ';' )[0];
+        cookies += tokenResponse.Headers.GetValues( "Set-Cookie" )
+            .Single( c => c.StartsWith( ".AspNetCore.Antiforgery.", StringComparison.Ordinal ) ).Split( ';' )[0];
         _client.DefaultRequestHeaders.Remove( "Cookie" );
         _client.DefaultRequestHeaders.Add( "Cookie", cookies );
+        _client.DefaultRequestHeaders.Remove( "X-XSRF-TOKEN" );
         _client.DefaultRequestHeaders.Add( "X-XSRF-TOKEN", data.GetProperty( "token" ).GetString( ) );
     }
 

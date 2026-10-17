@@ -92,6 +92,11 @@ public sealed class BlueskyAccountEvents(
             : users.Users.SingleOrDefaultAsync( u => u.AtProtoDid == did, cancellationToken );
     }
 
+    internal async Task<bool> HasCurrentAccountBindingAsync( AuthenticationTicket ticket, CancellationToken cancellationToken ) {
+        ApplicationUser? user = await FindUserAsync( ticket.Principal, cancellationToken );
+        return user is not null && await HasCurrentAccountBindingAsync( user, ticket.Properties );
+    }
+
     private async Task<bool> HasCurrentAccountBindingAsync( ApplicationUser user, AuthenticationProperties properties ) =>
         properties.GetString( UserIdProperty ) == user.Id &&
         properties.GetString( SecurityStampProperty ) is { Length: > 0 } stamp &&

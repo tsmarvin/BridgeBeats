@@ -14,9 +14,18 @@ public sealed partial class BlueskySessionService(
     IHttpClientFactory httpClients,
     ILogger<BlueskySessionService> logger
 ) {
-    /// <summary>Revokes the session named by the browser's Bluesky cookie and clears that cookie.</summary>
-    public Task SignOutAsync( HttpContext context ) =>
-        context.SignOutAsync( BlueskyAuthenticationDefaults.AuthenticationScheme );
+    /// <summary>Revokes an authenticated Bluesky session, or only clears an invalid browser cookie.</summary>
+    public async Task SignOutAsync( HttpContext context ) {
+        string scheme = BlueskyAuthenticationDefaults.AuthenticationScheme;
+        AuthenticateResult result = await context.AuthenticateAsync( scheme );
+        if (result.Succeeded) {
+            await context.SignOutAsync( scheme );
+        } else {
+            // The SDK falls back to the original request cookie's DID even after authentication rejects it.
+            BlueskyAuthenticationOptions options = authenticationOptions.Get( scheme );
+            options.CookieManager.DeleteCookie( context, options.Cookie.Name!, options.Cookie.Build( context ) );
+        }
+    }
 
     /// <summary>Removes a linked account's stored credentials, including when deletion uses an API key.</summary>
     public async Task RemoveAsync( string? did ) {

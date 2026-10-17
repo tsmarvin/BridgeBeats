@@ -589,7 +589,7 @@ namespace BridgeBeats.Web.Configuration {
             // This allows users to log in with Bluesky for playlist management
             string? domainWithScheme = AppSettings.NormalizeDomain( settings.Domain );
             if (!string.IsNullOrWhiteSpace( domainWithScheme )) {
-                string clientId = $"{domainWithScheme}/.well-known/client-metadata.json";
+                string clientId = $"{domainWithScheme}{BlueskyAuthenticationConfiguration.ClientMetadataPath}";
 
                 _ = services.AddBridgeBeatsBluesky( settings, clientId, domainWithScheme );
             }

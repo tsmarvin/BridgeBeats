@@ -21,7 +21,7 @@ public class BlueskySigningKeyConfigurationTests {
             using JsonDocument source = JsonDocument.Parse( originalJwk );
             OAuthClientSigningKey active = BlueskyAuthenticationConfiguration.LoadSigningKey( activePath, optional: false )!;
             Assert.AreEqual( source.RootElement.GetProperty( "kid" ).GetString( ), active.KeyId );
-            OAuthOptions options = new( "https://bridgebeats.example/.well-known/client-metadata.json",
+            OAuthOptions options = new( "https://bridgebeats.example/oauth-client-metadata.json",
                 new Uri( "https://bridgebeats.example/account/atproto-callback" ), ["atproto", "repo:link.bridgebeats.playlist"] ) {
                 ClientSigningKey = active
             };

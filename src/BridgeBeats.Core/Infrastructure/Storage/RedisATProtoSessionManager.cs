@@ -397,8 +397,7 @@ public sealed partial class RedisATProtoSessionManager : IATProtoSessionManager,
 
             LogAuthenticated( _identifier );
 
-            // Persist credentials (the Authenticated event handler will also do this, but we
-            // do it explicitly for safety in case the event fires before persistence completes).
+            // Persist the newly authenticated credentials before leaving the login gate.
             await PersistCredentialsFromAgentAsync( agent );
 
             _agent?.Dispose( );

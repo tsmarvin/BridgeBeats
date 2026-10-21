@@ -17,6 +17,9 @@ namespace BridgeBeats.Web.Configuration;
 internal static class BlueskyAuthenticationConfiguration {
     internal const string CookieName = "__Secure-BridgeBeats.Bluesky";
     internal const string ClientMetadataPath = "/oauth-client-metadata.json";
+    internal const string LegacyIdentityCookieName = ".AspNetCore.Identity.Application";
+    internal const string UpgradedIdentityCookieName = "__Secure-BridgeBeats.Identity.v2";
+    private const string ValidatedPasswordCookie = "BridgeBeats.ValidatedPasswordCookie";
 
     internal static IServiceCollection AddBridgeBeatsBluesky(
         this IServiceCollection services, AppSettings settings, string clientId, string domain
@@ -59,6 +62,8 @@ internal static class BlueskyAuthenticationConfiguration {
                 options.IdentityStore = new SqliteIdentityStore( settings.IdentityConnectionString, loggerFactory: loggerFactory );
                 options.CorrelationStateCache = new SqliteCorrelationStateCache( settings.IdentityConnectionString, loggerFactory: loggerFactory );
             } );
+        // SDK v8 registers its concrete handler through AddBluesky. Our handler must run before
+        // SDK cookie reads so a stale reference cannot revoke a newer DID session.
         _ = services.PostConfigure<AuthenticationOptions>( options =>
             options.SchemeMap[BlueskyAuthenticationDefaults.AuthenticationScheme].HandlerType = typeof( BridgeBeatsBlueskyAuthenticationHandler ) );
         _ = services.PostConfigure<BlueskyAuthenticationOptions>( BlueskyAuthenticationDefaults.AuthenticationScheme, options =>
@@ -68,19 +73,50 @@ internal static class BlueskyAuthenticationConfiguration {
             options.Events.OnValidatePrincipal = async context => {
                 await validate( context );
                 if (context.Principal is null) { return; }
+                if (context.Properties.GetString( ValidatedPasswordCookie ) == "1") { return; }
                 UserManager<ApplicationUser> users = context.HttpContext.RequestServices.GetRequiredService<UserManager<ApplicationUser>>( );
                 ApplicationUser? user = await users.GetUserAsync( context.Principal );
                 // Old OAuth-only Identity cookies carry no SDK session. Require one new OAuth login after upgrade.
-                if (user is { AtProtoDid: not null, PasswordHash: null }) {
+                if (user is null or { AtProtoDid: not null, PasswordHash: null }) {
                     context.RejectPrincipal( );
                     await context.HttpContext.SignOutAsync( IdentityConstants.ApplicationScheme );
+                } else {
+                    // Only legacy/unmarked tickets need this lookup. Renew once with a protected marker;
+                    // built-in security-stamp validation continues on its normal schedule.
+                    context.Properties.SetString( ValidatedPasswordCookie, "1" );
+                    context.ShouldRenew = true;
                 }
+            };
+            Func<CookieSigningInContext, Task> signIn = options.Events.OnSigningIn;
+            options.Events.OnSigningIn = async context => {
+                DeleteLegacyHostOnlyIdentityCookie( context.HttpContext, options );
+                await signIn( context );
+            };
+            Func<CookieSigningOutContext, Task> signOut = options.Events.OnSigningOut;
+            options.Events.OnSigningOut = async context => {
+                DeleteLegacyHostOnlyIdentityCookie( context.HttpContext, options );
+                await signOut( context );
             };
         } );
         _ = services.AddOpenTelemetry( ).WithMetrics( metrics => metrics.AddBlueskyAuthenticationMetrics( ) );
         _ = services.AddBlueskyAgentFactory( );
         _ = services.AddBlueskyOAuthClientMetadata( options => options.LogoUri = new Uri( $"{domain}/public/Icons/BridgeBeats_FullColor.svg" ) );
         return services;
+    }
+
+    private static void DeleteLegacyHostOnlyIdentityCookie( HttpContext context, CookieAuthenticationOptions options ) {
+        if (options.Cookie.Domain is null) { return; }
+        // The previous release used a host-only cookie. A domain-scoped deletion cannot remove it.
+        CookieOptions hostOnly = options.Cookie.Build( context );
+        hostOnly.Domain = null;
+        string name = options.Cookie.Name == UpgradedIdentityCookieName
+            ? LegacyIdentityCookieName : options.Cookie.Name!;
+        context.Response.Cookies.Delete( name, hostOnly );
+        foreach (string chunk in context.Request.Cookies.Keys.Where( key =>
+                     key.StartsWith( name + "C", StringComparison.Ordinal ) &&
+                     int.TryParse( key.AsSpan( name.Length + 1 ), out _ ) )) {
+            context.Response.Cookies.Delete( chunk, hostOnly );
+        }
     }
 
     // Keep existing installer-generated JWK secrets and their key IDs valid; PEM is also accepted.

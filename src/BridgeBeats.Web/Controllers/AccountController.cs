@@ -408,6 +408,11 @@ public partial class AccountController(
     [HttpGet]
     [Route( "account/atproto-callback" )]
     public async Task<IActionResult> AtProtoCallback( [FromServices] BlueskySignInManager? blueskySignInManager ) {
+        if (Request.Query.TryGetValue( "error", out var oauthError )) {
+            string code = oauthError.ToString( );
+            LogAtProtoOAuthServerError( code.Length is > 0 and <= 64 &&
+                code.All( character => char.IsAsciiLetterOrDigit( character ) || character == '_' ) ? code : "invalid_error_code" );
+        }
         if (blueskySignInManager is not null) {
             try {
                 idunno.Bluesky.AspNet.Authentication.SignInResult result = await blueskySignInManager.SignIn( );

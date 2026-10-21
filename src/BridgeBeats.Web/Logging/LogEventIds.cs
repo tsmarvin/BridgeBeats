@@ -13,15 +13,25 @@ namespace BridgeBeats.Web.Logging;
 /// <remarks>
 /// Range Allocation:
 /// <list type="bullet">
-///   <item>4000-4499: Controllers</item>
+///   <item>4000-4349: Controllers</item>
+///   <item>4350-4399: Authentication</item>
 ///   <item>4500-4749: Middleware</item>
 ///   <item>4750-4899: Configuration</item>
 ///   <item>4900-4999: BackgroundServices</item>
 /// </list>
 /// </remarks>
 public static class LogEventIds {
+    /// <summary>Authentication event identifiers (4350-4399).</summary>
+    public static class Authentication {
+        /// <summary>A local account was created from a verified Bluesky sign-in.</summary>
+        public const int BlueskyAccountCreated = 4350;
+
+        /// <summary>A verified Bluesky sign-in completed.</summary>
+        public const int BlueskyAccountSignedIn = 4351;
+    }
+
     /// <summary>
-    /// Event identifiers emitted by the web controllers (4000-4499), allocated in per-controller numeric blocks.
+    /// Event identifiers emitted by the web controllers (4000-4349), allocated in per-controller numeric blocks.
     /// </summary>
     public static class Controllers {
         // AccountController (4000-4049)
@@ -44,29 +54,15 @@ public static class LogEventIds {
         /// <summary>An account was deleted.</summary>
         public const int AccountControllerDeleted = 4005;
 
-        /// <summary>An ATProto OAuth authorization flow was started.</summary>
-        public const int AccountControllerAtProtoOAuthStarted = 4006;
-
+        // 4006 and 4008-4012 are retired custom OAuth event IDs; do not reuse them.
         /// <summary>Starting an ATProto OAuth authorization flow failed.</summary>
         public const int AccountControllerAtProtoOAuthStartFailed = 4007;
 
-        /// <summary>An ATProto OAuth flow returned an error.</summary>
-        public const int AccountControllerAtProtoOAuthError = 4008;
-
-        /// <summary>Creating a user from an ATProto identity failed.</summary>
-        public const int AccountControllerAtProtoUserCreateFailed = 4009;
-
-        /// <summary>A user was created from an ATProto identity.</summary>
-        public const int AccountControllerAtProtoUserCreated = 4010;
-
-        /// <summary>A user's ATProto tokens were updated.</summary>
-        public const int AccountControllerAtProtoTokensUpdated = 4011;
-
-        /// <summary>A user logged in via ATProto.</summary>
-        public const int AccountControllerAtProtoLoggedIn = 4012;
-
         /// <summary>Handling the ATProto OAuth callback failed.</summary>
         public const int AccountControllerAtProtoCallbackFailed = 4013;
+
+        /// <summary>The authorization server returned an OAuth error.</summary>
+        public const int AccountControllerAtProtoOAuthServerError = 4014;
 
         // HomeController (4050-4074)
 

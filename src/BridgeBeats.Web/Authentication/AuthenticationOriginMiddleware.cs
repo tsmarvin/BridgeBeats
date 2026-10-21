@@ -20,8 +20,10 @@ internal sealed class AuthenticationOriginMiddleware(
                 return;
             }
 
+            string canonicalPath = routePath.Equals( "/account/login", StringComparison.OrdinalIgnoreCase )
+                ? "/account/login" : "/account/register";
             UriBuilder target = new( canonicalOrigin.Origin ) {
-                Path = $"{context.Request.PathBase}{context.Request.Path}",
+                Path = path.EndsWith( "/", StringComparison.Ordinal ) ? canonicalPath + "/" : canonicalPath,
                 Query = context.Request.QueryString.Value?.TrimStart( '?' ) ?? string.Empty
             };
             context.Response.Redirect( target.Uri.ToString( ) );

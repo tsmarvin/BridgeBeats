@@ -464,7 +464,13 @@ namespace BridgeBeats.Web.Configuration {
                 options.Cookie.SameSite = SameSiteMode.Lax;
                 options.Cookie.HttpOnly = true;
 
-                options.Cookie.Domain = AuthenticationOrigin.Parse( settings.Domain )?.CookieDomain;
+                AuthenticationOrigin? origin = AuthenticationOrigin.Parse( settings.Domain );
+                options.Cookie.Domain = origin?.CookieDomain;
+                // A scheme or port made the previous release issue host-only cookies. Give these
+                // installations a new cookie name so old tickets on alias hosts cannot survive logout.
+                if (origin?.CookieDomain is not null && settings.Domain?.Contains( ':' ) == true) {
+                    options.Cookie.Name = BlueskyAuthenticationConfiguration.UpgradedIdentityCookieName;
+                }
             } );
         }
 
@@ -561,8 +567,7 @@ namespace BridgeBeats.Web.Configuration {
         /// <param name="services">The service collection to populate.</param>
         /// <param name="settings">The settings supplying the domain, signing key path, and ATProto credentials.</param>
         private static void ConfigureATProtoIfEnabled( IServiceCollection services, AppSettings settings ) {
-            // Register ATProto OAuth service (available even without server ATProto credentials)
-            // This allows users to log in with Bluesky for playlist management
+            // Register Bluesky sign-in even when the separate ATProto service account is not configured.
             string? domainWithScheme = AppSettings.NormalizeDomain( settings.Domain );
             if (!string.IsNullOrWhiteSpace( domainWithScheme )) {
                 string clientId = $"{domainWithScheme}{BlueskyAuthenticationConfiguration.ClientMetadataPath}";

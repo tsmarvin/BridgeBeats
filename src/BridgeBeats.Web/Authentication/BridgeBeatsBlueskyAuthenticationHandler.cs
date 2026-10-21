@@ -31,7 +31,7 @@ internal sealed class BridgeBeatsBlueskyAuthenticationHandler(
             binding is null ? null : Convert.ToBase64String( binding ) );
         DateTimeOffset now = (Options.TimeProvider ?? TimeProvider.System).GetUtcNow( );
         if (ticket is not null && ticket.Properties.ExpiresUtc is { } expires && expires > now &&
-            await accountEvents.HasCurrentAccountBindingAsync( ticket, Context.RequestAborted )) {
+            await accountEvents.HasCurrentAccountBindingAsync( ticket, Context )) {
             return;
         }
 

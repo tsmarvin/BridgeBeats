@@ -9,7 +9,7 @@ namespace BridgeBeats.Core.Infrastructure.Migrations {
         /// <inheritdoc />
         protected override void Up( MigrationBuilder migrationBuilder ) {
             // SDK v8.0.0 SQLite schema. The SDK owns these tables; EF owns their deployment lifecycle.
-            migrationBuilder.Sql(
+            _ = migrationBuilder.Sql(
                 """
                 CREATE TABLE IF NOT EXISTS "idunno_bluesky_identities"
                 (
@@ -18,10 +18,10 @@ namespace BridgeBeats.Core.Infrastructure.Migrations {
                     "ExpiresAtUtcTicks" INTEGER NOT NULL,
                     PRIMARY KEY ("Did")
                 ) WITHOUT ROWID;
-                
+
                 CREATE INDEX IF NOT EXISTS "IX_idunno_bluesky_identities_ExpiresAtUtcTicks"
                     ON "idunno_bluesky_identities" ("ExpiresAtUtcTicks");
-                
+
                 CREATE TABLE IF NOT EXISTS "idunno_bluesky_refresh_locks"
                 (
                     "Did" TEXT NOT NULL COLLATE BINARY,
@@ -29,10 +29,10 @@ namespace BridgeBeats.Core.Infrastructure.Migrations {
                     "ExpiresAtUtcTicks" INTEGER NOT NULL,
                     PRIMARY KEY ("Did")
                 ) WITHOUT ROWID;
-                
+
                 CREATE INDEX IF NOT EXISTS "IX_idunno_bluesky_refresh_locks_ExpiresAtUtcTicks"
                     ON "idunno_bluesky_refresh_locks" ("ExpiresAtUtcTicks");
-                
+
                 CREATE TABLE IF NOT EXISTS "idunno_bluesky_correlation_states"
                 (
                     "CorrelationId" BLOB NOT NULL,
@@ -40,17 +40,17 @@ namespace BridgeBeats.Core.Infrastructure.Migrations {
                     "ExpiresAtUtcTicks" INTEGER NOT NULL,
                     PRIMARY KEY ("CorrelationId")
                 ) WITHOUT ROWID;
-                
+
                 CREATE INDEX IF NOT EXISTS "IX_idunno_bluesky_correlation_states_ExpiresAtUtcTicks"
                     ON "idunno_bluesky_correlation_states" ("ExpiresAtUtcTicks");
-                
+
                 """ );
 
-            migrationBuilder.DropTable(
+            _ = migrationBuilder.DropTable(
                 name: "AtProtoOAuthStates" );
 
             // Native SQLite DROP COLUMN keeps this migration transactional and avoids rebuilding Identity tables.
-            migrationBuilder.Sql(
+            _ = migrationBuilder.Sql(
                 """
                 ALTER TABLE AspNetUsers DROP COLUMN AtProtoAccessToken;
                 ALTER TABLE AspNetUsers DROP COLUMN AtProtoDPoPKey;
@@ -61,33 +61,33 @@ namespace BridgeBeats.Core.Infrastructure.Migrations {
 
         /// <inheritdoc />
         protected override void Down( MigrationBuilder migrationBuilder ) {
-            migrationBuilder.Sql( "DROP TABLE idunno_bluesky_correlation_states; DROP TABLE idunno_bluesky_refresh_locks; DROP TABLE idunno_bluesky_identities;" );
+            _ = migrationBuilder.Sql( "DROP TABLE idunno_bluesky_correlation_states; DROP TABLE idunno_bluesky_refresh_locks; DROP TABLE idunno_bluesky_identities;" );
 
-            migrationBuilder.AddColumn<string>(
+            _ = migrationBuilder.AddColumn<string>(
                 name: "AtProtoAccessToken",
                 table: "AspNetUsers",
                 type: "TEXT",
                 nullable: true );
 
-            migrationBuilder.AddColumn<string>(
+            _ = migrationBuilder.AddColumn<string>(
                 name: "AtProtoDPoPKey",
                 table: "AspNetUsers",
                 type: "TEXT",
                 nullable: true );
 
-            migrationBuilder.AddColumn<string>(
+            _ = migrationBuilder.AddColumn<string>(
                 name: "AtProtoRefreshToken",
                 table: "AspNetUsers",
                 type: "TEXT",
                 nullable: true );
 
-            migrationBuilder.AddColumn<DateTime>(
+            _ = migrationBuilder.AddColumn<DateTime>(
                 name: "AtProtoTokenExpiration",
                 table: "AspNetUsers",
                 type: "TEXT",
                 nullable: true );
 
-            migrationBuilder.CreateTable(
+            _ = migrationBuilder.CreateTable(
                 name: "AtProtoOAuthStates",
                 columns: table => new {
                     State = table.Column<string>( type: "TEXT", maxLength: 128, nullable: false ),
@@ -101,10 +101,10 @@ namespace BridgeBeats.Core.Infrastructure.Migrations {
                     PdsUri = table.Column<string>( type: "TEXT", maxLength: 512, nullable: true )
                 },
                 constraints: table => {
-                    table.PrimaryKey( "PK_AtProtoOAuthStates", x => x.State );
+                    _ = table.PrimaryKey( "PK_AtProtoOAuthStates", x => x.State );
                 } );
 
-            migrationBuilder.CreateIndex(
+            _ = migrationBuilder.CreateIndex(
                 name: "IX_AtProtoOAuthStates_ExpiresAt",
                 table: "AtProtoOAuthStates",
                 column: "ExpiresAt" );

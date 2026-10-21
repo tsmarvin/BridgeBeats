@@ -3,7 +3,10 @@ using System.Text.Json;
 using BridgeBeats.Core.Infrastructure.Identity;
 using BridgeBeats.Web.Configuration;
 using idunno.AtProto.Authentication;
+using idunno.Bluesky;
 using idunno.Bluesky.AspNet.Authentication;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 
 #pragma warning disable CS1591
 namespace BridgeBeats.Tests.Unit;
@@ -53,5 +56,24 @@ public class BlueskySigningKeyConfigurationTests {
             Assert.IsNull( BlueskyAuthenticationConfiguration.LoadSigningKey( path, optional: true ) );
         } finally { File.Delete( path ); }
     }
+
+    [TestMethod]
+    public void ProductionBlueskyConfiguration_KeepsHttpsNonLoopbackTransportRestrictionsEnabled( ) {
+        ServiceCollection services = new( );
+        _ = services.AddLogging( );
+        AppSettings settings = new( ) {
+            Domain = "bridgebeats.example",
+            IdentityConnectionString = "Data Source=unused.db"
+        };
+        _ = services.AddBridgeBeatsBluesky( settings,
+            "https://bridgebeats.example/oauth-client-metadata.json", "https://bridgebeats.example" );
+        using ServiceProvider provider = services.BuildServiceProvider( );
+
+        OAuthOptions oauth = provider.GetRequiredService<IOptionsMonitor<BlueskyAgentOptions>>( ).CurrentValue.OAuthOptions!;
+        Assert.AreEqual( "https://bridgebeats.example/account/atproto-callback", oauth.ReturnUri!.AbsoluteUri );
+        Assert.IsFalse( oauth.AllowInsecureProtocols );
+        Assert.IsFalse( oauth.AllowLoopback );
+    }
+
 }
 #pragma warning restore CS1591

@@ -398,7 +398,7 @@ public partial class AccountController(
             Uri authorizationUrl = await blueskySignInManager.CreateRedirectUri(
                 handle, cancellationToken: HttpContext.RequestAborted );
             return Ok( new { authorizationUrl = authorizationUrl.ToString( ) } );
-        } catch (Exception ex) when (ex is not OperationCanceledException) {
+        } catch (Exception ex) when (ex is not OperationCanceledException || !HttpContext.RequestAborted.IsCancellationRequested) {
             LogAtProtoOAuthStartFailed( ex, request.Handle );
             return BadRequest( new { message = "Failed to start login. Please check your handle and try again." } );
         }
@@ -414,7 +414,7 @@ public partial class AccountController(
                 if (result.Succeeded) {
                     return Redirect( "/" );
                 }
-            } catch (Exception ex) when (ex is not OperationCanceledException) {
+            } catch (Exception ex) when (ex is not OperationCanceledException || !HttpContext.RequestAborted.IsCancellationRequested) {
                 LogAtProtoCallbackFailed( ex );
             }
         }

@@ -1,4 +1,3 @@
-using System.Net;
 using System.Security.Cryptography;
 using System.Text.Json;
 using AspNetCore.Authentication.ApiKey;
@@ -273,6 +272,7 @@ namespace BridgeBeats.Web.Configuration {
 
             _ = app.UseStaticFiles( ); // Serve static files from wwwroot
             _ = app.UseRouting( );
+            _ = app.UseCanonicalAuthenticationOrigin( AuthenticationOrigin.Parse( settings.Domain ) );
 
             // Restrict liveness endpoint access to internal requests only
             // NOTE: This middleware is intentionally placed before authentication because it uses IP-based authorization
@@ -454,7 +454,7 @@ namespace BridgeBeats.Web.Configuration {
         /// </summary>
         /// <param name="services">The service collection to populate.</param>
         /// <param name="settings">The settings supplying the Data Protection key path and domain.</param>
-        private static void ConfigureIdentity( IServiceCollection services, AppSettings settings ) {
+        internal static void ConfigureIdentity( IServiceCollection services, AppSettings settings ) {
             // Identity and SDK OAuth stores share the persisted Data Protection key ring.
             // ApplicationDbContext separately encrypts the Apple Music user token.
             _ = services.AddBridgeBeatsIdentity( settings.DataProtectionKeyPath );
@@ -464,46 +464,22 @@ namespace BridgeBeats.Web.Configuration {
                 options.Cookie.SameSite = SameSiteMode.Lax;
                 options.Cookie.HttpOnly = true;
 
-                string domain = settings.Domain.Trim().TrimStart('.').TrimEnd('.');
-                if (ShouldSetCookieDomain( domain )) {
-                    options.Cookie.Domain = $".{domain}";
-                }
+                options.Cookie.Domain = AuthenticationOrigin.Parse( settings.Domain )?.CookieDomain;
             } );
         }
 
         /// <summary>
-        /// Determines whether the application cookie should be scoped to a parent domain. Returns
-        /// <c>false</c> for empty values, values containing scheme, path, or port characters, <c>localhost</c>,
-        /// and bare IP addresses.
-        /// </summary>
-        /// <param name="domain">The candidate cookie domain.</param>
-        /// <returns><c>true</c> when the domain is a registrable host suitable for cookie scoping; otherwise <c>false</c>.</returns>
-        private static bool ShouldSetCookieDomain( string domain ) {
-            if (string.IsNullOrWhiteSpace( domain )) {
-                return false;
-            }
-
-            // Cookie domains must be host-only (no scheme, path, or port)
-            if (domain.Contains( "://", StringComparison.OrdinalIgnoreCase ) ||
-                domain.Contains( '/', StringComparison.Ordinal ) ||
-                domain.Contains( ':', StringComparison.Ordinal )) {
-                return false;
-            }
-
-            // Avoid forcing Domain on localhost/IPs; let the browser use host-only cookies
-            return !string.Equals( domain, "localhost", StringComparison.OrdinalIgnoreCase ) &&
-!IPAddress.TryParse( domain, out _ );
-        }
-
-        /// <summary>
         /// Registers the API-key hasher and the multi-scheme authentication policy. The policy forwards to
-        /// internal-service-key authentication when the service-key header is present, to API-key
-        /// authentication when the <c>X-API-Key</c> header is present, and otherwise to the Identity cookie.
+        /// internal-service-key authentication when its header is present, to API-key authentication when
+        /// the <c>X-API-Key</c> header is present, to Bluesky when that integration is enabled and its cookie
+        /// is present, and otherwise to the Identity cookie.
         /// </summary>
         /// <param name="services">The service collection to populate.</param>
         /// <param name="settings">The settings supplying the API-key salt and internal-service key.</param>
         /// <exception cref="InvalidOperationException">Thrown when the API-key salt is missing.</exception>
-        private static void ConfigureApiKeyAuth( IServiceCollection services, AppSettings settings ) {
+        internal static void ConfigureApiKeyAuth( IServiceCollection services, AppSettings settings ) {
+            AuthenticationOrigin? authenticationOrigin = AuthenticationOrigin.Parse( settings.Domain );
+
             // Configure API Key hashing
             if (string.IsNullOrWhiteSpace( settings.ApiKeySalt )) {
                 throw new InvalidOperationException( "ApiKeySalt is required in configuration for secure API key storage." );
@@ -522,7 +498,7 @@ namespace BridgeBeats.Web.Configuration {
                         ? InternalServiceDefaults.AuthenticationScheme
                         : context.Request.Headers.ContainsKey( "X-API-Key" )
                             ? ApiKeyDefaults.AuthenticationScheme
-                            : !string.IsNullOrWhiteSpace( settings.Domain ) &&
+                            : authenticationOrigin is not null &&
                               context.Request.Cookies.ContainsKey( BlueskyAuthenticationConfiguration.CookieName )
                                 ? BlueskyAuthenticationDefaults.AuthenticationScheme
                                 : IdentityConstants.ApplicationScheme;

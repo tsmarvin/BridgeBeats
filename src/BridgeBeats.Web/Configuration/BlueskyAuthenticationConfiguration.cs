@@ -22,8 +22,7 @@ internal static class BlueskyAuthenticationConfiguration {
         this IServiceCollection services, AppSettings settings, string clientId, string domain
     ) {
         OAuthClientSigningKey? signingKey = LoadSigningKey( settings.ATProtoOAuthSigningKeyPath, optional: true );
-        OAuthClientSigningKey[] previousKeys = settings.ATProtoOAuthAdditionalSigningKeyPaths
-            .Select( path => LoadSigningKey( path, optional: false )! ).ToArray( );
+        OAuthClientSigningKey[] previousKeys = [.. settings.ATProtoOAuthAdditionalSigningKeyPaths.Select( path => LoadSigningKey( path, optional: false )! )];
         _ = services.Configure<BlueskyAgentOptions>( options => {
             options.EnableBackgroundTokenRefresh = false;
             options.OAuthOptions = new OAuthOptions(
@@ -45,11 +44,7 @@ internal static class BlueskyAuthenticationConfiguration {
         services.TryAddSingleton<IDidHandleResolver>( _ => new DidHandleCache( ) );
         _ = services.AddAuthentication( ).AddBluesky( options => {
             options.Cookie.Name = CookieName;
-            string host = new Uri( domain ).Host;
-            if (Uri.CheckHostName( host ) == UriHostNameType.Dns && host.Contains( '.', StringComparison.Ordinal ) &&
-                !host.Equals( "localhost", StringComparison.OrdinalIgnoreCase )) {
-                options.Cookie.Domain = "." + host;
-            }
+            options.Cookie.Domain = AuthenticationOrigin.Parse( domain )?.CookieDomain;
             options.Cookie.Path = "/";
             options.Cookie.HttpOnly = true;
             options.Cookie.SecurePolicy = CookieSecurePolicy.Always;
@@ -58,9 +53,12 @@ internal static class BlueskyAuthenticationConfiguration {
             options.ExpireTimeSpan = TimeSpan.FromDays( 7 );
             options.SlidingExpiration = true;
             options.EventsType = typeof( BlueskyAccountEvents );
-            options.IdentityStore = new SqliteIdentityStore( settings.IdentityConnectionString );
-            options.CorrelationStateCache = new SqliteCorrelationStateCache( settings.IdentityConnectionString );
         } );
+        _ = services.AddOptions<BlueskyAuthenticationOptions>( BlueskyAuthenticationDefaults.AuthenticationScheme )
+            .Configure<ILoggerFactory>( ( options, loggerFactory ) => {
+                options.IdentityStore = new SqliteIdentityStore( settings.IdentityConnectionString, loggerFactory: loggerFactory );
+                options.CorrelationStateCache = new SqliteCorrelationStateCache( settings.IdentityConnectionString, loggerFactory: loggerFactory );
+            } );
         _ = services.PostConfigure<AuthenticationOptions>( options =>
             options.SchemeMap[BlueskyAuthenticationDefaults.AuthenticationScheme].HandlerType = typeof( BridgeBeatsBlueskyAuthenticationHandler ) );
         _ = services.PostConfigure<BlueskyAuthenticationOptions>( BlueskyAuthenticationDefaults.AuthenticationScheme, options =>

@@ -312,6 +312,10 @@ Check:
 
 ## Updates
 
+### Bluesky OAuth upgrade
+
+The migration from custom Bluesky OAuth to the SDK-managed stores is a forward-only deployment change. On first startup, the new image removes the legacy OAuth credential columns and pending-login table. The previous application image is incompatible with that database, so the image-only rollback steps below do not apply to this upgrade. Users must sign in to Bluesky again, and logins already in progress must be restarted. Local user accounts, DIDs, API keys, playlists, and Apple Music credentials remain intact. See [Bluesky sign-in configuration](CONFIGURATION.md#bluesky-sign-in) for persistence requirements and signing-key rotation.
+
 ### Using the Installation Script
 
 The installation script handles updates gracefully:
@@ -341,6 +345,8 @@ docker compose up -d
 ```
 
 ### Rollback
+
+These image-only steps do not apply to the [Bluesky OAuth upgrade](#bluesky-oauth-upgrade), whose migrated database is incompatible with the previous image.
 
 If you need to roll back after an update:
 

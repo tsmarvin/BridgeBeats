@@ -466,9 +466,10 @@ namespace BridgeBeats.Web.Configuration {
 
                 AuthenticationOrigin? origin = AuthenticationOrigin.Parse( settings.Domain );
                 options.Cookie.Domain = origin?.CookieDomain;
-                // A scheme or port made the previous release issue host-only cookies. Give these
+                // A scheme, port or trailing slash made the previous release issue host-only cookies. Give these
                 // installations a new cookie name so old tickets on alias hosts cannot survive logout.
-                if (origin?.CookieDomain is not null && settings.Domain?.Contains( ':' ) == true) {
+                if (origin?.CookieDomain is not null &&
+                    (settings.Domain?.Contains( ':' ) == true || settings.Domain?.Contains( '/' ) == true)) {
                     options.Cookie.Name = BlueskyAuthenticationConfiguration.UpgradedIdentityCookieName;
                 }
             } );

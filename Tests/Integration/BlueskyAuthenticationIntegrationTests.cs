@@ -271,6 +271,44 @@ public class BlueskyAuthenticationIntegrationTests {
     }
 
     [TestMethod]
+    [DataRow( false )]
+    [DataRow( true )]
+    public async Task NewBlueskyLogin_RejectsOldCookieWithoutRevokingReplacementSession( bool logoutFirst ) {
+        using HttpResponseMessage originalLogin = await SignInAsync( );
+        string oldCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        string userId = await LocalUserIdAsync( );
+        if (logoutFirst) {
+            await AddAntiforgeryHeaderAsync( );
+            using HttpResponseMessage logout = await _client.PostAsync( "/account/logout", null, TestContext.CancellationToken );
+            Assert.AreEqual( HttpStatusCode.OK, logout.StatusCode );
+            Assert.IsNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+            _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        }
+
+        using HttpResponseMessage replacementLogin = await SignInAsync( );
+        string replacementCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        Assert.AreEqual( userId, await LocalUserIdAsync( ) );
+        int revocations = _oauth.Revocations;
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", oldCookie );
+        JsonElement replay = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsFalse( replay.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.IsFalse( replay.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+
+        await AddAntiforgeryHeaderAsync( );
+        using HttpResponseMessage staleLogout = await _client.PostAsync( "/account/logout", null, TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.OK, staleLogout.StatusCode );
+        Assert.AreEqual( revocations, _oauth.Revocations );
+        Assert.IsNotNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", replacementCookie );
+        JsonElement current = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( current.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.AreEqual( userId, current.GetProperty( "userId" ).GetString( ) );
+    }
+
+    [TestMethod]
     public async Task Logout_WhenProtectedResourceDiscoveryFails_RemovesStoredSessionAndRejectsCookieReplay( ) {
         _ = await SignInAsync( );
         string cookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
@@ -1326,8 +1364,10 @@ public class BlueskyAuthenticationIntegrationTests {
     }
 
     [TestMethod]
-    public async Task ExplicitOriginUpgrade_RejectsOldIdentityCookieOnAliasHost( ) {
-        _configuredDomain = "https://bridgebeats.example";
+    [DataRow( "https://bridgebeats.example" )]
+    [DataRow( "bridgebeats.example/" )]
+    public async Task DomainUpgrade_RejectsOldIdentityCookieOnAliasHost( string configuredDomain ) {
+        _configuredDomain = configuredDomain;
         await RestartApplicationAsync( );
         await AddAntiforgeryHeaderAsync( );
         using HttpResponseMessage registration = await _client.PostAsJsonAsync( "/account/register",

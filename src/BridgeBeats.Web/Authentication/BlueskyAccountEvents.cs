@@ -80,8 +80,9 @@ public sealed partial class BlueskyAccountEvents(
             user.AtProtoHandle = verifiedHandle;
             EnsureSucceeded( await users.UpdateAsync( user ) );
         }
-        // Bind the protected reference ticket to this local account and its security stamp.
-        // Reusing a DID after account deletion must not make a previous account's cookie valid again.
+        // Each SDK identity is shared by DID. A new login must invalidate earlier reference tickets,
+        // including copies retained across logout and re-login for the same local account.
+        EnsureSucceeded( await users.UpdateSecurityStampAsync( user ) );
         context.Properties.SetString( UserIdProperty, user.Id );
         context.Properties.SetString( SecurityStampProperty, await users.GetSecurityStampAsync( user ) );
         context.Properties.IsPersistent = false;

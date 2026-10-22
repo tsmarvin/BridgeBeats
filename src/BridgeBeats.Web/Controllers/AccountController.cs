@@ -100,6 +100,28 @@ public partial class AccountController(
             CreatedAt = DateTime.UtcNow
         };
 
+        // Validate before ending a live session. CreateAsync validates again after cleanup.
+        bool validationSucceeded = true;
+        foreach (IPasswordValidator<ApplicationUser> validator in userManager.PasswordValidators) {
+            IdentityResult validation = await validator.ValidateAsync( userManager, user, request.Password );
+            validationSucceeded &= validation.Succeeded;
+            foreach (IdentityError error in validation.Errors) {
+                ModelState.AddModelError( string.Empty, error.Description );
+            }
+        }
+        foreach (IUserValidator<ApplicationUser> validator in userManager.UserValidators) {
+            IdentityResult validation = await validator.ValidateAsync( userManager, user );
+            validationSucceeded &= validation.Succeeded;
+            foreach (IdentityError error in validation.Errors) {
+                ModelState.AddModelError( string.Empty, error.Description );
+            }
+        }
+        if (!validationSucceeded) {
+            return BadRequest( ModelState );
+        }
+
+        await SignOutBlueskyAsync( );
+
         IdentityResult result;
         try {
             result = await userManager.CreateAsync( user, request.Password );
@@ -119,7 +141,6 @@ public partial class AccountController(
         }
 
         // Sign in the user automatically with a cookie for web UI
-        await SignOutBlueskyAsync( );
         await signInManager.SignInAsync( user, isPersistent: false );
 
         LogUserRegistered( user.Id );
@@ -167,6 +188,7 @@ public partial class AccountController(
 
         // Sign in the user with a cookie for web UI
         await SignOutBlueskyAsync( );
+        await ReloadLinkedAccountAsync( user );
         await signInManager.SignInAsync( user, isPersistent: false );
 
         // Generate new API key only if user doesn't have one
@@ -359,9 +381,9 @@ public partial class AccountController(
         // Revoke the linked OAuth session even when deletion is authenticated with an API key.
         BlueskySessionService? sessions = HttpContext.RequestServices.GetService<BlueskySessionService>( );
         if (sessions is not null) {
-            await sessions.RemoveAsync( user.AtProtoDid );
+            await sessions.EndSessionAsync( HttpContext, user.AtProtoDid );
+            await ReloadLinkedAccountAsync( user );
         }
-        await SignOutBlueskyAsync( );
         await signInManager.SignOutAsync( );
 
         // Delete the user
@@ -419,6 +441,9 @@ public partial class AccountController(
                 if (result.Succeeded) {
                     return Redirect( "/" );
                 }
+                LogAtProtoCallbackRejected( result.MissingQueryString ? "missing_query" :
+                    result.MissingCorrelationState ? "missing_correlation" :
+                    result.ErrorProcessingOAuth2Response ? "invalid_oauth_response" : "unknown" );
             } catch (Exception ex) when (ex is not OperationCanceledException || !HttpContext.RequestAborted.IsCancellationRequested) {
                 LogAtProtoCallbackFailed( ex );
             }
@@ -429,7 +454,15 @@ public partial class AccountController(
     private async Task SignOutBlueskyAsync( ) {
         BlueskySessionService? sessions = HttpContext.RequestServices?.GetService<BlueskySessionService>( );
         if (sessions is not null) {
-            await sessions.SignOutAsync( HttpContext );
+            await sessions.EndSessionAsync( HttpContext, null );
+        }
+    }
+
+    /// <summary>Refreshes tracked account stamps after session removal updates them directly in SQLite.</summary>
+    private async Task ReloadLinkedAccountAsync( ApplicationUser user ) {
+        if (user.AtProtoDid is not null) {
+            ApplicationDbContext db = HttpContext.RequestServices.GetRequiredService<ApplicationDbContext>( );
+            await db.Entry( user ).ReloadAsync( HttpContext.RequestAborted );
         }
     }
 

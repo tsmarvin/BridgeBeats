@@ -8,6 +8,7 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.JsonWebTokens;
 
@@ -21,6 +22,8 @@ public sealed partial class BlueskyAccountEvents(
     IDidHandleResolver handleResolver,
     IOptionsMonitor<BlueskyAgentOptions> agentOptions,
     IHttpClientFactory httpClients,
+    IMemoryCache principalCache,
+    BlueskySessionService sessions,
     ILogger<BlueskyAccountEvents> logger
 ) : BlueskyAuthenticationEvents {
     internal const string UserIdProperty = "BridgeBeats.UserId";
@@ -80,11 +83,12 @@ public sealed partial class BlueskyAccountEvents(
             user.AtProtoHandle = verifiedHandle;
             EnsureSucceeded( await users.UpdateAsync( user ) );
         }
-        // Each SDK identity is shared by DID. A new login must invalidate earlier reference tickets,
-        // including copies retained across logout and re-login for the same local account.
-        EnsureSucceeded( await users.UpdateSecurityStampAsync( user ) );
+        // The shared DID identity lets existing browsers keep working after a login elsewhere.
+        // Removing that identity rotates the stamp, so logout still invalidates every old ticket.
         context.Properties.SetString( UserIdProperty, user.Id );
-        context.Properties.SetString( SecurityStampProperty, await users.GetSecurityStampAsync( user ) );
+        string stamp = await users.GetSecurityStampAsync( user );
+        context.Properties.SetString( SecurityStampProperty, stamp );
+        context.HttpContext.Items[BridgeBeatsIdentityStore.ExpectedStampKey] = stamp;
         context.Properties.IsPersistent = false;
         await context.HttpContext.SignOutAsync( IdentityConstants.ApplicationScheme );
         if (created) { LogAccountCreated( logger, user.Id ); }
@@ -103,29 +107,35 @@ public sealed partial class BlueskyAccountEvents(
     public override async Task ValidatePrincipal( BlueskyValidatePrincipalContext context ) {
         ApplicationUser? user = await FindUserAsync( context.Principal, context.HttpContext );
         if (user is null) {
-            context.RejectPrincipal( );
-            await context.HttpContext.SignOutAsync( context.Scheme.Name );
+            RejectAndClearCookie( context );
             return;
         }
         if (!await HasCurrentAccountBindingAsync( user, context.Properties )) {
-            context.RejectPrincipal( );
-            // SDK sign-out revokes credentials by DID. An obsolete ticket must only clear its own cookie,
-            // preserving any newer login for the same DID. CheckSlidingExpiration prevents its renewal.
-            context.Options.CookieManager.DeleteCookie( context.HttpContext, context.Options.Cookie.Name!,
-                context.Options.Cookie.Build( context.HttpContext ) );
+            RejectAndClearCookie( context );
             return;
         }
         if (users.SupportsUserLockout && await users.IsLockedOutAsync( user )) {
             context.RejectPrincipal( );
-            await context.HttpContext.SignOutAsync( context.Scheme.Name );
+            await sessions.EndSessionAsync( context.HttpContext, user.AtProtoDid );
             return;
         }
-        ClaimsPrincipal localPrincipal = await principalFactory.CreateAsync( user );
+        string cacheKey = $"BlueskyPrincipal:{user.Id}:{user.SecurityStamp}:{user.ConcurrencyStamp}";
+        if (!principalCache.TryGetValue( cacheKey, out ClaimsPrincipal? basePrincipal ) || basePrincipal is null) {
+            basePrincipal = await principalFactory.CreateAsync( user );
+            _ = principalCache.Set( cacheKey, basePrincipal, TimeSpan.FromMinutes( 1 ) );
+        }
+        ClaimsPrincipal localPrincipal = new( basePrincipal.Identities.Select( identity => new ClaimsIdentity( identity ) ) );
         ClaimsIdentity identity = (ClaimsIdentity)localPrincipal.Identity!;
         // Preserve the SDK's credential claims (and their service issuers) for the injected BlueskyAgent.
         // NameIdentifier comes from Identity, keeping playlists, rate limits and API keys on the same user ID.
         identity.AddClaims( context.Principal!.Claims.Where( c => c.Type.StartsWith( "urn:atproto:", StringComparison.Ordinal ) ) );
         context.ReplacePrincipal( localPrincipal );
+    }
+
+    private static void RejectAndClearCookie( BlueskyValidatePrincipalContext context ) {
+        context.RejectPrincipal( );
+        context.Options.CookieManager.DeleteCookie( context.HttpContext, context.Options.Cookie.Name!,
+            context.Options.Cookie.Build( context.HttpContext ) );
     }
 
     private Task<ApplicationUser?> FindUserAsync( ClaimsPrincipal? principal, HttpContext context ) {
@@ -135,7 +145,7 @@ public sealed partial class BlueskyAccountEvents(
             return Task.FromResult<ApplicationUser?>( verified );
         }
         return did is null ? Task.FromResult<ApplicationUser?>( null )
-            : users.Users.SingleOrDefaultAsync( u => u.AtProtoDid == did, context.RequestAborted );
+            : users.Users.AsNoTracking( ).SingleOrDefaultAsync( u => u.AtProtoDid == did, context.RequestAborted );
     }
 
     internal async Task<bool> HasCurrentAccountBindingAsync( AuthenticationTicket ticket, HttpContext context ) {
@@ -146,6 +156,10 @@ public sealed partial class BlueskyAccountEvents(
         context.Items[s_verifiedUser] = user;
         return true;
     }
+
+    internal static string? GetVerifiedDid( HttpContext context ) =>
+        context.Items.TryGetValue( s_verifiedUser, out object? user ) && user is ApplicationUser verified
+            ? verified.AtProtoDid : null;
 
     private async Task<bool> HasCurrentAccountBindingAsync( ApplicationUser user, AuthenticationProperties properties ) =>
         properties.GetString( UserIdProperty ) == user.Id &&

@@ -28,6 +28,12 @@ public static class LogEventIds {
 
         /// <summary>A verified Bluesky sign-in completed.</summary>
         public const int BlueskyAccountSignedIn = 4351;
+
+        /// <summary>Remote OAuth revocation failed while the local session was being removed.</summary>
+        public const int BlueskyRevocationFailed = 4352;
+
+        /// <summary>Stored Bluesky credentials could not be read for remote revocation.</summary>
+        public const int BlueskyIdentityReadFailed = 4353;
     }
 
     /// <summary>
@@ -63,6 +69,9 @@ public static class LogEventIds {
 
         /// <summary>The authorization server returned an OAuth error.</summary>
         public const int AccountControllerAtProtoOAuthServerError = 4014;
+
+        /// <summary>The SDK rejected an ATProto OAuth callback without throwing.</summary>
+        public const int AccountControllerAtProtoCallbackRejected = 4015;
 
         // HomeController (4050-4074)
 

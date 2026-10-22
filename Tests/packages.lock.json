@@ -1749,8 +1749,8 @@
       "bridgebeats.contracts": {
         "type": "Project",
         "dependencies": {
-          "idunno.AtProto": "[8.0.0, )",
-          "idunno.Bluesky": "[8.0.0, )"
+          "idunno.AtProto": "[8.0.0, 8.0.0]",
+          "idunno.Bluesky": "[8.0.0, 8.0.0]"
         }
       },
       "bridgebeats.core": {
@@ -1781,8 +1781,8 @@
           "BridgeBeats.Core": "[1.0.0, )",
           "Microsoft.OpenApi": "[3.10.2, )",
           "Swashbuckle.AspNetCore": "[10.3.0, )",
-          "idunno.Bluesky.AspNet.Authentication": "[8.0.0, )",
-          "idunno.Bluesky.AspNet.Authentication.SQLite": "[8.0.0, )"
+          "idunno.Bluesky.AspNet.Authentication": "[8.0.0, 8.0.0]",
+          "idunno.Bluesky.AspNet.Authentication.SQLite": "[8.0.0, 8.0.0]"
         }
       },
       "bridgebeats.worker.discord": {
@@ -1797,8 +1797,8 @@
         "type": "Project",
         "dependencies": {
           "BridgeBeats.Core": "[1.0.0, )",
-          "idunno.AtProto": "[8.0.0, )",
-          "idunno.Bluesky": "[8.0.0, )"
+          "idunno.AtProto": "[8.0.0, 8.0.0]",
+          "idunno.Bluesky": "[8.0.0, 8.0.0]"
         }
       },
       "bridgebeats.worker.maintenance": {

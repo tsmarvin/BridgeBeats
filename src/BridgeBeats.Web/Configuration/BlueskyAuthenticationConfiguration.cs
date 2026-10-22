@@ -44,6 +44,8 @@ internal static class BlueskyAuthenticationConfiguration {
         _ = services.AddScoped<BlueskyAccountEvents>( );
         _ = services.AddTransient<BridgeBeatsBlueskyAuthenticationHandler>( );
         _ = services.AddScoped<BlueskySessionService>( );
+        _ = services.AddHttpContextAccessor( );
+        _ = services.AddMemoryCache( );
         services.TryAddSingleton<IDidHandleResolver>( _ => new DidHandleCache( ) );
         _ = services.AddAuthentication( ).AddBluesky( options => {
             options.Cookie.Name = CookieName;
@@ -58,8 +60,8 @@ internal static class BlueskyAuthenticationConfiguration {
             options.EventsType = typeof( BlueskyAccountEvents );
         } );
         _ = services.AddOptions<BlueskyAuthenticationOptions>( BlueskyAuthenticationDefaults.AuthenticationScheme )
-            .Configure<ILoggerFactory>( ( options, loggerFactory ) => {
-                options.IdentityStore = new SqliteIdentityStore( settings.IdentityConnectionString, loggerFactory: loggerFactory );
+            .Configure<ILoggerFactory, IHttpContextAccessor>( ( options, loggerFactory, httpContextAccessor ) => {
+                options.IdentityStore = new BridgeBeatsIdentityStore( settings.IdentityConnectionString, httpContextAccessor, loggerFactory );
                 options.CorrelationStateCache = new SqliteCorrelationStateCache( settings.IdentityConnectionString, loggerFactory: loggerFactory );
             } );
         // SDK v8 registers its concrete handler through AddBluesky. Our handler must run before
@@ -121,12 +123,12 @@ internal static class BlueskyAuthenticationConfiguration {
 
     // Keep existing installer-generated JWK secrets and their key IDs valid; PEM is also accepted.
     internal static OAuthClientSigningKey? LoadSigningKey( string path, bool optional ) {
-        if (optional && (string.IsNullOrWhiteSpace( path ) || !File.Exists( path ))) {
+        if (optional && string.IsNullOrWhiteSpace( path )) {
             return null;
         }
         string contents = File.ReadAllText( path );
-        if (optional && (string.IsNullOrWhiteSpace( contents ) || contents.Trim( ) == "{}")) {
-            return null;
+        if (string.IsNullOrWhiteSpace( contents ) || contents.Trim( ) == "{}") {
+            throw new InvalidDataException( $"ATProto OAuth signing key file is empty: {path}" );
         }
         if (contents.TrimStart( ).StartsWith( '{' )) {
             using ATProtoSigningKeyProvider key = new( contents );

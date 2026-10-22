@@ -16,6 +16,7 @@ namespace BridgeBeats.Core.Infrastructure.Migrations {
                     "Did" TEXT NOT NULL COLLATE BINARY,
                     "Identity" BLOB NOT NULL,
                     "ExpiresAtUtcTicks" INTEGER NOT NULL,
+                    "ProofKeyHash" TEXT COLLATE BINARY,
                     PRIMARY KEY ("Did")
                 ) WITHOUT ROWID;
 

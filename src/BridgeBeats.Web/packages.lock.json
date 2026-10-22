@@ -4,7 +4,7 @@
     "net10.0": {
       "idunno.Bluesky.AspNet.Authentication": {
         "type": "Direct",
-        "requested": "[8.0.0, )",
+        "requested": "[8.0.0, 8.0.0]",
         "resolved": "8.0.0",
         "contentHash": "u21lYA0GjyayfaSfikHZ1qQ4v7/i4kJB0t7vQihWa1YMI/u8Y4VkLOi6GDdhGmM1QkkO2FdhWBCCJrPsMGlcLA==",
         "dependencies": {
@@ -13,7 +13,7 @@
       },
       "idunno.Bluesky.AspNet.Authentication.SQLite": {
         "type": "Direct",
-        "requested": "[8.0.0, )",
+        "requested": "[8.0.0, 8.0.0]",
         "resolved": "8.0.0",
         "contentHash": "YMsluTgQi4+OBXt4LzUcTal8M3/s61pcm/v0SMe9Qago0RU1z8Smo65W7XVUm9MMEX0B1+l66otEqu45c2Pw+w==",
         "dependencies": {
@@ -607,8 +607,8 @@
       "bridgebeats.contracts": {
         "type": "Project",
         "dependencies": {
-          "idunno.AtProto": "[8.0.0, )",
-          "idunno.Bluesky": "[8.0.0, )"
+          "idunno.AtProto": "[8.0.0, 8.0.0]",
+          "idunno.Bluesky": "[8.0.0, 8.0.0]"
         }
       },
       "bridgebeats.core": {

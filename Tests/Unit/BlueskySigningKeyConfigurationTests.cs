@@ -53,7 +53,17 @@ public class BlueskySigningKeyConfigurationTests {
             Assert.IsNotNull( BlueskyAuthenticationConfiguration.LoadSigningKey( path, optional: false ) );
             File.Delete( path );
             _ = Assert.ThrowsExactly<FileNotFoundException>( ( ) => BlueskyAuthenticationConfiguration.LoadSigningKey( path, optional: false ) );
-            Assert.IsNull( BlueskyAuthenticationConfiguration.LoadSigningKey( path, optional: true ) );
+            _ = Assert.ThrowsExactly<FileNotFoundException>( ( ) => BlueskyAuthenticationConfiguration.LoadSigningKey( path, optional: true ) );
+        } finally { File.Delete( path ); }
+    }
+
+    [TestMethod]
+    public void PublicClientRequiresUnsetPath_AndPlaceholderKeyFails( ) {
+        Assert.IsNull( BlueskyAuthenticationConfiguration.LoadSigningKey( string.Empty, optional: true ) );
+        string path = Path.GetTempFileName( );
+        try {
+            File.WriteAllText( path, "{}" );
+            _ = Assert.ThrowsExactly<InvalidDataException>( ( ) => BlueskyAuthenticationConfiguration.LoadSigningKey( path, optional: true ) );
         } finally { File.Delete( path ); }
     }
 

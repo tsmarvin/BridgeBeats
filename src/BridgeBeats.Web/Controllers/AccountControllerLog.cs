@@ -86,6 +86,13 @@ public partial class AccountController {
         Message = "Failed to complete ATProto OAuth callback" )]
     private partial void LogAtProtoCallbackFailed( Exception ex );
 
+    /// <summary>Logs an SDK callback failure without recording OAuth secrets.</summary>
+    [LoggerMessage(
+        EventId = Logging.LogEventIds.Controllers.AccountControllerAtProtoCallbackRejected,
+        Level = LogLevel.Warning,
+        Message = "ATProto OAuth callback rejected: {Reason}" )]
+    private partial void LogAtProtoCallbackRejected( string reason );
+
     /// <summary>Logs the OAuth error code returned by the authorization server.</summary>
     [LoggerMessage(
         EventId = Logging.LogEventIds.Controllers.AccountControllerAtProtoOAuthServerError,

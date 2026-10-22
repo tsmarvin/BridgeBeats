@@ -112,33 +112,22 @@ namespace BridgeBeats.Web.Configuration {
         /// </summary>
         public string Domain { get; set; } = string.Empty;
 
-        /// <summary>
-        /// Normalizes a domain value into a scheme-qualified URL by trimming a trailing slash and
-        /// prefixing <c>https://</c> when the value does not already start with <c>https://</c>.
-        /// Only the literal prefix <c>https://</c> is recognized; a value that starts with
-        /// <c>http://</c> is not treated as scheme-present and will be double-prefixed
-        /// (becoming <c>https://http://…</c>). In practice <see cref="Domain"/> holds a bare
-        /// hostname, so the double-prefix case does not arise at runtime today.
-        /// </summary>
+        /// <summary>Normalizes a valid configured host or HTTPS origin to its HTTPS authority.</summary>
         /// <param name="domain">The raw domain value to normalize.</param>
         /// <returns>The normalized <c>https://</c> URL, or <c>null</c> when the input is null or whitespace.</returns>
         public static string? NormalizeDomain( string? domain ) {
-            if (string.IsNullOrWhiteSpace( domain )) {
-                return null;
-            }
-
-            string trimmed = domain.TrimEnd( '/' );
-            return trimmed.StartsWith( "https://", StringComparison.OrdinalIgnoreCase )
-                ? trimmed
-                : $"https://{trimmed}";
+            return AuthenticationOrigin.Parse( domain )?.Origin.GetLeftPart( UriPartial.Authority );
         }
 
         /// <summary>
-        /// Filesystem path to the JWK file holding the ATProto OAuth client-assertion signing key. When the
+        /// Filesystem path to the JWK or PEM file holding the ATProto OAuth client signing key. When the
         /// file is absent, empty, or <c>{}</c>, client-assertion signing is not configured and the ATProto
-        /// OAuth service operates as a public client.
+        /// OAuth client operates as a public client.
         /// </summary>
         public string ATProtoOAuthSigningKeyPath { get; set; } = string.Empty;
+
+        /// <summary>Previous OAuth signing keys retained for refresh and revocation of existing sessions.</summary>
+        public string[] ATProtoOAuthAdditionalSigningKeyPaths { get; set; } = [];
 
         /// <summary>
         /// Directory where application log files are written. Defaults to <c>./logs</c>.

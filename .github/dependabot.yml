@@ -10,6 +10,11 @@ updates:
     schedule:
       interval: "weekly"
     groups:
+      # The authentication handler hooks SDK v8 cookie reads; review these packages together.
+      bluesky-oauth-sdk:
+        patterns:
+          - "idunno.Bluesky*"
+          - "idunno.AtProto*"
       entity-framework-core:
         patterns:
           - "Microsoft.EntityFrameworkCore*"

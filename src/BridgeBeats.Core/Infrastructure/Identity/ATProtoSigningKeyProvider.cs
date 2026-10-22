@@ -8,27 +8,16 @@ namespace BridgeBeats.Core.Infrastructure.Identity;
 /// assertions. This key is shared across all sessions and is distinct from the per-session DPoP keys.
 /// </summary>
 /// <remarks>
-/// Constructed from a JWK JSON string supplied at startup (typically loaded from a configured file
-/// path). Only a single key is ever held and emitted in the public JWKS. Rotation is operational:
-/// replace the key file and restart the process. There is no in-process rotation or multi-key JWKS.
-/// The JWK contains the private parameter <c>d</c>; the public JWKS emitted by
-/// <see cref="GetPublicJwks"/> never includes that private material.
+/// Constructed from a JWK JSON string supplied at startup. The SDK publishes the public JWKS
+/// and handles active and retained signing keys.
 /// </remarks>
 public sealed class ATProtoSigningKeyProvider : IDisposable {
-
-    private static readonly JsonSerializerOptions s_indentedJsonOptions = new( ) { WriteIndented = true };
 
     /// <summary>Gets the ECDSA signing key, including its private parameters, used to sign client assertions.</summary>
     public ECDsa SigningKey { get; }
 
     /// <summary>Gets the key identifier (<c>kid</c>) matching the published JWKS.</summary>
     public string KeyId { get; }
-
-    /// <summary>Gets the base64url-encoded public X coordinate of the signing key.</summary>
-    public string PublicKeyX { get; }
-
-    /// <summary>Gets the base64url-encoded public Y coordinate of the signing key.</summary>
-    public string PublicKeyY { get; }
 
     private bool _disposed;
 
@@ -74,8 +63,6 @@ public sealed class ATProtoSigningKeyProvider : IDisposable {
         string y = yProp.GetString( )!;
         string d = dProp.GetString( )!;
 
-        PublicKeyX = x;
-        PublicKeyY = y;
         KeyId = kidProp.GetString( )!;
 
         // Create the ECDsa key from JWK parameters
@@ -88,31 +75,6 @@ public sealed class ATProtoSigningKeyProvider : IDisposable {
             Q = new ECPoint { X = xBytes, Y = yBytes },
             D = dBytes
         } );
-    }
-
-    /// <summary>
-    /// Builds the public JWKS document for publishing at the jwks_uri endpoint.
-    /// </summary>
-    /// <returns>
-    /// An indented JSON JWKS containing the single public key (algorithm <c>ES256</c>, use <c>sig</c>).
-    /// The private parameter is not included.
-    /// </returns>
-    public string GetPublicJwks( ) {
-        var jwks = new {
-            keys = new[] {
-                new {
-                    kty = "EC",
-                    crv = "P-256",
-                    x = PublicKeyX,
-                    y = PublicKeyY,
-                    kid = KeyId,
-                    alg = "ES256",
-                    use = "sig"
-                }
-            }
-        };
-
-        return JsonSerializer.Serialize( jwks, s_indentedJsonOptions );
     }
 
     /// <summary>

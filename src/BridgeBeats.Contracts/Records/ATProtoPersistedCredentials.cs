@@ -3,9 +3,8 @@ using System.Text.Json.Serialization;
 namespace BridgeBeats.Contracts.Records;
 
 /// <summary>
-/// The persisted, serialized form of a user's AT Protocol credentials, written to storage
-/// as camelCase JSON. This is the at-rest counterpart to the live <see cref="ATProtoOAuthResult"/>
-/// produced during an OAuth exchange.
+/// The persisted, serialized form of the AT Protocol service account's credentials, written to
+/// Redis as camelCase JSON by the session manager.
 /// </summary>
 /// <remarks>
 /// Per idunno.Bluesky guidance, access tokens are short-lived and are NOT persisted; only the
@@ -18,7 +17,7 @@ namespace BridgeBeats.Contracts.Records;
 /// </remarks>
 public sealed record ATProtoPersistedCredentials {
 
-    /// <summary>The OAuth refresh token used to mint new access tokens for this account.</summary>
+    /// <summary>The refresh token used to mint new access tokens for this account.</summary>
     [JsonPropertyName( "refreshToken" )]
     public required string RefreshToken { get; init; }
 

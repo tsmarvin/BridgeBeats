@@ -43,7 +43,62 @@ The installation script auto-generates `internal_service_key.txt`. When configur
 
 \* Required only when using ATProto PDS storage for caching lookup results. See the [ATProto Lexicon Resolution Setup Guide](ATPROTO_LEXICON.md) for complete configuration instructions.
 
-The ATProto OAuth signing key is supplied separately as the `atproto_oauth_key` Docker secret (an ES256 JWK). The container reads it from `/run/secrets/atproto_oauth_key`; the application setting is `ATProtoOAuthSigningKeyPath`. When the file is absent, empty, or `{}`, the ATProto OAuth service runs as a public client.
+### Bluesky sign-in
+
+Authentication derives its canonical HTTPS origin and OAuth metadata URLs from `BridgeBeats:Domain`. For a full deployment, use a bare hostname: card and playlist services add their own `https://` prefix, and the Docker stack also uses `DOMAIN` for Caddy and the dashboard.
+
+The authentication configuration accepts a bare hostname or an explicit HTTPS origin, with an optional port and root slash; surrounding whitespace is ignored. HTTP, user information, non-root paths, query strings, fragments, and malformed hosts or ports are rejected at startup. An empty value disables Bluesky sign-in and canonical host and port checks.
+
+Open the login and registration pages on that canonical origin. GET and HEAD requests for `/account/login` or `/account/register` using another hostname or public port redirect there before the pages issue authentication or antiforgery cookies. POST requests to those routes or `/account/login-atproto` using another hostname or public port return HTTP `400` JSON with a canonical `loginUrl`. Other hosts can still serve music links and `/account/antiforgery-token`. Caddy can continue forwarding the canonical host over internal HTTP after terminating public HTTPS.
+
+The ATProto OAuth signing key is supplied separately as the `atproto_oauth_key` Docker secret. The container reads it from `/run/secrets/atproto_oauth_key`; the application setting is `ATProtoOAuthSigningKeyPath`. Existing ES256 JWK files remain supported, including their original key IDs. Unencrypted P-256 PEM keys are also accepted. Leave `ATProtoOAuthSigningKeyPath` unset to run as a public client. If a path is configured, a missing, empty, or `{}` file fails startup instead of silently switching client type.
+
+Bluesky sign-in uses `idunno.Bluesky.AspNet.Authentication` with the SQLite identity and correlation stores in the existing Identity database. Its credentials and pending-login secrets are encrypted with the shared ASP.NET Data Protection key ring. Keep both the database and `DataProtectionKeyPath` persistent across restarts. Access tokens are refreshed by the authentication handler as requests arrive, with SQLite refresh locks coordinating concurrent requests and instances.
+
+The identity store holds one OAuth session per DID. Signing in on another browser replaces the shared credentials while keeping existing browser tickets valid. Signing out removes the stored session and rotates the local account's security stamp, ending every browser session for that DID. Credential refresh writes are conditional on the OAuth session that started them, so an in-flight refresh cannot recreate a removed session or replace a newer login.
+
+The protected browser ticket binds the DID to the local user ID and Identity security stamp. Each request validates that binding and ticket expiration before the SDK can access stored credentials. Deleting and recreating an account, or explicitly signing out, invalidates earlier tickets. Rejected tickets only clear the browser cookie; they cannot refresh or revoke a newer session. Cookies issued without these bindings require a new Bluesky sign-in.
+
+The local claims principal is cached in each app instance for one minute by user ID and security stamp. This avoids repeated role and claim queries for dashboard assets. The account binding and shared OAuth identity are still read on each request, so logout and account deletion take effect across instances immediately. Role-claim changes that do not change the user's stamps may take up to one minute to appear.
+
+Both Identity and Bluesky application cookies use the configured origin's hostname for cookie scope, without a scheme or port. Dotted DNS names share those cookies with their subdomains so Caddy's dashboard forward-auth can authenticate signed-in users; dashboard access still requires the `AspireDashboardAccess` role. Localhost, IP addresses, and single-label hosts use host-only cookies. The Bluesky application cookie is named `__Secure-BridgeBeats.Bluesky` and is secure and HTTP-only. The SDK's OAuth correlation cookie remains host-only; start sign-in on the canonical origin so the callback can receive it.
+
+The requested permissions are `atproto repo:link.bridgebeats.playlist`. The required `atproto` scope identifies the account by its stable DID; BridgeBeats maps that DID to its existing local user ID, so changes to a handle retain the same account and API keys. The playlist scope permits records in the BridgeBeats playlist collection. Profile permissions and broad Bluesky app permissions are not requested.
+
+The SDK publishes generated client metadata at `/oauth-client-metadata.json`, including public signing keys inline in `jwks` for confidential clients. This conventional client ID lets Bluesky display the application's hostname on its consent screen. Bluesky controls whether custom names and logos are displayed; publishing them does not grant trusted-client status. Metadata links to the existing full-color logo, `/Home/Tos`, and `/Home/Privacy`. This replaces the former `/.well-known/client-metadata.json` client ID and separate `/.well-known/jwks.json` endpoint. The callback remains `/account/atproto-callback`; logins started with the old client ID must be restarted after upgrading.
+
+When upgrading from the custom OAuth implementation, the application applies a migration at startup that creates the SDK stores and removes the old pending-login table and user-token columns. Users, DIDs, API keys, playlists, and Apple Music credentials are retained. Existing Bluesky users must sign in again to establish an SDK-managed OAuth session; logins already in progress must be restarted. Treat this as a forward-only deployment change: the previous application image is incompatible with the migrated database. Changing only the image tag or digest does not undo this upgrade, and reversing the schema cannot recover removed OAuth credentials. See the [deployment upgrade disclosure](DEPLOYMENT.md#bluesky-oauth-upgrade).
+
+#### Signing-key rotation
+
+Configure previous JWK or PEM file paths in `BridgeBeats:ATProtoOAuthAdditionalSigningKeyPaths`. New sign-ins use the active key; existing sessions keep their recorded key ID for refresh and revocation. Retain each old private key until no session needs it. Preserve a JWK's original `kid` and file format when retaining it; PEM key IDs are derived from the public-key thumbprint. Every configured key must have a unique ID, and previous keys require an active signing key. The metadata publishes the public parts of both active and previous keys.
+
+For a deployment that manages its own `appsettings.json`, use these settings inside the `BridgeBeats` section and restart every instance after changing keys:
+
+```json
+"ATProtoOAuthSigningKeyPath": "/run/secrets/atproto_oauth_key",
+"ATProtoOAuthAdditionalSigningKeyPaths": [ "/run/secrets/atproto_oauth_previous_key" ]
+```
+
+For Docker Compose, the entrypoint rewrites `appsettings.json` at startup. Configure retained keys through a Compose override:
+
+1. Before replacing `./secrets/atproto_oauth_key.json`, copy it to `./secrets/atproto_oauth_previous_key.json`. Keep the copy readable by the application container's UID `1654` and protected as a private key.
+2. Create or extend `docker-compose.override.yml` beside the installed `docker-compose.yml`:
+
+   ```yaml
+   services:
+     bridgebeats:
+       environment:
+         BridgeBeats__ATProtoOAuthAdditionalSigningKeyPaths__0: /run/secrets/atproto_oauth_previous_key
+       volumes:
+         - ./secrets/atproto_oauth_previous_key.json:/run/secrets/atproto_oauth_previous_key:ro
+   ```
+
+3. Replace the contents of `./secrets/atproto_oauth_key.json` with the new ES256 JWK or unencrypted P-256 PEM key. The existing mount keeps this as the active key at `/run/secrets/atproto_oauth_key`.
+4. Run `docker compose config --quiet` to validate the merged configuration, then `docker compose up -d --force-recreate bridgebeats` to load the keys. Keep the override file for subsequent deployments; Compose loads it alongside `docker-compose.yml`.
+5. Check `/oauth-client-metadata.json` for both public key IDs. Verify that a session established before rotation can still refresh and sign out, and that a new sign-in succeeds.
+
+For further rotations, retain a separate file for each key still in use and add matching read-only mounts and environment entries ending in `__1`, `__2`, and so on. Remove an old key's path and mount only after its sessions have ended, then recreate the application container.
 
 ### Discord Worker Configuration
 

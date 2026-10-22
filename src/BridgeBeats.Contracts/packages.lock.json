@@ -4,7 +4,7 @@
     "net10.0": {
       "idunno.AtProto": {
         "type": "Direct",
-        "requested": "[8.0.0, )",
+        "requested": "[8.0.0, 8.0.0]",
         "resolved": "8.0.0",
         "contentHash": "CyXSLf43r0lDEpUWIA+ffbHcDzvQNErsOQw8EOE23ryE3HH5C/eiAKPXZI2WaXUhPpHU3vLSkr+lSYptU2aEbQ==",
         "dependencies": {
@@ -27,7 +27,7 @@
       },
       "idunno.Bluesky": {
         "type": "Direct",
-        "requested": "[8.0.0, )",
+        "requested": "[8.0.0, 8.0.0]",
         "resolved": "8.0.0",
         "contentHash": "TjZCWvwmbkAA/JMk176sHUaQPNccGAxZLa1DEOcwf1ul6dOtyRp9BHkdvCMNW3gw5f+sB3YAwLLq9jYQNsig7w==",
         "dependencies": {

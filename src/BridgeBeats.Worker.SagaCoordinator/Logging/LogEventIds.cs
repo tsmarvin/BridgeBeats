@@ -4,9 +4,10 @@ namespace BridgeBeats.Worker.SagaCoordinator.Logging;
 /// Stable numeric event identifiers for the SagaCoordinator worker's structured log messages (5000-5249).
 /// Extends <see cref="Core.Infrastructure.Logging.LogEventIds"/> with SagaCoordinator-specific EventIds.
 /// Each constant is the <c>EventId</c> assigned to a corresponding
-/// <see cref="Microsoft.Extensions.Logging.LoggerMessageAttribute"/> method on
-/// <see cref="SagaCoordinatorBackgroundService"/>. The SagaCoordinator messages occupy the
-/// 5000–5099 range; values are part of the logging contract and must not be changed once shipped.
+/// <see cref="Microsoft.Extensions.Logging.LoggerMessageAttribute"/> method. The
+/// <see cref="SagaCoordinatorBackgroundService"/> messages occupy the 5000–5099 range, and the
+/// <see cref="Program"/> startup messages occupy 5100–5124; values are part of the logging
+/// contract and must not be changed once shipped.
 /// </summary>
 public static class LogEventIds {
     /// <summary>The coordinator host has started and is wiring up its subscriptions and polling loop.</summary>
@@ -170,4 +171,14 @@ public static class LogEventIds {
 
     /// <summary>Post-release cache indexing failed; the result is already written and waiters are released, so the failure is swallowed.</summary>
     public const int PostReleaseIndexFailed = 5055;
+
+    /// <summary>Persisting a terminal zero-result saga for refresh review failed; terminal cleanup continues.</summary>
+    public const int RefreshReviewPersistenceFailed = 5056;
+
+    #region Program Startup (5100-5124)
+
+    /// <summary>The set of providers enabled for secondary lookups, logged once at startup after the logging pipeline is live.</summary>
+    public const int EnabledProviders = 5100;
+
+    #endregion
 }

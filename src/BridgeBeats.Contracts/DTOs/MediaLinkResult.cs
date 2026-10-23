@@ -37,20 +37,15 @@ public sealed class MediaLinkResult {
     public DateTime LookedUpAt { get; init; }
 
     /// <summary>
-    /// <see langword="true"/> when the aggregate is incomplete — some providers were rate-limited
-    /// and have not yet resolved, so <see cref="Results"/> does not cover every expected provider.
+    /// <see langword="true"/> when this API result was returned before its coordinating saga
+    /// finalized and a more complete provider set may follow. This is transient response metadata:
+    /// it is derived from saga state and is never persisted to the PDS record.
     /// </summary>
-    /// <remarks>
-    /// When <see langword="true"/>, <see cref="RateLimitedProviders"/> lists the providers that were
-    /// rate-limited and will be retried later; the result may be updated when those providers
-    /// complete.
-    /// </remarks>
     public bool IsPartial { get; set; }
 
     /// <summary>
     /// Providers currently rate-limited and therefore not yet resolved, or <see langword="null"/>
-    /// when none are rate-limited. Only populated when <see cref="IsPartial"/> is
-    /// <see langword="true"/>.
+    /// when none are rate-limited.
     /// </summary>
     public List<SupportedProviders>? RateLimitedProviders { get; set; }
 

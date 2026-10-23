@@ -17,7 +17,7 @@ read_secret() {
 export DOTNET_ENVIRONMENT="${DOTNET_ENVIRONMENT:-Production}"
 export ASPNETCORE_ENVIRONMENT="${ASPNETCORE_ENVIRONMENT:-$DOTNET_ENVIRONMENT}"
 
-# ---- Configure Aspire Dashboard (Aspire 13.4) ----
+# ---- Configure Aspire Dashboard ----
 # Allow unsecured transport since we use HTTP behind Caddy reverse proxy (Caddy handles HTTPS)
 export ASPIRE_ALLOW_UNSECURED_TRANSPORT="true"
 # Dashboard auth is handled by Caddy forward_auth, so we disable all dashboard auth
@@ -242,7 +242,8 @@ export Parameters__ResilienceAttemptTimeoutSeconds="$RESILIENCE_ATTEMPT_TIMEOUT_
 
 # 5) Configure Aspire DCP paths (required for containerized deployment)
 export DcpPublisher__CliPath="/app/tools/dcp/dcp"
-export DcpPublisher__DashboardPath="/app/tools/dashboard/Aspire.Dashboard.dll"
+# Aspire 13.6 packages the dashboard as a native executable without a managed DLL or runtimeconfig.
+export DcpPublisher__DashboardPath="/app/tools/dashboard/Aspire.Dashboard"
 
 # 6) Launch the BridgeBeats AppHost (orchestrator)
 echo "Starting BridgeBeats AppHost (Environment: $DOTNET_ENVIRONMENT)..."

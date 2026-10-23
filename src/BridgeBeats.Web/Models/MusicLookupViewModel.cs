@@ -45,6 +45,12 @@ namespace BridgeBeats.Web.Models {
             /// The per-provider lookup result for <see cref="PrimaryProvider"/>.
             /// </summary>
             public MusicLookupResult PrimaryResult { get; set; } = null!;
+
+            /// <summary>
+            /// <see langword="true"/> when a non-finalized saga is still active for this result,
+            /// meaning the lookup is in progress and more provider results may arrive.
+            /// </summary>
+            public bool IsLookupInProgress { get; set; }
         }
     }
 }

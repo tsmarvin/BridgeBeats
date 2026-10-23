@@ -1,5 +1,8 @@
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Text.RegularExpressions;
 using BridgeBeats.Contracts.Enums;
+using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
 using BridgeBeats.Core.Infrastructure.Queue;
 using Microsoft.Extensions.Logging;
@@ -21,7 +24,307 @@ namespace BridgeBeats.Tests.Integration;
 [TestClass]
 [TestCategory( "Integration" )]
 [TestCategory( "Docker" )]
+[DoNotParallelize]
 public partial class RedisRequestQueueTests {
+
+    /// <summary>Generic dequeue emits one scoped span and measurement for each Redis boundary.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task DequeueAsync_TelemetryHasExactOuterReadDepthAndPelBoundaries( ) {
+        List<string> spans = [];
+        Dictionary<string, int> measurements = [];
+        using ActivityListener activityListener = new( ) {
+            ShouldListenTo = source => source.Name == QueueMetrics.MeterName,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+            ActivityStopped = activity => spans.Add( activity.OperationName )
+        };
+        using MeterListener meterListener = new( );
+        meterListener.InstrumentPublished = ( instrument, listener ) => {
+            if (instrument.Meter.Name == QueueMetrics.MeterName
+                && (instrument.Name.Contains( "dequeue", StringComparison.Ordinal ))) {
+                listener.EnableMeasurementEvents( instrument );
+            }
+        };
+        meterListener.SetMeasurementEventCallback<double>( ( instrument, _, _, _ ) =>
+            measurements[instrument.Name] = measurements.GetValueOrDefault( instrument.Name ) + 1 );
+        ActivitySource.AddActivityListener( activityListener );
+        meterListener.Start( );
+
+        await _queue.EnqueueAsync( CreateTestRequest( ), QueuePriority.Interactive, TestContext.CancellationToken );
+        Mock<BridgeBeats.Contracts.Interfaces.IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( t => t.GetAllRateLimitedAsync( It.IsAny<SupportedProviders>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [] );
+        _ = await _queue.DequeueAsync( tracker.Object, TestContext.CancellationToken );
+
+        _ = Assert.ContainsSingle( spans.Where( name => name == "queue.dequeue" ) );
+        Assert.Contains( "queue.dequeue.depth_probe", spans );
+        Assert.Contains( "queue.dequeue.pel_scan", spans );
+        Assert.Contains( "queue.dequeue.read_group", spans );
+        Assert.AreEqual( 1, measurements.GetValueOrDefault( "bridgebeats.queue.dequeue.depth_probe.duration" ) );
+        Assert.IsGreaterThan( 0, measurements.GetValueOrDefault( "bridgebeats.queue.dequeue.pel_scan.duration" ) );
+        Assert.IsGreaterThan( 0, measurements.GetValueOrDefault( "bridgebeats.queue.dequeue.read_group.duration" ) );
+    }
+
+    /// <summary>Both public dequeue overloads close their Redis-boundary telemetry on NOGROUP errors.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task DequeueAsync_NogroupException_ClosesPlainAndRateAwareTelemetry( ) {
+        List<string> spans = [];
+        using ActivityListener activityListener = new( ) {
+            ShouldListenTo = source => source.Name == QueueMetrics.MeterName,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+            ActivityStopped = activity => spans.Add( activity.OperationName )
+        };
+        ActivitySource.AddActivityListener( activityListener );
+
+        IDatabase db = s_redis!.GetDatabase( );
+        string stream = $"queue:{s_runToken}:spotify:interactive";
+        _ = await db.ExecuteAsync( "XGROUP", "DESTROY", stream, "spotify-workers" );
+        _ = await Assert.ThrowsAsync<RedisServerException>(
+            ( ) => _queue.DequeueAsync( TestContext.CancellationToken ) );
+        await _queue.EnsureConsumerGroupsAsync( TestContext.CancellationToken );
+        _ = await db.ExecuteAsync( "XGROUP", "DESTROY", stream, "spotify-workers" );
+        Mock<BridgeBeats.Contracts.Interfaces.IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( t => t.GetAllRateLimitedAsync( It.IsAny<SupportedProviders>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [] );
+        _ = await Assert.ThrowsAsync<RedisServerException>(
+            ( ) => _queue.DequeueAsync( tracker.Object, TestContext.CancellationToken ) );
+        await _queue.EnsureConsumerGroupsAsync( TestContext.CancellationToken );
+
+        Assert.IsGreaterThanOrEqualTo( 2, spans.Count( name => name == "queue.dequeue" ) );
+        Assert.Contains( "queue.dequeue.depth_probe", spans );
+        Assert.Contains( "queue.dequeue.read_group", spans );
+        Assert.Contains( "queue.dequeue.pel_scan", spans );
+    }
+
+    /// <summary>Deletes a claimed stream body and verifies the dequeue scan removes its ghost PEL entry.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task DequeueAsync_GhostPelEntry_IsRemovedOnScan( ) {
+        string stream = $"queue:{s_runToken}:spotify:interactive";
+        IDatabase db = s_redis!.GetDatabase();
+        List<string> ghostIds = [];
+        for (int i = 0; i < 50; i++) {
+            await _queue.EnqueueAsync( CreateTestRequest( ), QueuePriority.Interactive, TestContext.CancellationToken );
+            QueuedMessage<QueuedLookupRequest>? claimed = await _queue.DequeueAsync(TestContext.CancellationToken);
+            Assert.IsNotNull( claimed );
+            ghostIds.Add( claimed.MessageId[(claimed.MessageId.LastIndexOf( ':' ) + 1)..] );
+        }
+        _ = await db.StreamDeleteAsync( stream, [.. ghostIds.Select( id => (RedisValue)id )] );
+        Mock<BridgeBeats.Contracts.Interfaces.IRateLimitTracker> tracker = new();
+        _ = tracker.Setup( t => t.GetAllRateLimitedAsync( It.IsAny<SupportedProviders>( ), It.IsAny<CancellationToken>( ) ) ).ReturnsAsync( [] );
+        _ = await _queue.DequeueAsync( tracker.Object, TestContext.CancellationToken );
+        RedisResult pendingSummary = await db.ExecuteAsync("XPENDING", stream, "spotify-workers");
+        RedisResult[] pendingParts = (RedisResult[])pendingSummary!;
+        Assert.AreEqual( 0, (long)pendingParts[0] );
+        Assert.IsEmpty( await db.StreamRangeAsync( stream, ghostIds.First( ), ghostIds.Last( ) ) );
+        Assert.IsNull( await _queue.DequeueAsync( tracker.Object, TestContext.CancellationToken ) );
+    }
+
+    /// <summary>Own-PEL pagination eventually reaches entries beyond the per-call scan cap.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task DequeueAsync_OwnPelPagination_ReachesEntriesBeyondFifty( ) {
+        const int Count = 505;
+        Mock<BridgeBeats.Contracts.Interfaces.IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( t => t.GetAllRateLimitedAsync( It.IsAny<SupportedProviders>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [new RateLimitedEndpoint( "IsrcLookup", DateTimeOffset.UtcNow.AddMinutes( 5 ) )] );
+        for (int i = 0; i < Count; i++) {
+            await _queue.EnqueueAsync( CreateTestRequest( ) with { RateLimitedEndpoint = "IsrcLookup" }, QueuePriority.Interactive, TestContext.CancellationToken );
+        }
+        QueuedLookupRequest tailRequest = CreateTestRequest( lookupType: LookupRequestType.SongIdLookup );
+        await _queue.EnqueueAsync( tailRequest, QueuePriority.Interactive, TestContext.CancellationToken );
+
+        // Seed the current consumer's PEL without using the rate-aware path: the first 505 entries
+        // are deliberately blocked, so the rate-aware scan must advance past them to the tail.
+        for (int i = 0; i < Count; i++) {
+            QueuedMessage<QueuedLookupRequest>? message = await _queue.DequeueAsync( TestContext.CancellationToken );
+            Assert.IsNotNull( message );
+            _queue.ReleaseDelivery( message.MessageId );
+        }
+        QueuedMessage<QueuedLookupRequest>? seededTail = await _queue.DequeueAsync( TestContext.CancellationToken );
+        Assert.IsNotNull( seededTail );
+        Assert.AreEqual( tailRequest.RequestId, seededTail.Payload.RequestId );
+        _queue.ReleaseDelivery( seededTail.MessageId );
+
+        QueuedMessage<QueuedLookupRequest>? tail = null;
+        for (int i = 0; i < 20 && tail is null; i++) {
+            tail = await _queue.DequeueAsync( tracker.Object, TestContext.CancellationToken );
+        }
+        Assert.IsNotNull( tail );
+        Assert.AreEqual( tailRequest.RequestId, tail.Payload.RequestId );
+    }
+
+    /// <summary>XAUTOCLAIM cursor reaches an aged eligible tail beyond a young dead-consumer prefix.</summary>
+    [TestMethod]
+    [Timeout( 60000, CooperativeCancellation = true )]
+    public async Task DequeueAsync_DeadConsumerPelPagination_ReachesAgedTailBeyondFiveHundred( ) {
+        const int Count = 505;
+        string stream = $"queue:{s_runToken}:spotify:interactive";
+        IDatabase db = s_redis!.GetDatabase( );
+        for (int i = 0; i < Count; i++) {
+            await _queue.EnqueueAsync( CreateTestRequest( ) with { RateLimitedEndpoint = "IsrcLookup" }, QueuePriority.Interactive, TestContext.CancellationToken );
+        }
+        QueuedLookupRequest tailRequest = CreateTestRequest( lookupType: LookupRequestType.SongIdLookup );
+        await _queue.EnqueueAsync( tailRequest, QueuePriority.Interactive, TestContext.CancellationToken );
+        StreamEntry[] claimed = await db.StreamReadGroupAsync( stream, "spotify-workers", "dead-consumer", StreamPosition.NewMessages, Count + 1, noAck: false );
+        Assert.HasCount( Count + 1, claimed );
+        RedisValue[] ids = [.. claimed.Select( entry => entry.Id )];
+        _ = await db.ExecuteAsync( "XCLAIM", stream, "spotify-workers", "dead-consumer", "0", ids[^1], "IDLE", "1800000", "JUSTID" );
+
+        Mock<BridgeBeats.Contracts.Interfaces.IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( t => t.GetAllRateLimitedAsync( It.IsAny<SupportedProviders>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [new RateLimitedEndpoint( "IsrcLookup", DateTimeOffset.UtcNow.AddMinutes( 5 ) )] );
+        QueuedMessage<QueuedLookupRequest>? found = null;
+        for (int i = 0; i < 20 && found is null; i++) {
+            found = await _queue.DequeueAsync( tracker.Object, TestContext.CancellationToken );
+        }
+        Assert.IsNotNull( found );
+        Assert.AreEqual( tailRequest.RequestId, found.Payload.RequestId );
+    }
+
+    /// <summary>Fresh malformed, literal-null, and missing payload entries are ACKed and deleted.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task DequeueAsync_FreshPoisonEntries_AreRemovedFromPelAndStream( ) {
+        string stream = $"queue:{s_runToken}:spotify:interactive";
+        IDatabase db = s_redis!.GetDatabase( );
+        _ = await db.StreamAddAsync( stream, [new NameValueEntry( QueueStreamFieldNames.Payload, "{not-json" )] );
+        _ = await db.StreamAddAsync( stream, [new NameValueEntry( QueueStreamFieldNames.Payload, "null" )] );
+        _ = await db.StreamAddAsync( stream, [new NameValueEntry( QueueStreamFieldNames.EnqueuedAt, DateTimeOffset.UtcNow.ToString( "O" ) )] );
+
+        Mock<BridgeBeats.Contracts.Interfaces.IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( t => t.GetAllRateLimitedAsync( It.IsAny<SupportedProviders>( ), It.IsAny<CancellationToken>( ) ) ).ReturnsAsync( [] );
+        Assert.IsNull( await _queue.DequeueAsync( tracker.Object, TestContext.CancellationToken ) );
+
+        RedisResult pendingSummary = await db.ExecuteAsync( "XPENDING", stream, "spotify-workers" );
+        RedisResult[] pendingParts = (RedisResult[])pendingSummary!;
+        Assert.AreEqual( 0, (long)pendingParts[0] );
+        Assert.IsEmpty( await db.StreamRangeAsync( stream, "-", "+" ) );
+    }
+
+    /// <summary>An already-owned malformed payload is removed from the current consumer PEL.</summary>
+    [TestMethod]
+    public async Task DequeueAsync_OwnPoisonEntry_IsRemovedFromPelAndStream( ) {
+        string stream = $"queue:{s_runToken}:spotify:interactive";
+        IDatabase db = s_redis!.GetDatabase( );
+        RedisValue id = await db.StreamAddAsync( stream, [new NameValueEntry( QueueStreamFieldNames.Payload, "null" )] );
+        string consumer = (string)typeof( RedisRequestQueue<QueuedLookupRequest> )
+            .GetField( "_consumerId", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic )!
+            .GetValue( _queue )!;
+        _ = await db.StreamReadGroupAsync( stream, "spotify-workers", consumer, StreamPosition.NewMessages, 1, noAck: false );
+
+        Mock<BridgeBeats.Contracts.Interfaces.IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( t => t.GetAllRateLimitedAsync( It.IsAny<SupportedProviders>( ), It.IsAny<CancellationToken>( ) ) ).ReturnsAsync( [] );
+        Assert.IsNull( await _queue.DequeueAsync( tracker.Object, TestContext.CancellationToken ) );
+        Assert.IsEmpty( await db.StreamRangeAsync( stream, id, id ) );
+    }
+
+    /// <summary>A malformed payload abandoned by another consumer is reclaimed and removed.</summary>
+    [TestMethod]
+    public async Task DequeueAsync_ReclaimedPoisonEntry_IsRemovedFromPelAndStream( ) {
+        string stream = $"queue:{s_runToken}:spotify:interactive";
+        IDatabase db = s_redis!.GetDatabase( );
+        RedisValue id = await db.StreamAddAsync( stream, [new NameValueEntry( QueueStreamFieldNames.Payload, "{broken" )] );
+        _ = await db.StreamReadGroupAsync( stream, "spotify-workers", "dead-consumer", StreamPosition.NewMessages, 1, noAck: false );
+        _ = await db.ExecuteAsync( "XCLAIM", stream, "spotify-workers", "dead-consumer", 0, id, "IDLE", 1_800_000 );
+
+        Mock<BridgeBeats.Contracts.Interfaces.IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( t => t.GetAllRateLimitedAsync( It.IsAny<SupportedProviders>( ), It.IsAny<CancellationToken>( ) ) ).ReturnsAsync( [] );
+        Assert.IsNull( await _queue.DequeueAsync( tracker.Object, TestContext.CancellationToken ) );
+        Assert.IsEmpty( await db.StreamRangeAsync( stream, id, id ) );
+    }
+
+    /// <summary>Redis does not reclaim a live entry while it is below the generic worker idle threshold.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task AutoClaim_BelowIdleThreshold_DoesNotReclaim( ) {
+        string stream = $"queue:{s_runToken}:spotify:interactive";
+        await _queue.EnqueueAsync( CreateTestRequest( ), QueuePriority.Interactive, TestContext.CancellationToken );
+        QueuedMessage<QueuedLookupRequest>? claimed = await _queue.DequeueAsync(TestContext.CancellationToken);
+        Assert.IsNotNull( claimed );
+        string id = claimed.MessageId[(claimed.MessageId.LastIndexOf(':') + 1)..];
+        _ = await s_redis!.GetDatabase( ).ExecuteAsync( "XCLAIM", stream, "spotify-workers", "probe-consumer", 1, id, "IDLE", 1 );
+        RedisRequestQueue<QueuedLookupRequest> second = NewQueue("probe-consumer");
+        Mock<BridgeBeats.Contracts.Interfaces.IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( t => t.GetAllRateLimitedAsync( It.IsAny<SupportedProviders>( ), It.IsAny<CancellationToken>( ) ) ).ReturnsAsync( [] );
+        Assert.IsNull( await second.DequeueAsync( tracker.Object, TestContext.CancellationToken ) );
+        RedisResult pending = await s_redis!.GetDatabase( ).ExecuteAsync( "XPENDING", stream, "spotify-workers" );
+        Assert.IsGreaterThan( 0, (long)((RedisResult[])pending!)[0] );
+    }
+
+    /// <summary>Redis XAUTOCLAIM reassigns a pending entry once the idle threshold is met.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task AutoClaim_EligibleIdleEntry_IsReclaimed( ) {
+        string stream = $"queue:{s_runToken}:spotify:interactive";
+        await _queue.EnqueueAsync( CreateTestRequest( ), QueuePriority.Interactive, TestContext.CancellationToken );
+        QueuedMessage<QueuedLookupRequest>? claimed = await _queue.DequeueAsync(TestContext.CancellationToken);
+        Assert.IsNotNull( claimed );
+        string id = claimed.MessageId[(claimed.MessageId.LastIndexOf(':') + 1)..];
+        IDatabase db = s_redis!.GetDatabase( );
+        _ = await db.ExecuteAsync( "XCLAIM", stream, "spotify-workers", "dead-consumer", 0, id, "TIME", 1 );
+        StreamAutoClaimResult aged = await db.StreamAutoClaimAsync( stream, "spotify-workers", "probe", 15 * 60 * 1000, "0-0", 10 );
+        Assert.IsNotNull( aged.ClaimedEntries.FirstOrDefault( entry => entry.Id == id ) );
+        // Reassign the aged entry to the dead consumer without waiting so the production dequeue
+        // surface must reclaim it.
+        _ = await db.ExecuteAsync( "XCLAIM", stream, "spotify-workers", "dead-consumer", 0, id, "TIME", 1 );
+        RedisRequestQueue<QueuedLookupRequest> second = NewQueue("reclaimer");
+        await second.EnsureConsumerGroupsAsync( TestContext.CancellationToken );
+        Mock<BridgeBeats.Contracts.Interfaces.IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( t => t.GetAllRateLimitedAsync( It.IsAny<SupportedProviders>( ), It.IsAny<CancellationToken>( ) ) ).ReturnsAsync( [] );
+        QueuedMessage<QueuedLookupRequest>? reclaimed = await second.DequeueAsync( tracker.Object, TestContext.CancellationToken );
+        Assert.IsNotNull( reclaimed );
+        Assert.AreEqual( id, reclaimed.MessageId[(reclaimed.MessageId.LastIndexOf( ':' ) + 1)..] );
+    }
+
+    /// <summary>XAUTOCLAIM leaves an aged message pending when its endpoint is rate-limited.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task AutoClaim_AgedBlockedEntry_RemainsPending( ) {
+        string stream = $"queue:{s_runToken}:spotify:interactive";
+        await _queue.EnqueueAsync( CreateTestRequest( lookupType: LookupRequestType.IsrcLookup ), QueuePriority.Interactive, TestContext.CancellationToken );
+        QueuedMessage<QueuedLookupRequest>? claimed = await _queue.DequeueAsync( TestContext.CancellationToken );
+        Assert.IsNotNull( claimed );
+        string id = claimed.MessageId[(claimed.MessageId.LastIndexOf( ':' ) + 1)..];
+        IDatabase db = s_redis!.GetDatabase( );
+        _ = await db.ExecuteAsync( "XCLAIM", stream, "spotify-workers", "dead-consumer", 0, id, "TIME", 1 );
+        RedisRequestQueue<QueuedLookupRequest> second = NewQueue( "blocked-reclaimer" );
+        Mock<BridgeBeats.Contracts.Interfaces.IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( t => t.GetAllRateLimitedAsync( It.IsAny<SupportedProviders>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [new RateLimitedEndpoint( "IsrcLookup", DateTimeOffset.UtcNow.AddMinutes( 5 ) )] );
+        Assert.IsNull( await second.DequeueAsync( tracker.Object, TestContext.CancellationToken ) );
+        RedisResult pending = await db.ExecuteAsync( "XPENDING", stream, "spotify-workers" );
+        Assert.IsGreaterThan( 0, (long)((RedisResult[])pending!)[0] );
+    }
+
+    /// <summary>Consumer-group recreation is idempotent after an operational group deletion.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task EnsureConsumerGroups_RecreatesDeletedGroup( ) {
+        IDatabase db = s_redis!.GetDatabase();
+        string stream = $"queue:{s_runToken}:spotify:interactive";
+        _ = await db.ExecuteAsync( "XGROUP", "DESTROY", stream, "spotify-workers" );
+        await _queue.EnsureConsumerGroupsAsync( TestContext.CancellationToken );
+        RedisResult groups = await db.ExecuteAsync("XINFO", "GROUPS", stream);
+        RedisResult[] groupArray = (RedisResult[])groups!;
+        Assert.IsGreaterThan( 0, groupArray.Length );
+    }
+
+    /// <summary>Recreated groups start at the stream beginning and can drain pre-existing entries.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task EnsureConsumerGroups_RecreatesDeletedGroup_DequeuesPreExistingEntry( ) {
+        IDatabase db = s_redis!.GetDatabase( );
+        string stream = $"queue:{s_runToken}:spotify:interactive";
+        await _queue.EnqueueAsync( CreateTestRequest( lookupType: LookupRequestType.IsrcLookup ), QueuePriority.Interactive, TestContext.CancellationToken );
+        _ = await db.ExecuteAsync( "XGROUP", "DESTROY", stream, "spotify-workers" );
+
+        await _queue.EnsureConsumerGroupsAsync( TestContext.CancellationToken );
+
+        QueuedMessage<QueuedLookupRequest>? message = await _queue.DequeueAsync( TestContext.CancellationToken );
+        Assert.IsNotNull( message );
+    }
 
     /// <summary>The shared Redis connection used by the queue under test.</summary>
     private static IConnectionMultiplexer? s_redis;
@@ -102,6 +405,13 @@ public partial class RedisRequestQueueTests {
             _ = await db.KeyDeleteAsync( key );
         }
     }
+
+    private RedisRequestQueue<QueuedLookupRequest> NewQueue( string _ ) => new(
+        s_redis!,
+        new Mock<ILogger<RedisRequestQueue<QueuedLookupRequest>>>( ).Object,
+        _settings,
+        SupportedProviders.Spotify,
+        keyPrefix: s_runToken );
 
     /// <summary>
     /// Verifies enqueuing at interactive priority increases only the interactive depth.
@@ -215,6 +525,28 @@ public partial class RedisRequestQueueTests {
         Assert.AreEqual( 0, depth.Total );
     }
 
+    /// <summary>Unreadable deliveries are preserved in the DLQ instead of being silently destroyed.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task DequeueAsync_UnreadablePayload_MovesRawEntryToDlq( ) {
+        IDatabase db = s_redis!.GetDatabase( );
+        string interactive = $"queue:{s_runToken}:spotify:interactive";
+        string dlq = $"queue:{s_runToken}:spotify:dlq";
+        _ = await db.StreamAddAsync( interactive, [
+            new NameValueEntry( QueueStreamFieldNames.Payload, "{not-json" ),
+            new NameValueEntry( QueueStreamFieldNames.EnqueuedAt, DateTimeOffset.UtcNow.ToString( "O" ) )
+        ] );
+
+        QueuedMessage<QueuedLookupRequest>? message = await _queue.DequeueAsync( TestContext.CancellationToken );
+
+        Assert.IsNull( message );
+        Assert.AreEqual( 0L, await db.StreamLengthAsync( interactive ) );
+        Assert.AreEqual( 1L, await db.StreamLengthAsync( dlq ) );
+        StreamEntry[] entries = await db.StreamRangeAsync( dlq );
+        Assert.AreEqual( "{not-json", entries[0][QueueStreamFieldNames.Payload].ToString( ) );
+        Assert.AreEqual( "Unreadable queue payload.", entries[0]["dlqReason"].ToString( ) );
+    }
+
     /// <summary>
     /// Verifies moving a dequeued message to the dead-letter queue removes it from the main queue and
     /// makes it retrievable from the DLQ.
@@ -230,6 +562,8 @@ public partial class RedisRequestQueueTests {
         Assert.IsNotNull( message );
 
         // Act
+        await _queue.MoveToDlqAsync( message.MessageId, "Test failure reason", TestContext.CancellationToken );
+        // Retrying after an ambiguous client-side outcome must not create a second DLQ entry.
         await _queue.MoveToDlqAsync( message.MessageId, "Test failure reason", TestContext.CancellationToken );
 
         // Assert - main queue empty, DLQ has message
@@ -473,6 +807,70 @@ public partial class RedisRequestQueueTests {
         QueuedMessage<QueuedLookupRequest>? requeued = await _queue.DequeueAsync( TestContext.CancellationToken );
         Assert.IsNotNull( requeued );
         Assert.AreEqual( request.RequestId, requeued.Payload.RequestId );
+    }
+
+    /// <summary>An own-PEL scan cannot return a delivery that a local task is still processing.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task DequeueAsync_ActiveOwnPelDelivery_IsNotReturnedConcurrently( ) {
+        await _queue.EnqueueAsync( CreateTestRequest( ), QueuePriority.Interactive, TestContext.CancellationToken );
+        Mock<BridgeBeats.Contracts.Interfaces.IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( value => value.GetAllRateLimitedAsync(
+                It.IsAny<SupportedProviders>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [] );
+
+        QueuedMessage<QueuedLookupRequest>? first = await _queue.DequeueAsync( tracker.Object, TestContext.CancellationToken );
+        Assert.IsNotNull( first );
+
+        QueuedMessage<QueuedLookupRequest>? duplicate = await _queue.DequeueAsync( tracker.Object, TestContext.CancellationToken );
+        Assert.IsNull( duplicate );
+
+        ((IQueueDeliveryTracker)_queue).ReleaseDelivery( first.MessageId );
+        QueuedMessage<QueuedLookupRequest>? recovered = await _queue.DequeueAsync( tracker.Object, TestContext.CancellationToken );
+        Assert.IsNotNull( recovered );
+        Assert.AreEqual( first.MessageId, recovered.MessageId );
+        await _queue.AcknowledgeAsync( recovered.MessageId, TestContext.CancellationToken );
+    }
+
+    /// <summary>A transient requeue atomically replaces the delivery and advances its attempt.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task RequeueAsync_TransientRetry_IncrementsAttemptExactlyOnce( ) {
+        QueuedLookupRequest request = CreateTestRequest( ) with { AttemptCount = 2 };
+        await _queue.EnqueueAsync( request, QueuePriority.Interactive, TestContext.CancellationToken );
+        QueuedMessage<QueuedLookupRequest>? original = await _queue.DequeueAsync( TestContext.CancellationToken );
+        Assert.IsNotNull( original );
+
+        await _queue.RequeueAsync( original.MessageId, cancellationToken: TestContext.CancellationToken );
+        QueuedMessage<QueuedLookupRequest>? retry = await _queue.DequeueAsync( TestContext.CancellationToken );
+
+        Assert.IsNotNull( retry );
+        Assert.AreEqual( 3, retry.Payload.AttemptCount );
+        await _queue.AcknowledgeAsync( retry.MessageId, TestContext.CancellationToken );
+    }
+
+    /// <summary>Rate-aware workers defer an ordinary transient retry until its backoff expires.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task RequeueAsync_TransientRetry_HonorsNotBefore( ) {
+        await _queue.EnqueueAsync( CreateTestRequest( ), QueuePriority.Interactive, TestContext.CancellationToken );
+        QueuedMessage<QueuedLookupRequest>? original = await _queue.DequeueAsync( TestContext.CancellationToken );
+        Assert.IsNotNull( original );
+        await _queue.RequeueAsync( original.MessageId, cancellationToken: TestContext.CancellationToken );
+
+        Mock<IRateLimitTracker> tracker = new( );
+        _ = tracker.Setup( value => value.GetAllRateLimitedAsync(
+                It.IsAny<SupportedProviders>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [] );
+        Assert.IsNull( await _queue.DequeueAsync( tracker.Object, TestContext.CancellationToken ) );
+
+        await Task.Delay( TimeSpan.FromMilliseconds( 1100 ), TestContext.CancellationToken );
+        QueuedMessage<QueuedLookupRequest>? retry = await _queue.DequeueAsync(
+            tracker.Object, TestContext.CancellationToken );
+        Assert.IsNotNull( retry );
+        Assert.AreEqual( 1, retry.Payload.AttemptCount );
+        Assert.IsNotNull( retry.Payload.NotBefore );
+        await _queue.AcknowledgeAsync( retry.MessageId, TestContext.CancellationToken );
     }
 
     /// <summary>

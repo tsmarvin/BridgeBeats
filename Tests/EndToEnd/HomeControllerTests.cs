@@ -1,5 +1,13 @@
 using System.Net;
+using BridgeBeats.Contracts.DTOs;
+using BridgeBeats.Contracts.Enums;
+using BridgeBeats.Contracts.Interfaces;
+using BridgeBeats.Core.Infrastructure.Utilities;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Moq;
 
 namespace BridgeBeats.Tests.EndToEnd;
 
@@ -307,4 +315,318 @@ public class HomeControllerTests {
     /// The MSTest-injected test context, used here to obtain the per-test cancellation token.
     /// </summary>
     public TestContext TestContext { get; set; }
+}
+
+/// <summary>
+/// Verifies result rendering behavior with stubbed media-link services, including live saga-progress
+/// indicators and preservation of guidance carried by result-less placeholders.
+/// </summary>
+/// <remarks>
+/// Failure-first evidence for each new test is documented inline. A stub
+/// <see cref="ILookupProgressProbe"/> is injected via the per-test
+/// <see cref="ProbeOverrideFactory"/> so that the probe return value is the ONLY variable between
+/// the three cases; all other services are identical. This isolates the wiring path from the probe
+/// call through to the view-model property and rendered HTML.
+/// </remarks>
+[TestClass]
+[TestCategory( "EndToEnd" )]
+public class HomeControllerRenderingTests {
+
+    private const string TestUrl = "https://open.spotify.com/track/probetesttrack";
+    private const string PlaceholderMessage = "Apple Music is temporarily unavailable. Please try again.";
+
+    /// <summary>MSTest-injected context used to obtain the per-test cancellation token.</summary>
+    public TestContext TestContext { get; set; } = null!;
+
+    /// <summary>
+    /// Verifies URL lookup placeholders retain their provider guidance instead of becoming a generic
+    /// no-results response.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 15000, CooperativeCancellation = true )]
+    public async Task LookupResults_ResultlessPlaceholder_RendersProviderMessage( ) {
+        MediaLinkResult placeholder = new( ) { Messages = [PlaceholderMessage] };
+        using ProbeOverrideFactory factory = new( BuildBaseConfig( ), services => {
+            _ = services.RemoveAll<IMediaLinkService>( );
+            _ = services.AddTransient<IMediaLinkService>( _ => BuildStubMediaService( placeholder ) );
+        } );
+        await factory.InitializeDatabasesAsync( );
+        using HttpClient client = factory.CreateClient( );
+
+        string token = await AntiforgeryTestHelper.GetAntiforgeryTokenAsync( client, TestContext.CancellationToken );
+        FormUrlEncodedContent formData = new( new Dictionary<string, string> { ["uri"] = TestUrl } );
+        HttpResponseMessage response = await AntiforgeryTestHelper.PostWithAntiforgeryAsync(
+            client, "/Home/LookupResults", formData, token, TestContext.CancellationToken );
+        string content = await response.Content.ReadAsStringAsync( TestContext.CancellationToken );
+
+        Assert.AreEqual( HttpStatusCode.OK, response.StatusCode );
+        Assert.Contains( PlaceholderMessage, content, StringComparison.Ordinal );
+        Assert.DoesNotContain( "No results found", content, StringComparison.OrdinalIgnoreCase );
+    }
+
+    /// <summary>
+    /// Verifies single-result actions retain guidance from a result-less placeholder rather than
+    /// replacing it with their generic no-results fallback.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 15000, CooperativeCancellation = true )]
+    public async Task LookupResultsByIsrc_ResultlessPlaceholder_RendersProviderMessage( ) {
+        MediaLinkResult placeholder = new( ) { Messages = [PlaceholderMessage] };
+        using ProbeOverrideFactory factory = new( BuildBaseConfig( ), services => {
+            _ = services.RemoveAll<IMediaLinkService>( );
+            _ = services.AddTransient<IMediaLinkService>( _ => BuildStubMediaService( placeholder ) );
+        } );
+        await factory.InitializeDatabasesAsync( );
+        using HttpClient client = factory.CreateClient( );
+
+        string token = await AntiforgeryTestHelper.GetAntiforgeryTokenAsync( client, TestContext.CancellationToken );
+        FormUrlEncodedContent formData = new( new Dictionary<string, string> { ["isrc"] = "USRC12345678" } );
+        HttpResponseMessage response = await AntiforgeryTestHelper.PostWithAntiforgeryAsync(
+            client, "/Home/LookupResultsByIsrc", formData, token, TestContext.CancellationToken );
+        string content = await response.Content.ReadAsStringAsync( TestContext.CancellationToken );
+
+        Assert.AreEqual( HttpStatusCode.OK, response.StatusCode );
+        Assert.Contains( PlaceholderMessage, content, StringComparison.Ordinal );
+        Assert.DoesNotContain( "No results found", content, StringComparison.OrdinalIgnoreCase );
+    }
+
+    /// <summary>
+    /// Verifies that when <see cref="ILookupProgressProbe.IsActiveAsync"/> returns
+    /// <see langword="true"/>, the rendered view contains the "Still looking up" in-progress indicator.
+    /// Failure-first: a probe stub wired to return <see langword="false"/> causes this assertion to
+    /// fail (indicator absent); the correct <see langword="true"/>-returning stub makes it pass.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 15000, CooperativeCancellation = true )]
+    public async Task LookupResultsByIsrc_ProbeReturnsTrue_InProgressIndicatorIsRendered( ) {
+        Mock<ILookupProgressProbe> probeMock = new( );
+        _ = probeMock
+            .Setup( p => p.IsActiveAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+
+        using ProbeOverrideFactory factory = new( BuildBaseConfig( ), services => {
+            _ = services.RemoveAll<IMediaLinkService>( );
+            _ = services.AddTransient<IMediaLinkService>( sp => BuildStubMediaService( ) );
+            _ = services.RemoveAll<ILookupProgressProbe>( );
+            _ = services.AddTransient<ILookupProgressProbe>( sp => probeMock.Object );
+        } );
+        await factory.InitializeDatabasesAsync( );
+        using HttpClient client = factory.CreateClient( );
+
+        string token = await AntiforgeryTestHelper.GetAntiforgeryTokenAsync( client, TestContext.CancellationToken );
+        FormUrlEncodedContent formData = new( new Dictionary<string, string> { ["isrc"] = "USRC12345678" } );
+        HttpResponseMessage response = await AntiforgeryTestHelper.PostWithAntiforgeryAsync(
+            client, "/Home/LookupResultsByIsrc", formData, token, TestContext.CancellationToken );
+        string content = await response.Content.ReadAsStringAsync( TestContext.CancellationToken );
+
+        Assert.AreEqual( System.Net.HttpStatusCode.OK, response.StatusCode );
+        Assert.IsTrue(
+            content.Contains( "Still looking up", StringComparison.OrdinalIgnoreCase ),
+            "When the probe returns true, IsLookupInProgress must be true and the view must render the in-progress indicator." );
+    }
+
+    /// <summary>
+    /// Verifies that when <see cref="ILookupProgressProbe.IsActiveAsync"/> returns
+    /// <see langword="false"/>, the in-progress indicator is absent from the rendered view.
+    /// Failure-first: a probe stub returning <see langword="true"/> causes this assertion to fail
+    /// (indicator present); the correct <see langword="false"/>-returning stub makes it pass.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 15000, CooperativeCancellation = true )]
+    public async Task LookupResultsByIsrc_ProbeReturnsFalse_InProgressIndicatorIsAbsent( ) {
+        Mock<ILookupProgressProbe> probeMock = new( );
+        _ = probeMock
+            .Setup( p => p.IsActiveAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( false );
+
+        using ProbeOverrideFactory factory = new( BuildBaseConfig( ), services => {
+            _ = services.RemoveAll<IMediaLinkService>( );
+            _ = services.AddTransient<IMediaLinkService>( sp => BuildStubMediaService( ) );
+            _ = services.RemoveAll<ILookupProgressProbe>( );
+            _ = services.AddTransient<ILookupProgressProbe>( sp => probeMock.Object );
+        } );
+        await factory.InitializeDatabasesAsync( );
+        using HttpClient client = factory.CreateClient( );
+
+        string token = await AntiforgeryTestHelper.GetAntiforgeryTokenAsync( client, TestContext.CancellationToken );
+        FormUrlEncodedContent formData = new( new Dictionary<string, string> { ["isrc"] = "USRC12345678" } );
+        HttpResponseMessage response = await AntiforgeryTestHelper.PostWithAntiforgeryAsync(
+            client, "/Home/LookupResultsByIsrc", formData, token, TestContext.CancellationToken );
+        string content = await response.Content.ReadAsStringAsync( TestContext.CancellationToken );
+
+        Assert.AreEqual( System.Net.HttpStatusCode.OK, response.StatusCode );
+        Assert.IsFalse(
+            content.Contains( "Still looking up", StringComparison.OrdinalIgnoreCase ),
+            "When the probe returns false, IsLookupInProgress must be false and the in-progress indicator must not appear." );
+    }
+
+    /// <summary>
+    /// Verifies that when no <see cref="ILookupProgressProbe"/> is registered (probe is
+    /// <see langword="null"/>), the optional-parameter guard in the controller short-circuits and
+    /// the in-progress indicator is absent from the rendered view.
+    /// Failure-first: removing the <c>probe is not null</c> guard from the controller would cause
+    /// a <see cref="NullReferenceException"/> during <c>IsActiveAsync</c>, turning this test into
+    /// an unexpected exception rather than a failing assertion.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 15000, CooperativeCancellation = true )]
+    public async Task LookupResultsByIsrc_NullProbe_InProgressIndicatorIsAbsent( ) {
+        using ProbeOverrideFactory factory = new( BuildBaseConfig( ), services => {
+            _ = services.RemoveAll<IMediaLinkService>( );
+            _ = services.AddTransient<IMediaLinkService>( sp => BuildStubMediaService( ) );
+            // Explicitly remove every ILookupProgressProbe registration so the controller
+            // receives null for the optional probe parameter.
+            _ = services.RemoveAll<ILookupProgressProbe>( );
+        } );
+        await factory.InitializeDatabasesAsync( );
+        using HttpClient client = factory.CreateClient( );
+
+        string token = await AntiforgeryTestHelper.GetAntiforgeryTokenAsync( client, TestContext.CancellationToken );
+        FormUrlEncodedContent formData = new( new Dictionary<string, string> { ["isrc"] = "USRC12345678" } );
+        HttpResponseMessage response = await AntiforgeryTestHelper.PostWithAntiforgeryAsync(
+            client, "/Home/LookupResultsByIsrc", formData, token, TestContext.CancellationToken );
+        string content = await response.Content.ReadAsStringAsync( TestContext.CancellationToken );
+
+        Assert.AreEqual( System.Net.HttpStatusCode.OK, response.StatusCode );
+        Assert.IsFalse(
+            content.Contains( "Still looking up", StringComparison.OrdinalIgnoreCase ),
+            "When no probe is registered (null), the optional-param guard must prevent the IsActiveAsync call " +
+            "and IsLookupInProgress must remain false." );
+    }
+
+    /// <summary>
+    /// Verifies the regular URL-result action derives and probes the URL saga key carried by the
+    /// result's restored input link.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 15000, CooperativeCancellation = true )]
+    public async Task LookupResults_UrlProbeReturnsTrue_InProgressIndicatorIsRendered( ) {
+        string expectedKey = LookupKeyBuilder.UrlKey( TestUrl );
+        Mock<ILookupProgressProbe> probeMock = new( );
+        _ = probeMock
+            .Setup( p => p.IsActiveAsync( expectedKey, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+
+        using ProbeOverrideFactory factory = new( BuildBaseConfig( ), services => {
+            _ = services.RemoveAll<IMediaLinkService>( );
+            _ = services.AddTransient<IMediaLinkService>( _ => BuildStubMediaService( ) );
+            _ = services.RemoveAll<ILookupProgressProbe>( );
+            _ = services.AddTransient<ILookupProgressProbe>( _ => probeMock.Object );
+        } );
+        await factory.InitializeDatabasesAsync( );
+        using HttpClient client = factory.CreateClient( );
+
+        string token = await AntiforgeryTestHelper.GetAntiforgeryTokenAsync( client, TestContext.CancellationToken );
+        FormUrlEncodedContent formData = new( new Dictionary<string, string> { ["uri"] = TestUrl } );
+        HttpResponseMessage response = await AntiforgeryTestHelper.PostWithAntiforgeryAsync(
+            client, "/Home/LookupResults", formData, token, TestContext.CancellationToken );
+        string content = await response.Content.ReadAsStringAsync( TestContext.CancellationToken );
+
+        Assert.AreEqual( HttpStatusCode.OK, response.StatusCode );
+        Assert.Contains( "Still looking up", content, StringComparison.OrdinalIgnoreCase );
+        probeMock.Verify(
+            p => p.IsActiveAsync( expectedKey, It.IsAny<CancellationToken>( ) ),
+            Times.Once
+        );
+    }
+
+    /// <summary>
+    /// Verifies the streaming URL-result action uses the restored input link to probe the same saga
+    /// key and renders the progress indicator in its streamed card.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 15000, CooperativeCancellation = true )]
+    public async Task LookupResultsStream_UrlProbeReturnsTrue_InProgressIndicatorIsRendered( ) {
+        string expectedKey = LookupKeyBuilder.UrlKey( TestUrl );
+        Mock<ILookupProgressProbe> probeMock = new( );
+        _ = probeMock
+            .Setup( p => p.IsActiveAsync( expectedKey, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+
+        using ProbeOverrideFactory factory = new( BuildBaseConfig( ), services => {
+            _ = services.RemoveAll<IMediaLinkService>( );
+            _ = services.AddTransient<IMediaLinkService>( _ => BuildStubMediaService( ) );
+            _ = services.RemoveAll<ILookupProgressProbe>( );
+            _ = services.AddTransient<ILookupProgressProbe>( _ => probeMock.Object );
+        } );
+        await factory.InitializeDatabasesAsync( );
+        using HttpClient client = factory.CreateClient( );
+
+        string token = await AntiforgeryTestHelper.GetAntiforgeryTokenAsync( client, TestContext.CancellationToken );
+        FormUrlEncodedContent formData = new( new Dictionary<string, string> { ["uri"] = TestUrl } );
+        HttpResponseMessage response = await AntiforgeryTestHelper.PostWithAntiforgeryAsync(
+            client, "/Home/LookupResultsStream", formData, token, TestContext.CancellationToken );
+        string content = await response.Content.ReadAsStringAsync( TestContext.CancellationToken );
+
+        Assert.AreEqual( HttpStatusCode.OK, response.StatusCode );
+        Assert.Contains( "Still looking up", content, StringComparison.OrdinalIgnoreCase );
+        probeMock.Verify(
+            p => p.IsActiveAsync( expectedKey, It.IsAny<CancellationToken>( ) ),
+            Times.Once
+        );
+    }
+
+    /// <summary>
+    /// Builds the minimal configuration overrides for the probe-wiring test host. Workers and
+    /// ATProto are disabled so the host can start without external infrastructure beyond the shared
+    /// Redis container.
+    /// </summary>
+    private static Dictionary<string, string?> BuildBaseConfig( ) => new( ) {
+        ["BridgeBeats:DiscordToken"] = string.Empty,
+        ["BridgeBeats:Workers:UseWorkerServices"] = "false",
+        ["BridgeBeats:ATProtoIdentifier"] = string.Empty,
+        ["BridgeBeats:ATProtoPassword"] = string.Empty,
+        ["BridgeBeats:ATProtoUserDID"] = string.Empty,
+    };
+
+    /// <summary>
+    /// Builds a stub <see cref="IMediaLinkService"/> that returns a single Spotify result for
+    /// any ISRC, so the controller's <c>CreateViewModelFromResult</c> always produces at least
+    /// one view-model item regardless of what ISRC is submitted. The stub is disposable: a new
+    /// instance is created per-test factory.
+    /// </summary>
+    private static IMediaLinkService BuildStubMediaService( MediaLinkResult? result = null ) {
+        Mock<IMediaLinkService> mock = new( );
+        MediaLinkResult stubResult = result ?? new MediaLinkResult {
+            Results = new Dictionary<SupportedProviders, MusicLookupResult> {
+                [SupportedProviders.Spotify] = new MusicLookupResult {
+                    Artist = "Probe Test Artist",
+                    Title = "Probe Test Track",
+                    ExternalId = "USRC12345678",
+                    URL = "https://open.spotify.com/track/probetesttrack",
+                    ArtUrl = string.Empty,
+                    IsAlbum = false
+                }
+            }
+        };
+        stubResult.InputLinks.Add( TestUrl );
+        _ = mock
+            .Setup( s => s.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
+            .ReturnsAsync( stubResult );
+        _ = mock
+            .Setup( s => s.GetInfoAsync( It.IsAny<string>( ) ) )
+            .Returns( ( string _ ) => YieldResult( stubResult ) );
+        return mock.Object;
+    }
+
+    private static async IAsyncEnumerable<MediaLinkResult> YieldResult( MediaLinkResult result ) {
+        await Task.CompletedTask;
+        yield return result;
+    }
+
+    /// <summary>
+    /// Extends <see cref="CustomWebApplicationFactory"/> with a per-test service-override callback
+    /// so probe-wiring tests can inject stub implementations without modifying the shared factory.
+    /// The override callback runs after the parent's <see cref="CustomWebApplicationFactory.ConfigureWebHost"/>
+    /// so <c>RemoveAll&lt;T&gt;</c> correctly replaces any service the parent registered.
+    /// </summary>
+    private sealed class ProbeOverrideFactory(
+        Dictionary<string, string?> config,
+        Action<IServiceCollection> serviceOverrides
+    ) : CustomWebApplicationFactory( config ) {
+        protected override void ConfigureWebHost( IWebHostBuilder builder ) {
+            base.ConfigureWebHost( builder );
+            _ = builder.ConfigureServices( serviceOverrides );
+        }
+    }
 }

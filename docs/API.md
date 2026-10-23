@@ -236,8 +236,8 @@ them; `url` streams them.
 | `results` | object (map) keyed by provider name | Each key is a `SupportedProviders` member name (`AppleMusic`, `Spotify`, `Tidal`); each value is the provider's result. Populated as each provider responds. |
 | `messages` | array of strings or `null` | Informational messages; `null` when there are none. |
 | `lookedUpAt` | string (ISO 8601, UTC) | When the aggregate was looked up. |
-| `isPartial` | boolean | `true` when some providers were rate-limited and have not yet resolved. |
-| `rateLimitedProviders` | array of provider names or `null` | The providers still rate-limited; `null` unless `isPartial` is `true`. |
+| `isPartial` | boolean | `true` when this response was returned before its lookup saga finalized and a more complete provider set may follow. This is transient API metadata and is not persisted in PDS records. |
+| `rateLimitedProviders` | array of provider names or `null` | The providers still rate-limited when the result is incomplete; `null` when no providers are rate-limited. |
 
 The `results` keys are the `SupportedProviders` enum member names in PascalCase — `AppleMusic`,
 `Spotify`, `Tidal` — not numeric values. System.Text.Json serializes enum dictionary keys as the
@@ -451,8 +451,10 @@ curl -X POST https://bridgebeats.example.com/music/lookup/urlList \
    providers.
 2. Honor the `Retry-After` header on 429 responses.
 3. Cache results on your side to avoid redundant calls.
-4. Check `isPartial` on the response: when `true`, some providers were rate-limited and the result
-   may be updated once they resolve.
+4. Check `isPartial` on the response. When `true`, the coordinating saga had not finalized when
+   the response was produced and a more complete provider set may follow. When
+   `rateLimitedProviders` is non-null, it identifies providers delayed by rate limiting; `messages`
+   contains user-facing explanations and retry timing.
 
 ## Swagger
 

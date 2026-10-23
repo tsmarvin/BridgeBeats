@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
 using BridgeBeats.Contracts.Constants;
@@ -18,9 +19,9 @@ namespace BridgeBeats.Worker.Spotify;
 /// multi-id batches. This helper owns the consumer-group lifecycle for those streams, depth and
 /// age inspection (to drive flush decisions), batch dequeue (including reclaiming stalled pending
 /// entries via XAUTOCLAIM), acknowledgement, and bounded requeue. Poison entries (missing or
-/// unparseable payloads) are acknowledged and deleted rather than retried.
+/// unparseable payloads) are removed atomically rather than retried.
 /// </remarks>
-public sealed partial class SpotifyBatchQueueHelper {
+public sealed partial class SpotifyBatchQueueHelper : IQueueWorkSignal {
 
     /// <summary>Redis connection multiplexer used for all stream operations.</summary>
     private readonly IConnectionMultiplexer _redis;
@@ -30,46 +31,171 @@ public sealed partial class SpotifyBatchQueueHelper {
 
     /// <summary>JSON options used to serialize and deserialize queued request payloads (camelCase, compact).</summary>
     private readonly JsonSerializerOptions _jsonOptions;
+    private readonly string _bulkTrackStream;
+    private readonly string _bulkAlbumStream;
+    private readonly string _interactiveStream;
+    private readonly string _backgroundStream;
+    private readonly string _workSignalChannel;
+    private readonly string _bulkWorkSignalChannel;
 
     /// <summary>Name of the Redis consumer group shared by the Spotify bulk streams.</summary>
-    private const string ConsumerGroup = "spotify-workers";
+    private const string ConsumerGroup = SpotifyConstants.ConsumerGroup;
 
     /// <summary>
     /// This process instance's consumer id within <see cref="ConsumerGroup"/>, derived from
-    /// <see cref="Environment.MachineName"/> and a GUID then truncated to 32 characters via
-    /// <c>[..32]</c>. The truncation discards part of the GUID, so this value is <b>not</b>
-    /// guaranteed to be unique across multiple replicas running on the same host.
+    /// <see cref="Environment.MachineName"/> and a full GUID. The GUID is retained even when
+    /// multiple replicas run on the same host.
     /// </summary>
     private readonly string _consumerId;
+    private readonly Dictionary<string, RedisValue> _autoClaimCursors = [];
+    private readonly SemaphoreSlim _workSignalInitialization = new( 1, 1 );
+    private TaskCompletionSource _workSignal = CreateWorkSignal( );
+    private long _workVersion;
+    private bool _workSignalInitialized;
+    private DateTimeOffset? _nextReclaimCheck;
+
+    /// <summary>Internal identity seam used to verify replica uniqueness without touching Redis.</summary>
+    internal string ConsumerId => _consumerId;
 
     /// <summary>
     /// Minimum idle time (ms) before XAUTOCLAIM reclaims a pending entry.
-    /// 60 seconds is long enough that a slow-but-alive processing cycle is
+    /// 15 minutes is long enough that a slow-but-alive processing cycle is
     /// never inadvertently reclaimed, while short enough that a crashed consumer
-    /// does not block the stream for more than one minute.
+    /// does not block the stream for more than 15 minutes.
     /// </summary>
-    private const int AutoClaimMinIdleMs = 60_000;
+    private const int AutoClaimMinIdleMs = 15 * 60 * 1000;
+
+    /// <summary>
+    /// Atomically forwards one live bulk delivery to the appropriate generic single-item stream,
+    /// wakes its consumer, and removes the source. Source existence makes redelivery idempotent.
+    /// </summary>
+    private const string ForwardToSingleItemScript = """
+        local source = redis.call('XRANGE', KEYS[1], ARGV[1], ARGV[1], 'COUNT', 1)
+        if #source == 0 then return false end
+        local groupExists = false
+        local groups = redis.call('XINFO', 'GROUPS', KEYS[1])
+        for _, group in ipairs(groups) do
+            for i = 1, #group, 2 do
+                if group[i] == 'name' and group[i + 1] == ARGV[6] then
+                    groupExists = true
+                    break
+                end
+            end
+            if groupExists then break end
+        end
+        if not groupExists then return redis.error_reply('NOGROUP source consumer group is missing') end
+        local replacement = redis.call('XADD', KEYS[2], '*', ARGV[2], ARGV[3], ARGV[4], ARGV[5])
+        redis.call('PUBLISH', ARGV[7], replacement)
+        redis.call('XACK', KEYS[1], ARGV[6], ARGV[1])
+        redis.call('XDEL', KEYS[1], ARGV[1])
+        return replacement
+        """;
+
+    private const string RequeueDeliveryScript = """
+        local source = redis.call('XRANGE', KEYS[1], ARGV[1], ARGV[1], 'COUNT', 1)
+        if #source == 0 then return false end
+        local replacement = redis.call(
+            'XADD', KEYS[1], '*', ARGV[3], ARGV[4], ARGV[5], ARGV[6])
+        redis.call('XACK', KEYS[1], ARGV[2], ARGV[1])
+        redis.call('XDEL', KEYS[1], ARGV[1])
+        redis.call('PUBLISH', ARGV[7], replacement)
+        return replacement
+        """;
+
+    private const string RemoveDeliveryScript = """
+        redis.call('XACK', KEYS[1], ARGV[2], ARGV[1])
+        return redis.call('XDEL', KEYS[1], ARGV[1])
+        """;
 
     /// <summary>
     /// Initializes the helper, deriving this process instance's consumer id.
     /// </summary>
     /// <param name="redis">The Redis connection multiplexer.</param>
     /// <param name="logger">The logger for this helper.</param>
+    /// <param name="keyPrefix">Optional isolated queue-key prefix shared with the bulk producer.</param>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="redis"/> or <paramref name="logger"/> is <see langword="null"/>.</exception>
     public SpotifyBatchQueueHelper(
         IConnectionMultiplexer redis,
-        ILogger<SpotifyBatchQueueHelper> logger
+        ILogger<SpotifyBatchQueueHelper> logger,
+        string? keyPrefix = null
     ) {
         _redis = redis ?? throw new ArgumentNullException( nameof( redis ) );
         _logger = logger ?? throw new ArgumentNullException( nameof( logger ) );
+        _bulkTrackStream = QueueStreamKeys.SpotifyBulkFor( isTrack: true, keyPrefix );
+        _bulkAlbumStream = QueueStreamKeys.SpotifyBulkFor( isTrack: false, keyPrefix );
+        _interactiveStream = QueueStreamKeys.For( SupportedProviders.Spotify, QueuePriority.Interactive, keyPrefix );
+        _backgroundStream = QueueStreamKeys.For( SupportedProviders.Spotify, QueuePriority.Background, keyPrefix );
+        _workSignalChannel = QueueStreamKeys.WorkSignalFor( SupportedProviders.Spotify, keyPrefix );
+        _bulkWorkSignalChannel = QueueStreamKeys.SpotifyBulkWorkSignal( keyPrefix );
 
         string uniqueId = Guid.NewGuid( ).ToString( "N" );
-        _consumerId = $"spotify-batch-{Environment.MachineName}-{uniqueId}"[..32];
+        // Redis stream consumer names are not bounded to 32 characters. Keep the full random
+        // suffix so long machine names cannot truncate it away and cause a restart collision.
+        _consumerId = $"spotify-batch-{Environment.MachineName}-{uniqueId}";
 
         _jsonOptions = new JsonSerializerOptions {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             WriteIndented = false
         };
+    }
+
+    private static TaskCompletionSource CreateWorkSignal( ) =>
+        new( TaskCreationOptions.RunContinuationsAsynchronously );
+
+    /// <inheritdoc/>
+    public async Task InitializeWorkSignalAsync( CancellationToken cancellationToken = default ) {
+        if (_workSignalInitialized) return;
+        await _workSignalInitialization.WaitAsync( cancellationToken );
+        try {
+            if (_workSignalInitialized) return;
+            await _redis.GetSubscriber( ).SubscribeAsync(
+                RedisChannel.Literal( _bulkWorkSignalChannel ),
+                ( _, _ ) => NotifyWorkAvailable( ) );
+            _workSignalInitialized = true;
+        } finally {
+            _ = _workSignalInitialization.Release( );
+        }
+    }
+
+    /// <inheritdoc/>
+    public long CaptureWorkVersion( ) => Interlocked.Read( ref _workVersion );
+
+    /// <inheritdoc/>
+    public async Task WaitForWorkAsync(
+        long observedVersion,
+        DateTimeOffset? scheduledWake,
+        CancellationToken cancellationToken = default
+    ) {
+        if (_nextReclaimCheck is { } reclaimCheck
+            && (scheduledWake is null || scheduledWake <= DateTimeOffset.UtcNow)) {
+            scheduledWake = reclaimCheck;
+        }
+        while (Interlocked.Read( ref _workVersion ) == observedVersion) {
+            Task signal = Volatile.Read( ref _workSignal ).Task;
+            if (Interlocked.Read( ref _workVersion ) != observedVersion) return;
+            if (scheduledWake is null) {
+                await signal.WaitAsync( cancellationToken );
+                return;
+            }
+
+            TimeSpan remaining = scheduledWake.Value - DateTimeOffset.UtcNow;
+            if (remaining <= TimeSpan.Zero) return;
+            TaskCompletionSource elapsed = CreateWorkSignal( );
+            using Timer timer = new(
+                static state => ((TaskCompletionSource)state!).TrySetResult( ),
+                elapsed,
+                remaining,
+                Timeout.InfiniteTimeSpan );
+            Task completed = await Task.WhenAny( signal, elapsed.Task ).WaitAsync( cancellationToken );
+            await completed;
+            return;
+        }
+    }
+
+    private void NotifyWorkAvailable( ) {
+        _ = Interlocked.Increment( ref _workVersion );
+        TaskCompletionSource previous = Interlocked.Exchange( ref _workSignal, CreateWorkSignal( ) );
+        _ = previous.TrySetResult( );
     }
 
     /// <summary>
@@ -85,7 +211,7 @@ public sealed partial class SpotifyBatchQueueHelper {
     public async Task EnsureConsumerGroupsAsync( CancellationToken cancellationToken = default ) {
         IDatabase db = _redis.GetDatabase( );
 
-        foreach (string stream in new[] { SpotifyConstants.BulkTrackIdStream, SpotifyConstants.BulkAlbumIdStream }) {
+        foreach (string stream in new[] { _bulkTrackStream, _bulkAlbumStream }) {
             if (cancellationToken.IsCancellationRequested) { break; }
             try {
                 _ = await db.StreamCreateConsumerGroupAsync(
@@ -113,8 +239,8 @@ public sealed partial class SpotifyBatchQueueHelper {
         cancellationToken.ThrowIfCancellationRequested( );
         IDatabase db = _redis.GetDatabase( );
 
-        long bulkTrackCount = await db.StreamLengthAsync( SpotifyConstants.BulkTrackIdStream );
-        long bulkAlbumCount = await db.StreamLengthAsync( SpotifyConstants.BulkAlbumIdStream );
+        long bulkTrackCount = await db.StreamLengthAsync( _bulkTrackStream );
+        long bulkAlbumCount = await db.StreamLengthAsync( _bulkAlbumStream );
 
         return new IdLookupDepth(
             TrackIdCount: (int)bulkTrackCount,
@@ -143,7 +269,7 @@ public sealed partial class SpotifyBatchQueueHelper {
             return null;
         }
 
-        string stream = isTracks ? SpotifyConstants.BulkTrackIdStream : SpotifyConstants.BulkAlbumIdStream;
+        string stream = isTracks ? _bulkTrackStream : _bulkAlbumStream;
         IDatabase db = _redis.GetDatabase( );
 
         try {
@@ -181,7 +307,7 @@ public sealed partial class SpotifyBatchQueueHelper {
         CancellationToken cancellationToken = default
     ) {
         int count = maxCount ?? SpotifyConstants.MaxTracksPerBatchLookup;
-        return await DequeueBatchFromStreamAsync( SpotifyConstants.BulkTrackIdStream, count, cancellationToken );
+        return await DequeueBatchFromStreamAsync( _bulkTrackStream, count, cancellationToken );
     }
 
     /// <summary>
@@ -195,22 +321,23 @@ public sealed partial class SpotifyBatchQueueHelper {
         CancellationToken cancellationToken = default
     ) {
         int count = maxCount ?? SpotifyConstants.MaxAlbumsPerBatchLookup;
-        return await DequeueBatchFromStreamAsync( SpotifyConstants.BulkAlbumIdStream, count, cancellationToken );
+        return await DequeueBatchFromStreamAsync( _bulkAlbumStream, count, cancellationToken );
     }
 
     /// <summary>
-    /// Dequeues up to <paramref name="count"/> messages from a bulk stream, first reclaiming
-    /// stalled pending entries via XAUTOCLAIM and then reading new entries for this consumer.
+    /// Dequeues up to <paramref name="count"/> messages in three bounded stages: this consumer's
+    /// pending entries, stalled entries reclaimed via XAUTOCLAIM, then new entries.
     /// </summary>
     /// <param name="stream">The bulk stream key to read from.</param>
     /// <param name="count">Maximum number of messages to return.</param>
     /// <param name="cancellationToken">Token used to stop reading early.</param>
     /// <returns>The decoded messages in claim order; poison entries are dropped, not returned.</returns>
     /// <remarks>
-    /// Reclaimed entries are counted against <paramref name="count"/> so a single call never
-    /// exceeds the requested batch size. Entries with missing or unparseable payloads are
-    /// acknowledged and deleted as poison. If XAUTOCLAIM is unsupported by the server, the reclaim
-    /// step is skipped and only new entries are read.
+    /// Recovered and reclaimed entries are counted against <paramref name="count"/> so a single
+    /// call never exceeds the requested batch size. Entries with missing or unparseable payloads
+    /// are acknowledged and deleted as poison. If XAUTOCLAIM is unsupported by the server, only
+    /// dead-consumer reclaim is skipped; this consumer's pending entries and new entries remain
+    /// readable.
     /// </remarks>
     private async Task<IReadOnlyList<QueuedMessage<QueuedLookupRequest>>> DequeueBatchFromStreamAsync(
         string stream,
@@ -219,131 +346,210 @@ public sealed partial class SpotifyBatchQueueHelper {
     ) {
         IDatabase db = _redis.GetDatabase( );
         List<QueuedMessage<QueuedLookupRequest>> messages = [];
-
-        // XAUTOCLAIM sweep: reclaim any PEL entries idle longer than AutoClaimMinIdleMs,
-        // then immediately deserialize and append them to the result — claimed entries land
-        // in THIS consumer's PEL and XREADGROUP with ">" can never see them again.
-        // Safe here because there is exactly one consumer service (SpotifyBulkProcessorService)
-        // reading these streams — no other consumer group member can be legitimately processing
-        // the entry after 60 seconds of idle time.
-        int remainingCount = count;
+        HashSet<string> scannedEntryIds = [];
+        Stopwatch dequeueTimer = Stopwatch.StartNew( );
+        Activity? dequeueActivity = QueueMetrics.ActivitySource.StartActivity( "queue.spotify.dequeue" );
+        _ = (dequeueActivity?.SetTag( QueueMetricTags.Provider, "spotify" ));
+        _ = (dequeueActivity?.SetTag( QueueMetricTags.Priority, "bulk" ));
         try {
-            StreamAutoClaimResult claimed = await db.StreamAutoClaimAsync(
+
+            // XAUTOCLAIM sweep: reclaim any PEL entries idle longer than AutoClaimMinIdleMs,
+            // then immediately deserialize and append them to the result — claimed entries land
+            // in THIS consumer's PEL and XREADGROUP with ">" can never see them again.
+            // Safe here because there is exactly one consumer service (SpotifyBulkProcessorService)
+            // reading these streams — no other consumer group member can be legitimately processing
+            // the entry after 15 minutes of idle time.
+            int remainingCount = count;
+            Stopwatch pelTimer = Stopwatch.StartNew( );
+            using Activity? pelActivity = QueueMetrics.ActivitySource.StartActivity( "queue.spotify.dequeue.pel_scan" );
+            _ = (pelActivity?.SetTag( QueueMetricTags.Provider, "spotify" ));
+            _ = (pelActivity?.SetTag( QueueMetricTags.Priority, "bulk" ));
+            _ = (pelActivity?.SetTag( QueueMetricTags.Stream, stream ));
+            try {
+                // Recover entries still owned by this consumer before waiting for the idle
+                // threshold. XREADGROUP with an explicit 0-0 position reads this consumer's PEL
+                // without delivering new entries or resetting idle clocks on entries beyond the
+                // bounded batch budget.
+                StreamEntry[] ownPending = await db.StreamReadGroupAsync(
+                    stream,
+                    ConsumerGroup,
+                    _consumerId,
+                    position: "0-0",
+                    count: remainingCount,
+                    noAck: false );
+                remainingCount = await AppendDecodedEntriesAsync(
+                    db, stream, ownPending, messages, remainingCount, scannedEntryIds,
+                    recordPelOutcome: true, cancellationToken: cancellationToken );
+
+                if (remainingCount <= 0) {
+                    RecordBulkDequeues( messages );
+                    return messages;
+                }
+
+                RedisValue autoClaimStart = _autoClaimCursors.TryGetValue( stream, out RedisValue cursor ) ? cursor : "0-0";
+                StreamAutoClaimResult claimed = await db.StreamAutoClaimAsync(
                 stream,
                 ConsumerGroup,
                 _consumerId,
                 AutoClaimMinIdleMs,
-                "0-0",
-                count
+                autoClaimStart,
+                remainingCount
             );
+                _autoClaimCursors[stream] = claimed.NextStartId.HasValue && claimed.NextStartId != "0-0"
+                    ? claimed.NextStartId
+                    : "0-0";
 
-            if (claimed.ClaimedEntries.Length > 0) {
-                LogAutoClaimRecovered( _logger, claimed.ClaimedEntries.Length, stream );
-
-                foreach (StreamEntry entry in claimed.ClaimedEntries) {
-                    if (cancellationToken.IsCancellationRequested || remainingCount <= 0) { break; }
-
-                    string? payload = entry[QueueStreamFieldNames.Payload];
-                    string? enqueuedAtStr = entry[QueueStreamFieldNames.EnqueuedAt];
-
-                    if (string.IsNullOrEmpty( payload )) {
-                        // Poison: no payload field — ACK+XDEL to prevent infinite re-claim loop.
-                        await AckAndDeletePoisonEntryAsync( db, stream, entry.Id.ToString( ) );
-                        continue;
-                    }
-
-                    try {
-                        QueuedLookupRequest? request = JsonSerializer.Deserialize<QueuedLookupRequest>( payload, _jsonOptions );
-                        if (request is null) {
-                            // Literal JSON null payload — deserializes without throwing but produces
-                            // a null object. Route through AckAndDeletePoisonEntryAsync so this entry
-                            // is removed from the PEL rather than remaining for eternal 60s re-claims.
-                            LogDeserializationError( _logger, new InvalidOperationException( "null payload" ), entry.Id.ToString( ), stream );
-                            await AckAndDeletePoisonEntryAsync( db, stream, entry.Id.ToString( ) );
-                            continue;
-                        }
-
-                        DateTimeOffset enqueuedAt = DateTimeOffset.UtcNow;
-                        if (!string.IsNullOrEmpty( enqueuedAtStr ) &&
-                            !DateTimeOffset.TryParseExact( enqueuedAtStr, "O", CultureInfo.InvariantCulture, DateTimeStyles.None, out enqueuedAt )) {
-                            LogMalformedEnqueuedAt( _logger, enqueuedAtStr, stream );
-                            enqueuedAt = DateTimeOffset.UtcNow;
-                        }
-
-                        string compositeId = $"{stream}:{entry.Id}";
-                        messages.Add( new QueuedMessage<QueuedLookupRequest>( compositeId, request, enqueuedAt ) );
-                        remainingCount--;
-                    } catch (JsonException ex) {
-                        // Poison message: cannot deserialize even after re-claim — ACK and delete
-                        // to prevent infinite re-claim/re-fail every AutoClaimMinIdleMs.
-                        LogDeserializationError( _logger, ex, entry.Id.ToString( ), stream );
-                        await AckAndDeletePoisonEntryAsync( db, stream, entry.Id.ToString( ) );
-                    }
+                foreach (RedisValue deletedId in claimed.DeletedIds) {
+                    QueueMetrics.PelScanEntries.Add( 1,
+                        new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ),
+                        new KeyValuePair<string, object?>( QueueMetricTags.Outcome, "missing" ) );
                 }
+
+                if (claimed.ClaimedEntries.Length > 0) {
+                    LogAutoClaimRecovered( _logger, claimed.ClaimedEntries.Length, stream );
+                    remainingCount = await AppendDecodedEntriesAsync(
+                        db, stream, claimed.ClaimedEntries, messages, remainingCount,
+                        scannedEntryIds, recordPelOutcome: true, cancellationToken: cancellationToken );
+                }
+            } catch (RedisServerException ex) when (ex.Message.Contains( "NOGROUP", StringComparison.OrdinalIgnoreCase )) {
+                throw;
+            } catch (RedisServerException ex) when (IsAutoClaimUnsupported( ex )) {
+                // XAUTOCLAIM was added in Redis 6.2; if the server is older, log and continue
+                LogAutoClaimNotSupported( _logger, ex, stream );
+            } finally {
+                pelTimer.Stop( );
+                pelActivity?.Stop( );
+                QueueMetrics.PelScanDuration.Record( pelTimer.Elapsed.TotalSeconds,
+                    new KeyValuePair<string, object?>( QueueMetricTags.Provider, "spotify" ),
+                    new KeyValuePair<string, object?>( QueueMetricTags.Priority, "bulk" ),
+                    new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ) );
             }
-        } catch (RedisServerException ex) {
-            // XAUTOCLAIM was added in Redis 6.2; if the server is older, log and continue
-            LogAutoClaimNotSupported( _logger, ex, stream );
-        }
 
-        // Skip XREADGROUP if the claimed entries already filled the budget.
-        if (remainingCount <= 0) {
+            // Skip XREADGROUP if the claimed entries already filled the budget.
+            if (remainingCount <= 0) {
+                RecordBulkDequeues( messages );
+                return messages;
+            }
+
+            Stopwatch readTimer = Stopwatch.StartNew( );
+            Activity? readActivity = QueueMetrics.ActivitySource.StartActivity( "queue.spotify.dequeue.read_group" );
+            _ = (readActivity?.SetTag( QueueMetricTags.Provider, "spotify" ));
+            _ = (readActivity?.SetTag( QueueMetricTags.Priority, "bulk" ));
+            _ = (readActivity?.SetTag( QueueMetricTags.Stream, stream ));
+            StreamEntry[] entries;
+            try {
+                entries = await db.StreamReadGroupAsync(
+                    stream,
+                    ConsumerGroup,
+                    _consumerId,
+                    count: remainingCount,
+                    noAck: false
+                );
+
+            } catch (RedisServerException ex) when (ex.Message.Contains( "NOGROUP", StringComparison.OrdinalIgnoreCase )) {
+                throw;
+            } catch (RedisServerException) {
+                throw;
+            } finally {
+                readTimer.Stop( );
+                readActivity?.Stop( );
+                QueueMetrics.ReadGroupDuration.Record( readTimer.Elapsed.TotalSeconds,
+                    new KeyValuePair<string, object?>( QueueMetricTags.Provider, "spotify" ),
+                    new KeyValuePair<string, object?>( QueueMetricTags.Priority, "bulk" ),
+                    new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ) );
+            }
+
+            _ = await AppendDecodedEntriesAsync(
+                db, stream, entries, messages, remainingCount, scannedEntryIds,
+                recordPelOutcome: false, cancellationToken: cancellationToken );
+
+            RecordBulkDequeues( messages );
             return messages;
+        } finally {
+            _nextReclaimCheck = messages.Count == 0
+                ? DateTimeOffset.UtcNow.AddMilliseconds( AutoClaimMinIdleMs )
+                : null;
+            dequeueTimer.Stop( );
+            dequeueActivity?.Stop( );
+            QueueMetrics.DequeueDuration.Record( dequeueTimer.Elapsed.TotalSeconds,
+                new KeyValuePair<string, object?>( QueueMetricTags.Provider, "spotify" ),
+                new KeyValuePair<string, object?>( QueueMetricTags.Priority, "bulk" ) );
         }
+    }
 
-        try {
-            StreamEntry[] entries = await db.StreamReadGroupAsync(
-                stream,
-                ConsumerGroup,
-                _consumerId,
-                count: remainingCount,
-                noAck: false
-            );
+    private async Task<int> AppendDecodedEntriesAsync(
+        IDatabase db,
+        string stream,
+        IReadOnlyList<StreamEntry> entries,
+        List<QueuedMessage<QueuedLookupRequest>> messages,
+        int remainingCount,
+        HashSet<string> scannedEntryIds,
+        bool recordPelOutcome,
+        CancellationToken cancellationToken
+    ) {
+        foreach (StreamEntry entry in entries) {
+            if (cancellationToken.IsCancellationRequested || remainingCount <= 0) break;
+            string compositeId = $"{stream}:{entry.Id}";
+            if (!scannedEntryIds.Add( compositeId )) continue;
+            string? payload = entry[QueueStreamFieldNames.Payload];
+            string? enqueuedAtStr = entry[QueueStreamFieldNames.EnqueuedAt];
+            if (string.IsNullOrEmpty( payload )) {
+                await AckAndDeletePoisonEntryAsync( db, stream, entry.Id.ToString( ) );
+                if (recordPelOutcome) {
+                    QueueMetrics.PelScanEntries.Add( 1,
+                        new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ),
+                        new KeyValuePair<string, object?>( QueueMetricTags.Outcome, "poison" ) );
+                }
+                continue;
+            }
 
-            foreach (StreamEntry entry in entries) {
-                if (cancellationToken.IsCancellationRequested) { break; }
-                string? payload = entry[QueueStreamFieldNames.Payload];
-                string? enqueuedAtStr = entry[QueueStreamFieldNames.EnqueuedAt];
-
-                if (string.IsNullOrEmpty( payload )) {
-                    // Poison: no payload field — ACK+XDEL to remove from PEL so it cannot be
-                    // re-read by XREADGROUP or re-claimed by XAUTOCLAIM every AutoClaimMinIdleMs.
+            try {
+                QueuedLookupRequest? request = JsonSerializer.Deserialize<QueuedLookupRequest>( payload, _jsonOptions );
+                if (request is null) {
                     await AckAndDeletePoisonEntryAsync( db, stream, entry.Id.ToString( ) );
+                    if (recordPelOutcome) {
+                        QueueMetrics.PelScanEntries.Add( 1,
+                            new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ),
+                            new KeyValuePair<string, object?>( QueueMetricTags.Outcome, "poison" ) );
+                    }
                     continue;
                 }
 
-                try {
-                    QueuedLookupRequest? request = JsonSerializer.Deserialize<QueuedLookupRequest>( payload, _jsonOptions );
-                    if (request is null) {
-                        // Literal JSON null payload — deserializes without throwing but produces
-                        // a null object. Route through AckAndDeletePoisonEntryAsync so this entry
-                        // is removed from the PEL rather than remaining for eternal 60s re-claims.
-                        LogDeserializationError( _logger, new InvalidOperationException( "null payload" ), entry.Id.ToString( ), stream );
-                        await AckAndDeletePoisonEntryAsync( db, stream, entry.Id.ToString( ) );
-                        continue;
-                    }
+                DateTimeOffset enqueuedAt = DateTimeOffset.UtcNow;
+                if (!string.IsNullOrEmpty( enqueuedAtStr )
+                    && !DateTimeOffset.TryParseExact( enqueuedAtStr, "O", CultureInfo.InvariantCulture, DateTimeStyles.None, out enqueuedAt )) {
+                    LogMalformedEnqueuedAt( _logger, enqueuedAtStr, stream );
+                    enqueuedAt = DateTimeOffset.UtcNow;
+                }
 
-                    DateTimeOffset enqueuedAt = DateTimeOffset.UtcNow;
-                    if (!string.IsNullOrEmpty( enqueuedAtStr ) &&
-                        !DateTimeOffset.TryParseExact( enqueuedAtStr, "O", CultureInfo.InvariantCulture, DateTimeStyles.None, out enqueuedAt )) {
-                        LogMalformedEnqueuedAt( _logger, enqueuedAtStr, stream );
-                        enqueuedAt = DateTimeOffset.UtcNow;
-                    }
-
-                    string compositeId = $"{stream}:{entry.Id}";
-                    messages.Add( new QueuedMessage<QueuedLookupRequest>( compositeId, request, enqueuedAt ) );
-                } catch (JsonException ex) {
-                    // Poison message: ACK and delete to remove it from the PEL so it cannot be
-                    // re-claimed by XAUTOCLAIM and re-fail every AutoClaimMinIdleMs indefinitely.
-                    LogDeserializationError( _logger, ex, entry.Id.ToString( ), stream );
-                    await AckAndDeletePoisonEntryAsync( db, stream, entry.Id.ToString( ) );
+                messages.Add( new QueuedMessage<QueuedLookupRequest>( compositeId, request, enqueuedAt ) {
+                    Priority = QueuePriority.Bulk
+                } );
+                if (recordPelOutcome) {
+                    QueueMetrics.PelScanEntries.Add( 1,
+                        new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ),
+                        new KeyValuePair<string, object?>( QueueMetricTags.Outcome, "eligible" ) );
+                }
+                remainingCount--;
+            } catch (JsonException ex) {
+                LogDeserializationError( _logger, ex, entry.Id.ToString( ), stream );
+                await AckAndDeletePoisonEntryAsync( db, stream, entry.Id.ToString( ) );
+                if (recordPelOutcome) {
+                    QueueMetrics.PelScanEntries.Add( 1,
+                        new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ),
+                        new KeyValuePair<string, object?>( QueueMetricTags.Outcome, "poison" ) );
                 }
             }
-        } catch (RedisServerException ex) {
-            LogStreamReadWarning( _logger, ex, stream );
         }
 
-        return messages;
+        return remainingCount;
+    }
+
+    private static void RecordBulkDequeues( IReadOnlyList<QueuedMessage<QueuedLookupRequest>> messages ) {
+        foreach (QueuedMessage<QueuedLookupRequest> message in messages) {
+            QueueMetrics.RecordDequeue( SupportedProviders.Spotify, QueuePriority.Bulk );
+            QueueMetrics.RecordQueueSojourn( SupportedProviders.Spotify, QueuePriority.Bulk, message.EnqueuedAt );
+        }
     }
 
     /// <summary>
@@ -356,11 +562,22 @@ public sealed partial class SpotifyBatchQueueHelper {
     /// <returns>A task that completes once the entry is removed (Redis errors are logged and swallowed).</returns>
     private async Task AckAndDeletePoisonEntryAsync( IDatabase db, string stream, string id ) {
         try {
-            _ = await db.StreamAcknowledgeAsync( stream, ConsumerGroup, id );
-            _ = await db.StreamDeleteAsync( stream, [id] );
+            _ = await db.ScriptEvaluateAsync(
+                RemoveDeliveryScript,
+                [stream],
+                [id, ConsumerGroup] );
+            QueueMetrics.RecordDeliveryRemoved( SupportedProviders.Spotify, QueuePriority.Bulk );
+            QueueMetrics.RecordTerminalOutcome( SupportedProviders.Spotify, QueuePriority.Bulk, "poison_deleted" );
         } catch (RedisServerException ex) {
             LogStreamReadWarning( _logger, ex, stream );
         }
+    }
+
+    private static bool IsAutoClaimUnsupported( RedisServerException exception ) {
+        string message = exception.Message;
+        return message.Contains( "XAUTOCLAIM", StringComparison.OrdinalIgnoreCase )
+            && (message.Contains( "unknown command", StringComparison.OrdinalIgnoreCase )
+                || message.Contains( "not supported", StringComparison.OrdinalIgnoreCase ));
     }
 
     /// <summary>
@@ -373,10 +590,73 @@ public sealed partial class SpotifyBatchQueueHelper {
         (string stream, string id) = ParseMessageId( messageId );
 
         IDatabase db = _redis.GetDatabase( );
-        _ = await db.StreamAcknowledgeAsync( stream, ConsumerGroup, id );
-        _ = await db.StreamDeleteAsync( stream, [id] );
+        _ = await db.ScriptEvaluateAsync(
+            RemoveDeliveryScript,
+            [stream],
+            [id, ConsumerGroup] );
+        QueueMetrics.RecordDeliveryRemoved( SupportedProviders.Spotify, QueuePriority.Bulk );
 
         LogMessageAcknowledged( _logger, id, stream );
+    }
+
+    /// <summary>
+    /// Atomically transfers a rejected bulk delivery to the generic Spotify background stream.
+    /// </summary>
+    /// <param name="message">The claimed bulk delivery to transfer.</param>
+    /// <param name="cancellationToken">Token checked before the atomic Redis operation.</param>
+    /// <returns>
+    /// <see langword="true"/> when Redis created the background replacement and removed the bulk
+    /// source; <see langword="false"/> when the source had already been removed by another attempt.
+    /// </returns>
+    /// <remarks>
+    /// XADD, XACK, and XDEL run in one Lua script. A redelivery after an ambiguous client-side
+    /// response finds no source entry and therefore cannot create a second background copy.
+    /// </remarks>
+    public async Task<bool> ForwardToSingleItemAsync(
+        QueuedMessage<QueuedLookupRequest> message,
+        CancellationToken cancellationToken = default
+    ) {
+        ArgumentNullException.ThrowIfNull( message );
+        cancellationToken.ThrowIfCancellationRequested( );
+        (string stream, string id) = ParseMessageId( message.MessageId );
+        QueuedLookupRequest requeued = message.Payload with {
+            EnqueueOrigin = QueueEnqueueOrigin.Requeue,
+            BypassBulkRouting = true
+        };
+        string payload = JsonSerializer.Serialize( requeued, _jsonOptions );
+        string enqueuedAt = DateTimeOffset.UtcNow.ToString( "O" );
+
+        QueuePriority destinationPriority = message.Payload.OriginPriority == QueuePriority.Interactive
+            ? QueuePriority.Interactive
+            : QueuePriority.Background;
+        string destinationStream = destinationPriority == QueuePriority.Interactive
+            ? _interactiveStream
+            : _backgroundStream;
+
+        RedisResult result = await _redis.GetDatabase( ).ScriptEvaluateAsync(
+            ForwardToSingleItemScript,
+            keys: [stream, destinationStream],
+            values: [
+                id,
+                QueueStreamFieldNames.Payload,
+                payload,
+                QueueStreamFieldNames.EnqueuedAt,
+                enqueuedAt,
+                ConsumerGroup,
+                _workSignalChannel
+            ] );
+        RedisValue replacementId = (RedisValue)result;
+        if (!replacementId.HasValue) {
+            return false;
+        }
+
+        QueueMetrics.RecordDeliveryRemoved( SupportedProviders.Spotify, QueuePriority.Bulk );
+        QueueMetrics.RecordRequeue( SupportedProviders.Spotify );
+        QueueMetrics.RecordEnqueue(
+            SupportedProviders.Spotify,
+            destinationPriority,
+            QueueEnqueueOrigin.Requeue );
+        return true;
     }
 
     /// <summary>
@@ -387,14 +667,14 @@ public sealed partial class SpotifyBatchQueueHelper {
     /// <param name="cancellationToken">Token used to cancel the operation.</param>
     /// <returns>
     /// <see cref="RequeueOutcome.Requeued"/> when the message was re-added with an incremented
-    /// attempt; <see cref="RequeueOutcome.CapReached"/> when the retry cap was reached or the
-    /// payload was unserializable (the message is discarded); or
+    /// attempt; <see cref="RequeueOutcome.CapReached"/> when the retry cap was reached (the
+    /// original delivery remains pending until the caller records terminal saga state); or
     /// <see cref="RequeueOutcome.NotFound"/> when the original entry no longer exists.
     /// </returns>
     /// <exception cref="OperationCanceledException">Thrown when <paramref name="cancellationToken"/> is cancelled before work begins.</exception>
     /// <remarks>
-    /// The original entry is always acknowledged and deleted first; on a successful requeue a fresh
-    /// entry is added with a new <c>enqueuedAt</c> timestamp and <c>AttemptCount + 1</c>. The caller
+    /// A fresh replacement is added before the original entry is acknowledged and deleted, with a
+    /// new <c>enqueuedAt</c> timestamp and <c>AttemptCount + 1</c>. The caller
     /// is responsible for finalizing the saga when the cap is reached.
     /// </remarks>
     public async Task<RequeueOutcome> RequeueAsync(
@@ -426,20 +706,18 @@ public sealed partial class SpotifyBatchQueueHelper {
             try {
                 request = JsonSerializer.Deserialize<QueuedLookupRequest>( rawPayload, _jsonOptions );
             } catch (JsonException) {
-                // Fall through — will requeue with attempt 1 if we can't parse
+                // Fall through to terminal poison handling if we cannot parse.
             }
         }
 
         int currentAttempt = request?.AttemptCount ?? 0;
 
-        // ACK and delete the original entry in both paths
-        _ = await db.StreamAcknowledgeAsync( stream, ConsumerGroup, id );
-        _ = await db.StreamDeleteAsync( stream, [id] );
-
-        if (currentAttempt >= LookupConstants.MaxQueueRetryAttempts) {
-            // Cap reached: log and signal caller to handle saga completion.
-            // The message is already ACK+deleted above (removed from the PEL and stream).
-            // Caller must write the failed provider state and publish completion events.
+        if (currentAttempt >= LookupConstants.MaxQueueRetryAttempts - 1) {
+            // The retry budget counts total executions: attempts 0..Max-2 may be replaced;
+            // the final execution at Max-1 is terminal and must not create a sixth delivery.
+            // The caller must durably record terminal saga state before removing this final
+            // recovery delivery. Leaving it in the PEL makes a Redis failure during that write
+            // recoverable through normal redelivery.
             LogMaxRetriesExceeded( _logger, id, LookupConstants.MaxQueueRetryAttempts, sagaId );
             return RequeueOutcome.CapReached;
         }
@@ -448,11 +726,20 @@ public sealed partial class SpotifyBatchQueueHelper {
             // Payload could not be deserialized — cannot safely increment AttemptCount.
             // Drop the message and signal CapReached so the caller writes failed saga state.
             LogPoisonPayloadDiscarded( _logger, id, sagaId );
+            _ = await db.ScriptEvaluateAsync(
+                RemoveDeliveryScript,
+                [stream],
+                [id, ConsumerGroup] );
+            QueueMetrics.RecordDeliveryRemoved( SupportedProviders.Spotify, QueuePriority.Bulk );
+            QueueMetrics.RecordTerminalOutcome( SupportedProviders.Spotify, QueuePriority.Bulk, "poison_deleted" );
             return RequeueOutcome.CapReached;
         }
 
         // Build re-serialized payload with AttemptCount + 1
-        QueuedLookupRequest requeuedRequest = request with { AttemptCount = currentAttempt + 1 };
+        QueuedLookupRequest requeuedRequest = request with {
+            AttemptCount = currentAttempt + 1,
+            EnqueueOrigin = QueueEnqueueOrigin.Requeue
+        };
 
         string newPayload = JsonSerializer.Serialize( requeuedRequest, _jsonOptions );
 
@@ -461,7 +748,31 @@ public sealed partial class SpotifyBatchQueueHelper {
             new NameValueEntry( QueueStreamFieldNames.EnqueuedAt, DateTimeOffset.UtcNow.ToString( "O" ) )
         ];
 
-        _ = await db.StreamAddAsync( stream, fields );
+        RedisResult moveResult = await db.ScriptEvaluateAsync(
+            RequeueDeliveryScript,
+            [stream],
+            [
+                id,
+                ConsumerGroup,
+                QueueStreamFieldNames.Payload,
+                fields[0].Value,
+                QueueStreamFieldNames.EnqueuedAt,
+                fields[1].Value,
+                _bulkWorkSignalChannel
+            ] );
+        RedisValue replacementId = (RedisValue)moveResult;
+        if (!replacementId.HasValue) {
+            LogMessageNotFound( _logger, id, stream );
+            return RequeueOutcome.NotFound;
+        }
+        NotifyWorkAvailable( );
+
+        // Count the replacement as accepted immediately after XADD; cleanup failures must not
+        // erase the enqueue acceptance from telemetry.
+        QueueMetrics.RecordEnqueue( SupportedProviders.Spotify, QueuePriority.Bulk, QueueEnqueueOrigin.Requeue );
+
+        QueueMetrics.RecordDeliveryRemoved( SupportedProviders.Spotify, QueuePriority.Bulk );
+        QueueMetrics.RecordRequeue( SupportedProviders.Spotify );
 
         LogMessageRequeued( _logger, stream, currentAttempt + 1 );
         return RequeueOutcome.Requeued;
@@ -477,9 +788,9 @@ public sealed partial class SpotifyBatchQueueHelper {
     /// Known bulk stream prefixes are matched first (their keys themselves contain colons); the
     /// last-colon fallback handles any other well-formed composite id.
     /// </remarks>
-    private static (string stream, string id) ParseMessageId( string compositeId ) {
+    private (string stream, string id) ParseMessageId( string compositeId ) {
         // Format: stream:id where id may contain colons (Redis stream IDs are timestamp-sequence)
-        foreach (string streamPrefix in new[] { SpotifyConstants.BulkTrackIdStream, SpotifyConstants.BulkAlbumIdStream }) {
+        foreach (string streamPrefix in new[] { _bulkTrackStream, _bulkAlbumStream }) {
             if (compositeId.StartsWith( streamPrefix + ":", StringComparison.OrdinalIgnoreCase )) {
                 string id = compositeId[(streamPrefix.Length + 1)..];
                 return (streamPrefix, id);
@@ -535,14 +846,14 @@ public sealed partial class SpotifyBatchQueueHelper {
         Message = "XAUTOCLAIM recovered {Count} pending entries from {Stream}" )]
     private static partial void LogAutoClaimRecovered( ILogger logger, int count, string stream );
 
-    /// <summary>Logs that XAUTOCLAIM is unsupported by the server, disabling pending-entry recovery.</summary>
+    /// <summary>Logs that XAUTOCLAIM is unsupported; only dead-consumer recovery is disabled.</summary>
     /// <param name="logger">The logger to write to.</param>
     /// <param name="ex">The Redis error returned by the server.</param>
     /// <param name="stream">The stream key.</param>
     [LoggerMessage(
         EventId = LogEventIds.AutoClaimNotSupported,
         Level = LogLevel.Warning,
-        Message = "XAUTOCLAIM not supported on {Stream} — pending-entry recovery disabled (requires Redis ≥ 6.2)" )]
+        Message = "XAUTOCLAIM not supported on {Stream} — dead-consumer recovery disabled (XAUTOCLAIM requires Redis ≥ 6.2); current-consumer PEL recovery remains available" )]
     private static partial void LogAutoClaimNotSupported( ILogger logger, Exception ex, string stream );
 
     /// <summary>Logs that a stream entry payload failed to deserialize and was discarded.</summary>

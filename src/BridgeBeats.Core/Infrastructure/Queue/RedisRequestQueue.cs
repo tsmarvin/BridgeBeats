@@ -1,5 +1,9 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Globalization;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using BridgeBeats.Contracts.Constants;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
@@ -38,12 +42,14 @@ internal static partial class RedisQueuePatterns {
 /// <c>:background</c>, <c>:bulk</c>, and <c>:dlq</c> (provider name lower-cased). Messages are read
 /// through a per-provider consumer group (<c>{provider}-workers</c>) by a per-process consumer
 /// (<c>{provider}-worker-{guid}</c>). Two behaviors are easy to misread and are called out here:
-/// acknowledgement does XACK followed by XDEL, so a processed message is deleted and cannot be
-/// replayed from the stream; and the delayed form of requeue is a logged stub that requeues
-/// immediately, so the requested delay is not honored. The unit other components pass around is
-/// the composite message id <c>{streamName}:{redisId}</c>.
+/// acknowledgement atomically performs XACK and XDEL, so a processed message is deleted and cannot be
+/// replayed from the stream. Requeue atomically creates the replacement and removes the original;
+/// ordinary transient retries carry a <c>NotBefore</c> timestamp, while provider rate-limit state
+/// controls endpoint eligibility. Idle consumers wake through Redis Pub/Sub or the earliest known
+/// retry/reclaim deadline. The unit other components pass around is the composite
+/// message id <c>{streamName}:{redisId}</c>.
 /// </remarks>
-public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : class, IQueueableRequest {
+public sealed partial class RedisRequestQueue<T> : IRequestQueue<T>, IConsumerGroupAssurance, IQueueDeliveryTracker, IQueueWorkSignal where T : class, IQueueableRequest {
 
     /// <summary>Redis connection used for all stream operations.</summary>
     private readonly IConnectionMultiplexer _redis;
@@ -79,6 +85,12 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
 
     /// <summary>Stream key for the dead-letter queue.</summary>
     private readonly string _dlqStream;
+    private readonly RedisChannel _workSignalChannel;
+    private readonly SemaphoreSlim _workSignalInitialization = new( 1, 1 );
+    private TaskCompletionSource _workSignal = CreateWorkSignal( );
+    private long _workVersion;
+    private bool _workSignalInitialized;
+    private DateTimeOffset? _nextScheduledWake;
 
     /// <summary>
     /// Effective aging interval (validated in constructor; N ≤ 1 falls back to default). Every
@@ -93,6 +105,14 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
     /// </summary>
     private int _dequeueCounter;
 
+    /// <summary>Per-stream XAUTOCLAIM cursor retained between bounded dequeue calls.</summary>
+    private readonly ConcurrentDictionary<string, RedisValue> _autoClaimCursors = [];
+
+    /// <summary>Per-stream own-consumer XPENDING cursor retained between bounded dequeue calls.</summary>
+    private readonly ConcurrentDictionary<string, RedisValue> _pendingCursors = [];
+    /// <summary>Deliveries handed to processing tasks but not yet acknowledged or abandoned.</summary>
+    private readonly ConcurrentDictionary<string, byte> _activeDeliveries = [];
+
     // Track which stream a message came from for ack/requeue
 
     /// <summary>Dead-letter field holding the reason a message was dead-lettered. Literal: <c>"dlqReason"</c>.</summary>
@@ -103,6 +123,71 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
 
     /// <summary>Dead-letter field holding the stream the message came from. Literal: <c>"originalStream"</c>.</summary>
     private const string DlqOriginalStreamField = "originalStream";
+    private const int AutoClaimMinIdleMs = 15 * 60 * 1000;
+    private const string EnqueueDeliveryScript = """
+        local messageId = redis.call(
+            'XADD', KEYS[1], '*', ARGV[1], ARGV[2], ARGV[3], ARGV[4])
+        redis.call('PUBLISH', ARGV[5], messageId)
+        return messageId
+        """;
+    private const string RequeueDeliveryScript = """
+        local source = redis.call('XRANGE', KEYS[1], ARGV[1], ARGV[1], 'COUNT', 1)
+        if #source == 0 then return false end
+        local replacement = redis.call(
+            'XADD', KEYS[1], '*', ARGV[3], ARGV[4], ARGV[5], ARGV[6])
+        redis.call('XACK', KEYS[1], ARGV[2], ARGV[1])
+        redis.call('XDEL', KEYS[1], ARGV[1])
+        redis.call('PUBLISH', ARGV[7], replacement)
+        return replacement
+        """;
+    private const string RequeueDlqDeliveryScript = """
+        local source = redis.call('XRANGE', KEYS[1], ARGV[1], ARGV[1], 'COUNT', 1)
+        if #source == 0 then return false end
+        local replacement = redis.call(
+            'XADD', KEYS[2], '*', ARGV[2], ARGV[3], ARGV[4], ARGV[5])
+        redis.call('XDEL', KEYS[1], ARGV[1])
+        redis.call('PUBLISH', ARGV[6], replacement)
+        return replacement
+        """;
+    private const string MoveToDlqDeliveryScript = """
+        local source = redis.call('XRANGE', KEYS[1], ARGV[1], ARGV[1], 'COUNT', 1)
+        if #source == 0 then return false end
+        local values = source[1][2]
+        local payload = false
+        local enqueuedAt = false
+        for i = 1, #values, 2 do
+            if values[i] == ARGV[3] then payload = values[i + 1] end
+            if values[i] == ARGV[4] then enqueuedAt = values[i + 1] end
+        end
+        if not payload or not enqueuedAt then return false end
+        local replacement = redis.call(
+            'XADD', KEYS[2], '*', ARGV[3], payload, ARGV[4], enqueuedAt,
+            ARGV[5], KEYS[1], ARGV[6], ARGV[7], ARGV[8], ARGV[9])
+        redis.call('XACK', KEYS[1], ARGV[2], ARGV[1])
+        redis.call('XDEL', KEYS[1], ARGV[1])
+        return replacement
+        """;
+    private const string RemoveDeliveryScript = """
+        redis.call('XACK', KEYS[1], ARGV[2], ARGV[1])
+        return redis.call('XDEL', KEYS[1], ARGV[1])
+        """;
+    private const string MovePoisonToDlqScript = """
+        local source = redis.call('XRANGE', KEYS[1], ARGV[1], ARGV[1], 'COUNT', 1)
+        if #source == 0 then return false end
+        local values = source[1][2]
+        local payload = ''
+        local enqueuedAt = ARGV[9]
+        for i = 1, #values, 2 do
+            if values[i] == ARGV[3] then payload = values[i + 1] end
+            if values[i] == ARGV[4] then enqueuedAt = values[i + 1] end
+        end
+        local replacement = redis.call(
+            'XADD', KEYS[2], '*', ARGV[3], payload, ARGV[4], enqueuedAt,
+            ARGV[5], KEYS[1], ARGV[6], ARGV[7], ARGV[8], ARGV[9])
+        redis.call('XACK', KEYS[1], ARGV[2], ARGV[1])
+        redis.call('XDEL', KEYS[1], ARGV[1])
+        return replacement
+        """;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="RedisRequestQueue{T}"/> class for one provider,
@@ -151,21 +236,78 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
         }
 
         string providerName = provider.ToString( ).ToLowerInvariant( );
-        string queuePrefix = string.IsNullOrEmpty( keyPrefix )
-            ? $"queue:{providerName}"
-            : $"queue:{keyPrefix}:{providerName}";
-        _interactiveStream = $"{queuePrefix}:interactive";
-        _backgroundStream = $"{queuePrefix}:background";
-        _bulkStream = $"{queuePrefix}:bulk";
-        _dlqStream = $"{queuePrefix}:dlq";
+        _interactiveStream = QueueStreamKeys.For( provider, QueuePriority.Interactive, keyPrefix );
+        _backgroundStream = QueueStreamKeys.For( provider, QueuePriority.Background, keyPrefix );
+        _bulkStream = QueueStreamKeys.For( provider, QueuePriority.Bulk, keyPrefix );
+        _dlqStream = QueueStreamKeys.DlqFor( provider, keyPrefix );
+        _workSignalChannel = RedisChannel.Literal( QueueStreamKeys.WorkSignalFor( provider, keyPrefix ) );
 
-        _consumerGroup = $"{providerName}-workers";
+        _consumerGroup = provider == SupportedProviders.Spotify
+            ? SpotifyConstants.ConsumerGroup
+            : $"{providerName}-workers";
         _consumerId = $"{providerName}-worker-{Guid.NewGuid( ):N}";
 
         _jsonOptions = new JsonSerializerOptions {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             WriteIndented = false
         };
+    }
+
+    private static TaskCompletionSource CreateWorkSignal( ) =>
+        new( TaskCreationOptions.RunContinuationsAsynchronously );
+
+    /// <inheritdoc/>
+    public async Task InitializeWorkSignalAsync( CancellationToken cancellationToken = default ) {
+        if (_workSignalInitialized) return;
+        await _workSignalInitialization.WaitAsync( cancellationToken );
+        try {
+            if (_workSignalInitialized) return;
+            await _redis.GetSubscriber( ).SubscribeAsync( _workSignalChannel,
+                ( _, _ ) => NotifyWorkAvailable( ) );
+            _workSignalInitialized = true;
+        } finally {
+            _ = _workSignalInitialization.Release( );
+        }
+    }
+
+    /// <inheritdoc/>
+    public long CaptureWorkVersion( ) => Interlocked.Read( ref _workVersion );
+
+    /// <inheritdoc/>
+    public async Task WaitForWorkAsync(
+        long observedVersion,
+        DateTimeOffset? scheduledWake,
+        CancellationToken cancellationToken = default
+    ) {
+        scheduledWake = Earliest( scheduledWake, _nextScheduledWake );
+        while (Interlocked.Read( ref _workVersion ) == observedVersion) {
+            Task signal = Volatile.Read( ref _workSignal ).Task;
+            if (Interlocked.Read( ref _workVersion ) != observedVersion) return;
+
+            if (scheduledWake is null) {
+                await signal.WaitAsync( cancellationToken );
+                return;
+            }
+
+            TimeSpan remaining = scheduledWake.Value - DateTimeOffset.UtcNow;
+            if (remaining <= TimeSpan.Zero) return;
+
+            TaskCompletionSource timerElapsed = CreateWorkSignal( );
+            using Timer timer = new(
+                static state => ((TaskCompletionSource)state!).TrySetResult( ),
+                timerElapsed,
+                remaining,
+                Timeout.InfiniteTimeSpan );
+            Task completed = await Task.WhenAny( signal, timerElapsed.Task ).WaitAsync( cancellationToken );
+            await completed;
+            return;
+        }
+    }
+
+    private void NotifyWorkAvailable( ) {
+        _ = Interlocked.Increment( ref _workVersion );
+        TaskCompletionSource previous = Interlocked.Exchange( ref _workSignal, CreateWorkSignal( ) );
+        _ = previous.TrySetResult( );
     }
 
     /// <summary>
@@ -187,7 +329,7 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
                 _ = await db.StreamCreateConsumerGroupAsync(
                     stream,
                     _consumerGroup,
-                    StreamPosition.NewMessages,
+                    StreamPosition.Beginning,
                     createStream: true
                 );
                 LogConsumerGroupCreated( _logger, _consumerGroup, stream );
@@ -222,10 +364,24 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
             new NameValueEntry( QueueStreamFieldNames.EnqueuedAt, DateTimeOffset.UtcNow.ToString( "O" ) )
         ];
 
-        RedisValue messageId = await db.StreamAddAsync( stream, fields );
+        RedisResult enqueueResult = await db.ScriptEvaluateAsync(
+            EnqueueDeliveryScript,
+            [stream],
+            [
+                QueueStreamFieldNames.Payload,
+                fields[0].Value,
+                QueueStreamFieldNames.EnqueuedAt,
+                fields[1].Value,
+                _workSignalChannel.ToString( )
+            ] );
+        RedisValue messageId = (RedisValue)enqueueResult;
+        if (!messageId.HasValue) {
+            throw new InvalidOperationException( $"Redis did not return a message id for enqueue to '{stream}'." );
+        }
 
-        // Record enqueue metric
-        QueueMetrics.RecordEnqueue( _provider, priority );
+        NotifyWorkAvailable( );
+
+        QueueMetrics.RecordEnqueue( _provider, priority, request is QueuedLookupRequest q ? q.EnqueueOrigin : QueueEnqueueOrigin.New );
 
         if (_logger.IsEnabled( LogLevel.Debug )) {
             string msgId = messageId!;
@@ -245,33 +401,74 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
     /// </remarks>
     public async Task<QueuedMessage<T>?> DequeueAsync( CancellationToken cancellationToken = default ) {
         IDatabase db = _redis.GetDatabase( );
+        Stopwatch dequeueTimer = Stopwatch.StartNew( );
+        Activity? dequeueActivity = QueueMetrics.ActivitySource.StartActivity( "queue.dequeue" );
+        _ = (dequeueActivity?.SetTag( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ));
+        QueuePriority? dequeuedPriority = null;
 
-        // Determine stream order: interactive-first with aging and bulk gating.
-        unchecked { _dequeueCounter++; }
-        string[] streamOrder = await GetWeightedStreamOrderWithBulkGatingAsync( _dequeueCounter );
+        try {
+            unchecked { _dequeueCounter++; }
+            Stopwatch depthTimer = Stopwatch.StartNew( );
+            Activity? depthActivity = QueueMetrics.ActivitySource.StartActivity( "queue.dequeue.depth_probe" );
+            _ = (depthActivity?.SetTag( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ));
+            string[] streamOrder;
+            try {
+                streamOrder = await GetWeightedStreamOrderWithBulkGatingAsync( _dequeueCounter );
+            } finally {
+                depthTimer.Stop( );
+                depthActivity?.Stop( );
+                QueueMetrics.DepthProbeDuration.Record( depthTimer.Elapsed.TotalSeconds,
+                    new KeyValuePair<string, object?>( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ) );
+            }
 
-        foreach (string stream in streamOrder) {
-            StreamEntry[] entries = await db.StreamReadGroupAsync(
-                stream,
-                _consumerGroup,
-                _consumerId,
-                count: 1,
-                noAck: false
-            );
-
-            if (entries.Length > 0) {
-                StreamEntry entry = entries[0];
-                QueuedMessage<T>? message = ParseStreamEntry( entry, stream );
-                if (message is not null) {
-                    // Record dequeue metric based on stream priority
-                    QueuePriority priority = GetPriorityFromStream( stream );
-                    QueueMetrics.RecordDequeue( _provider, priority );
+            foreach (string stream in streamOrder) {
+                Stopwatch readTimer = Stopwatch.StartNew( );
+                Activity? readActivity = QueueMetrics.ActivitySource.StartActivity( "queue.dequeue.read_group" );
+                _ = (readActivity?.SetTag( QueueMetricTags.Stream, stream ));
+                StreamEntry[] entries;
+                try {
+                    entries = await db.StreamReadGroupAsync(
+                        stream,
+                        _consumerGroup,
+                        _consumerId,
+                        count: 1,
+                        noAck: false
+                    );
+                } finally {
+                    readTimer.Stop( );
+                    readActivity?.Stop( );
+                    QueueMetrics.ReadGroupDuration.Record( readTimer.Elapsed.TotalSeconds,
+                        new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ) );
                 }
-                return message;
+
+                if (entries.Length > 0) {
+                    StreamEntry entry = entries[0];
+                    QueuedMessage<T>? message = ParseStreamEntry( entry, stream );
+                    if (message is not null) {
+                        if (TryActivateDelivery( message )) {
+                            dequeuedPriority = GetPriorityFromStream( stream );
+                            QueueMetrics.RecordDequeue( _provider, dequeuedPriority.Value );
+                            QueueMetrics.RecordQueueSojourn( _provider, dequeuedPriority.Value, message.EnqueuedAt );
+                            return message;
+                        }
+                        continue;
+                    }
+                    await MovePoisonEntryToDlqAsync( db, stream, entry.Id );
+                }
+            }
+            return null;
+        } finally {
+            dequeueTimer.Stop( );
+            dequeueActivity?.Stop( );
+            if (dequeuedPriority is { } priority) {
+                QueueMetrics.DequeueDuration.Record( dequeueTimer.Elapsed.TotalSeconds,
+                    new KeyValuePair<string, object?>( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ),
+                    new KeyValuePair<string, object?>( QueueMetricTags.Priority, priority.ToString( ).ToLowerInvariant( ) ) );
+            } else {
+                QueueMetrics.DequeueDuration.Record( dequeueTimer.Elapsed.TotalSeconds,
+                    new KeyValuePair<string, object?>( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ) );
             }
         }
-
-        return null;
     }
 
     /// <summary>
@@ -288,42 +485,75 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="rateLimitTracker"/> is null.</exception>
     public async Task<QueuedMessage<T>?> DequeueAsync( IRateLimitTracker rateLimitTracker, CancellationToken cancellationToken = default ) {
         ArgumentNullException.ThrowIfNull( rateLimitTracker );
+        Stopwatch dequeueTimer = Stopwatch.StartNew( );
+        Activity? dequeueActivity = QueueMetrics.ActivitySource.StartActivity( "queue.dequeue" );
+        _ = (dequeueActivity?.SetTag( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ));
+        QueuePriority? dequeuedPriority = null;
 
         IDatabase db = _redis.GetDatabase( );
+        _nextScheduledWake = null;
 
-        // Get all currently rate-limited endpoints for this provider
-        IReadOnlyList<RateLimitedEndpoint> rateLimitedEndpoints = await rateLimitTracker.GetAllRateLimitedAsync( _provider, cancellationToken );
-        HashSet<string> blockedEndpoints = rateLimitedEndpoints.Select( e => e.Endpoint ).ToHashSet( StringComparer.OrdinalIgnoreCase );
+        try {
 
-        // Determine stream order: interactive-first with aging and bulk gating.
-        unchecked { _dequeueCounter++; }
-        string[] streamOrder = await GetWeightedStreamOrderWithBulkGatingAsync( _dequeueCounter );
+            // Get all currently rate-limited endpoints for this provider
+            IReadOnlyList<RateLimitedEndpoint> rateLimitedEndpoints = await rateLimitTracker.GetAllRateLimitedAsync( _provider, cancellationToken );
+            HashSet<string> blockedEndpoints = rateLimitedEndpoints.Select( e => e.Endpoint ).ToHashSet( StringComparer.OrdinalIgnoreCase );
 
-        if (_logger.IsEnabled( LogLevel.Debug )) {
-            LogDequeueStarting( _logger, blockedEndpoints.Count, streamOrder.Length );
-        }
+            // Determine stream order: interactive-first with aging and bulk gating.
+            unchecked { _dequeueCounter++; }
+            Stopwatch depthTimer = Stopwatch.StartNew( );
+            string[] streamOrder;
+            using Activity? depthActivity = QueueMetrics.ActivitySource.StartActivity( "queue.dequeue.depth_probe" );
+            _ = (depthActivity?.SetTag( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ));
+            try {
+                streamOrder = await GetWeightedStreamOrderWithBulkGatingAsync( _dequeueCounter );
+            } finally {
+                depthTimer.Stop( );
+                depthActivity?.Stop( );
+                QueueMetrics.DepthProbeDuration.Record( depthTimer.Elapsed.TotalSeconds,
+                    new KeyValuePair<string, object?>( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ) );
+            }
 
-        foreach (string stream in streamOrder) {
-            // Peek at pending messages to find one that's not rate-limited
-            QueuedMessage<T>? eligibleMessage = await FindEligibleMessageAsync( db, stream, blockedEndpoints, cancellationToken );
-            if (eligibleMessage is not null) {
-                // Record dequeue metric based on stream priority
-                QueuePriority priority = GetPriorityFromStream( stream );
-                QueueMetrics.RecordDequeue( _provider, priority );
-                return eligibleMessage;
+            if (_logger.IsEnabled( LogLevel.Debug )) {
+                LogDequeueStarting( _logger, blockedEndpoints.Count, streamOrder.Length );
+            }
+
+            foreach (string stream in streamOrder) {
+                // Peek at pending messages to find one that's not rate-limited
+                QueuedMessage<T>? eligibleMessage = await FindEligibleMessageAsync( db, stream, blockedEndpoints, cancellationToken );
+                if (eligibleMessage is not null) {
+                    // Record dequeue metric based on stream priority
+                    QueuePriority priority = GetPriorityFromStream( stream );
+                    dequeuedPriority = priority;
+                    QueueMetrics.RecordDequeue( _provider, priority );
+                    QueueMetrics.RecordQueueSojourn( _provider, priority, eligibleMessage.EnqueuedAt );
+                    return eligibleMessage;
+                }
+            }
+
+            if (_logger.IsEnabled( LogLevel.Debug )) {
+                LogDequeueNoEligibleMessages( _logger, streamOrder.Length );
+            }
+
+            RecordScheduledWake( DateTimeOffset.UtcNow.AddMilliseconds( AutoClaimMinIdleMs ) );
+            return null;
+        } finally {
+            dequeueTimer.Stop( );
+            dequeueActivity?.Stop( );
+            if (dequeuedPriority is { } priority) {
+                QueueMetrics.DequeueDuration.Record( dequeueTimer.Elapsed.TotalSeconds,
+                    new KeyValuePair<string, object?>( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ),
+                    new KeyValuePair<string, object?>( QueueMetricTags.Priority, priority.ToString( ).ToLowerInvariant( ) ) );
+            } else {
+                QueueMetrics.DequeueDuration.Record( dequeueTimer.Elapsed.TotalSeconds,
+                    new KeyValuePair<string, object?>( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ) );
             }
         }
-
-        if (_logger.IsEnabled( LogLevel.Debug )) {
-            LogDequeueNoEligibleMessages( _logger, streamOrder.Length );
-        }
-
-        return null;
     }
 
     /// <summary>
-    /// Finds the first eligible message in the stream that is not rate-limited, checking the
-    /// consumer's pending list before reading new messages via XREADGROUP.
+    /// Finds the first eligible message in the stream that is not rate-limited. It scans abandoned
+    /// entries via XAUTOCLAIM, then this consumer's pending list, then new messages via XREADGROUP.
     /// </summary>
     /// <param name="db">The Redis database to read from.</param>
     /// <param name="stream">The stream to scan.</param>
@@ -331,9 +561,9 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
     /// <param name="cancellationToken">A cancellation token (not currently observed).</param>
     /// <returns>The first eligible message, or null if none found within the scan caps.</returns>
     /// <remarks>
-    /// Pending messages already claimed by this consumer are checked first (up to 50, recovery
-    /// scenario), then up to 50 new messages are read. Blocked messages are left in place to be
-    /// retried once their endpoint clears. The scan caps bound the per-stream work each dequeue does.
+    /// Each stage is independently bounded to 50 entries and returns at most one eligible message.
+    /// Blocked messages are left in place to be retried once their endpoint clears. The scan caps
+    /// bound the per-stream work each dequeue does.
     /// </remarks>
     private async Task<QueuedMessage<T>?> FindEligibleMessageAsync(
         IDatabase db,
@@ -341,112 +571,236 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
         HashSet<string> blockedEndpoints,
         CancellationToken cancellationToken
     ) {
+        return await FindEligibleMessageCoreAsync( db, stream, blockedEndpoints, cancellationToken );
+    }
+
+    private async Task<QueuedMessage<T>?> FindEligibleMessageCoreAsync(
+        IDatabase db,
+        string stream,
+        HashSet<string> blockedEndpoints,
+        CancellationToken cancellationToken
+    ) {
         _ = cancellationToken; // Reserved for future async cancellation support
-        int pendingCount = 0;
-        int blockedPendingCount = 0;
-        int newMessagesRead = 0;
-        int blockedNewCount = 0;
-
-        // First, check for any pending messages already claimed by this consumer
-        // that may need to be processed (recovery scenario)
-        StreamPendingMessageInfo[]? pendingMessages = null;
-        try {
-            pendingMessages = await db.StreamPendingMessagesAsync(
-                stream,
-                _consumerGroup,
-                count: 50, // Check a reasonable batch
-                _consumerId
-            );
-            pendingCount = pendingMessages.Length;
-        } catch (RedisServerException) {
-            // Consumer group may not exist yet or no pending messages
+        Stopwatch pelTimer = Stopwatch.StartNew( );
+        Activity? pelActivity = QueueMetrics.ActivitySource.StartActivity( "queue.dequeue.pel_scan" );
+        _ = (pelActivity?.SetTag( QueueMetricTags.Stream, stream ));
+        bool pelStopped = false;
+        void StopPelScan( ) {
+            if (pelStopped) return;
+            pelStopped = true;
+            pelTimer.Stop( );
+            pelActivity?.Stop( );
+            QueueMetrics.PelScanDuration.Record( pelTimer.Elapsed.TotalSeconds,
+                new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ) );
         }
+        try {
+            int pendingCount = 0;
+            int blockedPendingCount = 0;
+            int newMessagesRead = 0;
+            int blockedNewCount = 0;
 
-        // Process pending messages first (already claimed)
-        if (pendingMessages is { Length: > 0 }) {
-            foreach (StreamPendingMessageInfo pending in pendingMessages) {
-                // Read the message content
-                StreamEntry[] entries = await db.StreamRangeAsync( stream, pending.MessageId, pending.MessageId, count: 1 );
-                if (entries.Length == 0) { continue; }
+            // Reclaim entries abandoned by a dead consumer. A fifteen-minute idle threshold avoids
+            // stealing a legitimately slow provider request while allowing restart recovery.
+            try {
+                RedisValue autoClaimStart = _autoClaimCursors.TryGetValue( stream, out RedisValue cursor ) ? cursor : "0-0";
+                StreamAutoClaimResult claimed = await db.StreamAutoClaimAsync(
+                stream, _consumerGroup, _consumerId, AutoClaimMinIdleMs, autoClaimStart, 50);
+                _autoClaimCursors[stream] = claimed.NextStartId.HasValue && claimed.NextStartId != "0-0"
+                    ? claimed.NextStartId
+                    : "0-0";
+                foreach (RedisValue deletedId in claimed.DeletedIds) {
+                    _ = await db.StreamAcknowledgeAsync( stream, _consumerGroup, deletedId );
+                    _ = await db.StreamDeleteAsync( stream, [deletedId] );
+                    QueueMetrics.PelScanEntries.Add( 1,
+                        new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ),
+                        new KeyValuePair<string, object?>( QueueMetricTags.Outcome, "missing" ) );
+                }
+                foreach (StreamEntry claimedEntry in claimed.ClaimedEntries) {
+                    QueuedMessage<T>? reclaimed = ParseStreamEntry(claimedEntry, stream);
+                    if (reclaimed is null) {
+                        await MovePoisonEntryToDlqAsync( db, stream, claimedEntry.Id );
+                        continue;
+                    }
+                    bool reclaimedBlocked = IsMessageBlocked( reclaimed.Payload, blockedEndpoints );
+                    if (!reclaimedBlocked && TryActivateDelivery( reclaimed )) {
+                        QueueMetrics.PelScanEntries.Add( 1,
+                            new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ),
+                            new KeyValuePair<string, object?>( QueueMetricTags.Outcome, "eligible" ) );
+                        return reclaimed;
+                    }
+                    QueueMetrics.PelScanEntries.Add( 1,
+                        new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ),
+                        new KeyValuePair<string, object?>( QueueMetricTags.Outcome,
+                            reclaimedBlocked ? "blocked" : "active" ) );
+                }
+            } catch (RedisServerException ex) when (ex.Message.Contains( "NOGROUP", StringComparison.OrdinalIgnoreCase )) {
+                throw;
+            } catch (RedisServerException ex) when (IsAutoClaimUnsupported( ex )) {
+                // Redis versions before 6.2 lack XAUTOCLAIM; continue with own-PEL and new reads.
+            } catch (RedisServerException) {
+                throw;
+            }
 
-                StreamEntry entry = entries[0];
+            // Next, check for any pending messages already claimed by this consumer that may need
+            // to be processed (recovery scenario) after the XAUTOCLAIM stage above.
+            StreamEntry[]? pendingEntries = null;
+            try {
+                RedisValue pendingCursor = _pendingCursors.TryGetValue( stream, out RedisValue cursor )
+                    ? cursor
+                    : "0-0";
+                pendingEntries = await db.StreamReadGroupAsync(
+                    stream,
+                    _consumerGroup,
+                    _consumerId,
+                    position: pendingCursor,
+                    count: 50,
+                    noAck: false );
+                if (pendingEntries.Length < 50) {
+                    _ = _pendingCursors.TryRemove( stream, out _ );
+                } else {
+                    // XREADGROUP history returns IDs strictly greater than the supplied ID, so
+                    // the final entry is the next page's cursor without XPENDING's '(' syntax.
+                    _pendingCursors[stream] = pendingEntries[^1].Id;
+                }
+                pendingCount = pendingEntries.Length;
+            } catch (RedisServerException ex) when (ex.Message.Contains( "NOGROUP", StringComparison.OrdinalIgnoreCase )) {
+                throw;
+            } catch (RedisServerException) {
+                throw;
+            }
+
+            // XREADGROUP with an explicit history ID returns this consumer's pending entries and
+            // their bodies in one round trip. The prior XPENDING + one XRANGE per entry path made
+            // every dequeue up to 51 sequential Redis calls under a large PEL.
+            if (pendingEntries is { Length: > 0 }) {
+                foreach (StreamEntry entry in pendingEntries) {
+                    if (entry.Values.Length == 0) {
+                        // Redis returns an empty body when a PEL row outlives its stream entry.
+                        _ = await db.StreamAcknowledgeAsync( stream, _consumerGroup, entry.Id );
+                        _ = await db.StreamDeleteAsync( stream, [entry.Id] );
+                        QueueMetrics.PelScanEntries.Add( 1,
+                            new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ),
+                            new KeyValuePair<string, object?>( QueueMetricTags.Outcome, "missing" ) );
+                        continue;
+                    }
+
+                    QueuedMessage<T>? message = ParseStreamEntry( entry, stream );
+                    if (message is null) {
+                        await MovePoisonEntryToDlqAsync( db, stream, entry.Id );
+                        continue;
+                    }
+
+                    // Check if this message's endpoint is blocked
+                    bool messageBlocked = IsMessageBlocked( message.Payload, blockedEndpoints );
+                    if (!messageBlocked && TryActivateDelivery( message )) {
+                        if (_logger.IsEnabled( LogLevel.Debug )) {
+                            string msgId = entry.Id.ToString( );
+                            LogFoundEligibleMessage( _logger, msgId, stream );
+                        }
+                        QueueMetrics.PelScanEntries.Add( 1,
+                            new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ),
+                            new KeyValuePair<string, object?>( QueueMetricTags.Outcome, "eligible" ) );
+                        return message;
+                    }
+
+                    if (messageBlocked) blockedPendingCount++;
+                    QueueMetrics.PelScanEntries.Add( 1,
+                        new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ),
+                        new KeyValuePair<string, object?>( QueueMetricTags.Outcome,
+                            messageBlocked ? "blocked" : "active" ) );
+                    // A blocked message remains pending. An active message is already owned by
+                    // another local processing task and must not be handed out again.
+                    if (messageBlocked && _logger.IsEnabled( LogLevel.Debug )) {
+                        string msgIdString = entry.Id.ToString( );
+                        LogSkippingBlockedMessage( _logger, msgIdString, stream );
+                    }
+                }
+            }
+
+            // No eligible pending messages, read new messages using XREADGROUP. The PEL span ends
+            // before the first read so its duration cannot hide the read-group latency.
+            StopPelScan( );
+
+            // No eligible pending messages, read new messages using XREADGROUP
+            // This properly claims messages from the stream (unlike XCLAIM which only works for pending messages)
+            // Read a batch and check each for rate limiting
+            const int MaxNewMessagesToRead = 50;
+            int messagesChecked = 0;
+
+            while (messagesChecked < MaxNewMessagesToRead) {
+                // Read one message at a time so we can check rate limits and leave blocked ones pending
+                Stopwatch readTimer = Stopwatch.StartNew( );
+                using Activity? readActivity = QueueMetrics.ActivitySource.StartActivity( "queue.dequeue.read_group" );
+                _ = (readActivity?.SetTag( QueueMetricTags.Stream, stream ));
+                StreamEntry[] newEntries;
+                try {
+                    newEntries = await db.StreamReadGroupAsync(
+                        stream,
+                        _consumerGroup,
+                        _consumerId,
+                        position: StreamPosition.NewMessages,
+                        count: 1,
+                        noAck: false );
+                } finally {
+                    readTimer.Stop( );
+                    readActivity?.Stop( );
+                    QueueMetrics.ReadGroupDuration.Record( readTimer.Elapsed.TotalSeconds,
+                        new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ) );
+                }
+
+                if (newEntries.Length == 0) {
+                    // No more new messages in stream
+                    if (messagesChecked == 0 && _logger.IsEnabled( LogLevel.Debug )) {
+                        LogNoNewMessagesInStream( _logger, stream );
+                    }
+                    break;
+                }
+
+                newMessagesRead++;
+                messagesChecked++;
+
+                StreamEntry entry = newEntries[0];
                 QueuedMessage<T>? message = ParseStreamEntry( entry, stream );
-                if (message is null) { continue; }
+                if (message is null) {
+                    await MovePoisonEntryToDlqAsync( db, stream, entry.Id );
+                    continue;
+                }
 
                 // Check if this message's endpoint is blocked
-                if (!IsMessageBlocked( message.Payload, blockedEndpoints )) {
+                if (!IsMessageBlocked( message.Payload, blockedEndpoints )
+                    && TryActivateDelivery( message )) {
                     if (_logger.IsEnabled( LogLevel.Debug )) {
-                        string msgId = pending.MessageId.ToString( );
+                        string msgId = entry.Id.ToString( );
                         LogFoundEligibleMessage( _logger, msgId, stream );
                     }
                     return message;
                 }
 
-                blockedPendingCount++;
-                // Message is blocked - leave it pending, don't acknowledge
+                // Message is blocked by rate limiting - leave it pending for later retry
+                blockedNewCount++;
                 if (_logger.IsEnabled( LogLevel.Debug )) {
-                    string msgIdString = pending.MessageId.ToString( );
-                    LogSkippingBlockedMessage( _logger, msgIdString, stream );
+                    string entryIdString = entry.Id.ToString( );
+                    LogSkippingRateLimitedMessage( _logger, entryIdString, stream );
                 }
+                // Continue to check next message
             }
+
+            // Log summary of what we scanned
+            if (_logger.IsEnabled( LogLevel.Debug ) && (pendingCount > 0 || newMessagesRead > 0)) {
+                LogStreamScanSummary( _logger, stream, pendingCount, newMessagesRead, blockedPendingCount + blockedNewCount );
+            }
+
+            return null;
+        } finally {
+            StopPelScan( );
         }
+    }
 
-        // No eligible pending messages, read new messages using XREADGROUP
-        // This properly claims messages from the stream (unlike XCLAIM which only works for pending messages)
-        // Read a batch and check each for rate limiting
-        const int MaxNewMessagesToRead = 50;
-        int messagesChecked = 0;
-
-        while (messagesChecked < MaxNewMessagesToRead) {
-            // Read one message at a time so we can check rate limits and leave blocked ones pending
-            StreamEntry[] newEntries = await db.StreamReadGroupAsync(
-                stream,
-                _consumerGroup,
-                _consumerId,
-                position: StreamPosition.NewMessages, // ">" - only new messages
-                count: 1,
-                noAck: false // Message becomes pending until acknowledged
-            );
-
-            if (newEntries.Length == 0) {
-                // No more new messages in stream
-                if (messagesChecked == 0 && _logger.IsEnabled( LogLevel.Debug )) {
-                    LogNoNewMessagesInStream( _logger, stream );
-                }
-                break;
-            }
-
-            newMessagesRead++;
-            messagesChecked++;
-
-            StreamEntry entry = newEntries[0];
-            QueuedMessage<T>? message = ParseStreamEntry( entry, stream );
-            if (message is null) { continue; }
-
-            // Check if this message's endpoint is blocked
-            if (!IsMessageBlocked( message.Payload, blockedEndpoints )) {
-                if (_logger.IsEnabled( LogLevel.Debug )) {
-                    string msgId = entry.Id.ToString( );
-                    LogFoundEligibleMessage( _logger, msgId, stream );
-                }
-                return message;
-            }
-
-            // Message is blocked by rate limiting - leave it pending for later retry
-            blockedNewCount++;
-            if (_logger.IsEnabled( LogLevel.Debug )) {
-                string entryIdString = entry.Id.ToString( );
-                LogSkippingRateLimitedMessage( _logger, entryIdString, stream );
-            }
-            // Continue to check next message
-        }
-
-        // Log summary of what we scanned
-        if (_logger.IsEnabled( LogLevel.Debug ) && (pendingCount > 0 || newMessagesRead > 0)) {
-            LogStreamScanSummary( _logger, stream, pendingCount, newMessagesRead, blockedPendingCount + blockedNewCount );
-        }
-
-        return null;
+    private static bool IsAutoClaimUnsupported( RedisServerException exception ) {
+        string message = exception.Message;
+        return message.Contains( "XAUTOCLAIM", StringComparison.OrdinalIgnoreCase )
+            && (message.Contains( "unknown command", StringComparison.OrdinalIgnoreCase )
+                || message.Contains( "not supported", StringComparison.OrdinalIgnoreCase ));
     }
 
     /// <summary>
@@ -459,9 +813,13 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
     /// True if the request is a lookup request whose lookup type matches a blocked endpoint;
     /// otherwise false. Non-lookup request types are never treated as blocked.
     /// </returns>
-    private static bool IsMessageBlocked( T request, HashSet<string> blockedEndpoints ) {
-        // Extract the lookup type from the request if it's a QueuedLookupRequest
+    private bool IsMessageBlocked( T request, HashSet<string> blockedEndpoints ) {
+        // Extract the lookup type from the request if it's a QueuedLookupRequest.
         if (request is QueuedLookupRequest lookupRequest) {
+            if (lookupRequest.NotBefore is { } notBefore && notBefore > DateTimeOffset.UtcNow) {
+                RecordScheduledWake( notBefore );
+                return true;
+            }
             // Use the LookupType as the endpoint key for rate limiting
             string endpointKey = lookupRequest.LookupType.ToString( );
             return blockedEndpoints.Contains( endpointKey );
@@ -469,6 +827,28 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
 
         // For other request types, don't block
         return false;
+    }
+
+    private void RecordScheduledWake( DateTimeOffset candidate ) {
+        if (_nextScheduledWake is null || candidate < _nextScheduledWake) {
+            _nextScheduledWake = candidate;
+        }
+    }
+
+    private static DateTimeOffset? Earliest( DateTimeOffset? left, DateTimeOffset? right ) =>
+        left is null ? right : right is null || left <= right ? left : right;
+
+    private bool TryActivateDelivery( QueuedMessage<T> message ) =>
+        _activeDeliveries.TryAdd( message.MessageId, 0 );
+
+    /// <inheritdoc/>
+    public void ReleaseDelivery( string messageId ) {
+        ArgumentException.ThrowIfNullOrWhiteSpace( messageId );
+        if (_activeDeliveries.TryRemove( messageId, out _ )) {
+            // A locally fenced PEL entry is eligible again. Wake the dequeue producer even when
+            // no new Redis stream entry was added (for example after capped ACK recovery).
+            NotifyWorkAvailable( );
+        }
     }
 
     /// <summary>
@@ -489,13 +869,14 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
         (string stream, string id) = ParseMessageId( messageId );
 
         IDatabase db = _redis.GetDatabase( );
-        _ = await db.StreamAcknowledgeAsync( stream, _consumerGroup, id );
-
-        // Also delete the message from the stream (cleanup)
-        _ = await db.StreamDeleteAsync( stream, [id] );
+        _ = await db.ScriptEvaluateAsync(
+            RemoveDeliveryScript,
+            [stream],
+            [id, _consumerGroup] );
+        ReleaseDelivery( messageId );
 
         // Record acknowledge metric
-        QueueMetrics.RecordAcknowledge( _provider );
+        QueueMetrics.RecordDeliveryRemoved( _provider, GetPriorityFromStream( stream ) );
 
         LogAcknowledged( _logger, id, stream );
     }
@@ -505,15 +886,14 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
     /// </summary>
     /// <param name="messageId">The composite message id to requeue.</param>
     /// <param name="delay">
-    /// Requested delay before the message becomes available again. <b>Not honored:</b> a non-zero
-    /// delay is logged and then ignored, and the message is requeued immediately.
+    /// An explicit provider eligibility delay. When omitted, the queue applies the ordinary
+    /// transient-failure 1/2/4/8-second backoff and increments the attempt count.
     /// </param>
     /// <param name="cancellationToken">A cancellation token (not currently observed).</param>
     /// <returns>A task that completes once the message is requeued, or immediately if the original entry no longer exists.</returns>
     /// <remarks>
-    /// Reads the original entry, acknowledges and deletes it, then re-adds the same payload with a
-    /// new <c>enqueuedAt</c>. The delayed-requeue path is a known stub: it only logs that delay is
-    /// not implemented and proceeds with an immediate requeue. A requeue metric is recorded.
+    /// Reads the original entry, adds a replacement, then acknowledges and deletes the original
+    /// so an XADD failure cannot lose the delivery.
     /// </remarks>
     /// <exception cref="ArgumentException">Thrown when <paramref name="messageId"/> is null or whitespace, or is not a valid composite id.</exception>
     public async Task RequeueAsync( string messageId, TimeSpan? delay = null, CancellationToken cancellationToken = default ) {
@@ -527,28 +907,55 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
 
         if (entries.Length == 0) {
             LogMessageNotFoundForRequeue( _logger, id, stream );
+            ReleaseDelivery( messageId );
             return;
         }
 
         StreamEntry original = entries[0];
 
-        // Acknowledge and delete the original
-        _ = await db.StreamAcknowledgeAsync( stream, _consumerGroup, id );
-        _ = await db.StreamDeleteAsync( stream, [id] );
-
-        if (delay.HasValue && delay.Value > TimeSpan.Zero) {
-            // For delayed requeue, we'd need a separate delay mechanism (e.g., sorted set with score = delivery time)
-            // For now, add immediately with a note. Workers can implement delay checking later.
-            LogDelayedRequeueNotImplemented( _logger );
-        }
-
         // Re-add with updated enqueued time
+        RedisValue payload = original[QueueStreamFieldNames.Payload];
+        if (typeof( T ) == typeof( QueuedLookupRequest )) {
+            QueuedLookupRequest? queued = JsonSerializer.Deserialize<QueuedLookupRequest>( payload.ToString( ), _jsonOptions );
+            if (queued is not null) {
+                TimeSpan retryDelay = delay ?? TimeSpan.FromSeconds( 1 << Math.Min( queued.AttemptCount, 3 ) );
+                payload = JsonSerializer.Serialize( queued with {
+                    EnqueueOrigin = QueueEnqueueOrigin.Requeue,
+                    AttemptCount = delay is null ? queued.AttemptCount + 1 : queued.AttemptCount,
+                    NotBefore = DateTimeOffset.UtcNow + retryDelay
+                }, _jsonOptions );
+            }
+        }
         NameValueEntry[] fields = [
-            new NameValueEntry( QueueStreamFieldNames.Payload, original[QueueStreamFieldNames.Payload] ),
+            new NameValueEntry( QueueStreamFieldNames.Payload, payload ),
             new NameValueEntry( QueueStreamFieldNames.EnqueuedAt, DateTimeOffset.UtcNow.ToString( "O" ) )
         ];
 
-        _ = await db.StreamAddAsync( stream, fields );
+        RedisResult moveResult = await db.ScriptEvaluateAsync(
+            RequeueDeliveryScript,
+            [stream],
+            [
+                id,
+                _consumerGroup,
+                QueueStreamFieldNames.Payload,
+                payload,
+                QueueStreamFieldNames.EnqueuedAt,
+                fields[1].Value,
+                _workSignalChannel.ToString( )
+            ] );
+        RedisValue replacementId = (RedisValue)moveResult;
+        if (!replacementId.HasValue) {
+            ReleaseDelivery( messageId );
+            return;
+        }
+        NotifyWorkAvailable( );
+
+        // An accepted replacement is counted at the XADD boundary, even if cleanup of the
+        // original PEL entry subsequently fails.
+        QueueMetrics.RecordEnqueue( _provider, GetPriorityFromStream( stream ), QueueEnqueueOrigin.Requeue );
+
+        ReleaseDelivery( messageId );
+        QueueMetrics.RecordDeliveryRemoved( _provider, GetPriorityFromStream( stream ) );
 
         // Record requeue metric
         QueueMetrics.RecordRequeue( _provider );
@@ -630,15 +1037,36 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
         string targetStream = GetStreamForPriority( priority );
 
         // Add to target stream
+        RedisValue payload = original[QueueStreamFieldNames.Payload];
+        if (typeof( T ) == typeof( QueuedLookupRequest )) {
+            QueuedLookupRequest? queued = JsonSerializer.Deserialize<QueuedLookupRequest>( payload.ToString( ), _jsonOptions );
+            if (queued is not null) {
+                payload = JsonSerializer.Serialize( queued with { EnqueueOrigin = QueueEnqueueOrigin.Requeue }, _jsonOptions );
+            }
+        }
         NameValueEntry[] fields = [
-            new NameValueEntry( QueueStreamFieldNames.Payload, original[QueueStreamFieldNames.Payload] ),
+            new NameValueEntry( QueueStreamFieldNames.Payload, payload ),
             new NameValueEntry( QueueStreamFieldNames.EnqueuedAt, DateTimeOffset.UtcNow.ToString( "O" ) )
         ];
 
-        _ = await db.StreamAddAsync( targetStream, fields );
+        RedisResult moveResult = await db.ScriptEvaluateAsync(
+            RequeueDlqDeliveryScript,
+            [_dlqStream, targetStream],
+            [
+                id,
+                QueueStreamFieldNames.Payload,
+                fields[0].Value,
+                QueueStreamFieldNames.EnqueuedAt,
+                fields[1].Value,
+                _workSignalChannel.ToString( )
+            ] );
+        RedisValue replacementId = (RedisValue)moveResult;
+        if (!replacementId.HasValue) {
+            throw new InvalidOperationException( $"DLQ entry '{_dlqStream}:{id}' was no longer available to requeue." );
+        }
+        NotifyWorkAvailable( );
 
-        // Delete from DLQ
-        _ = await db.StreamDeleteAsync( _dlqStream, [id] );
+        QueueMetrics.RecordEnqueue( _provider, priority, QueueEnqueueOrigin.Requeue );
 
         LogMovedFromDlq( _logger, id, targetStream, priority );
     }
@@ -662,30 +1090,28 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
         (string stream, string id) = ParseMessageId( messageId );
         IDatabase db = _redis.GetDatabase( );
 
-        // Read the original message
-        StreamEntry[] entries = await db.StreamRangeAsync( stream, id, id, count: 1 );
-
-        if (entries.Length == 0) {
+        RedisResult moveResult = await db.ScriptEvaluateAsync(
+            MoveToDlqDeliveryScript,
+            [stream, _dlqStream],
+            [
+                id,
+                _consumerGroup,
+                QueueStreamFieldNames.Payload,
+                QueueStreamFieldNames.EnqueuedAt,
+                DlqOriginalStreamField,
+                DlqReasonField,
+                reason,
+                DlqMovedAtField,
+                DateTimeOffset.UtcNow.ToString( "O" )
+            ] );
+        RedisValue replacementId = (RedisValue)moveResult;
+        ReleaseDelivery( messageId );
+        if (!replacementId.HasValue) {
             LogMessageNotFoundForDlqMove( _logger, id, stream );
             return;
         }
-
-        StreamEntry original = entries[0];
-
-        // Add to DLQ with metadata
-        NameValueEntry[] dlqFields = [
-            new NameValueEntry( QueueStreamFieldNames.Payload, original[QueueStreamFieldNames.Payload] ),
-            new NameValueEntry( QueueStreamFieldNames.EnqueuedAt, original[QueueStreamFieldNames.EnqueuedAt] ),
-            new NameValueEntry( DlqOriginalStreamField, stream ),
-            new NameValueEntry( DlqReasonField, reason ),
-            new NameValueEntry( DlqMovedAtField, DateTimeOffset.UtcNow.ToString( "O" ) )
-        ];
-
-        _ = await db.StreamAddAsync( _dlqStream, dlqFields );
-
-        // Acknowledge and delete from original stream
-        _ = await db.StreamAcknowledgeAsync( stream, _consumerGroup, id );
-        _ = await db.StreamDeleteAsync( stream, [id] );
+        QueueMetrics.RecordDeliveryRemoved( _provider, GetPriorityFromStream( stream ) );
+        QueueMetrics.RecordDlq( _provider, GetPriorityFromStream( stream ) );
 
         LogMovedToDlq( _logger, id, stream, reason );
     }
@@ -734,6 +1160,10 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
         if (stream == _interactiveStream) { return QueuePriority.Interactive; }
         if (stream == _backgroundStream) { return QueuePriority.Background; }
         if (stream == _bulkStream) { return QueuePriority.Bulk; }
+        if (_provider == SupportedProviders.Spotify
+            && stream is SpotifyConstants.BulkTrackIdStream or SpotifyConstants.BulkAlbumIdStream) {
+            return QueuePriority.Bulk;
+        }
         return QueuePriority.Background; // Default fallback
     }
 
@@ -826,17 +1256,49 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
             }
 
             DateTimeOffset enqueuedAt = !string.IsNullOrEmpty( enqueuedAtStr )
-                ? DateTimeOffset.Parse( enqueuedAtStr )
+                ? DateTimeOffset.Parse(
+                    enqueuedAtStr,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind )
                 : DateTimeOffset.UtcNow;
 
             // Composite message ID includes stream for ack/requeue
             string compositeId = $"{stream}:{entry.Id}";
 
-            return new QueuedMessage<T>( compositeId, request, enqueuedAt );
+            return new QueuedMessage<T>( compositeId, request, enqueuedAt ) {
+                Priority = GetPriorityFromStream( stream )
+            };
         } catch (JsonException ex) {
             LogDeserializationError( _logger, ex, entry.Id.ToString( ), stream );
             return null;
+        } catch (FormatException ex) {
+            LogDeserializationError( _logger, ex, entry.Id.ToString( ), stream );
+            return null;
         }
+    }
+
+    private async Task MovePoisonEntryToDlqAsync( IDatabase db, string stream, RedisValue id ) {
+        RedisResult result = await db.ScriptEvaluateAsync(
+            MovePoisonToDlqScript,
+            [stream, _dlqStream],
+            [
+                id,
+                _consumerGroup,
+                QueueStreamFieldNames.Payload,
+                QueueStreamFieldNames.EnqueuedAt,
+                DlqOriginalStreamField,
+                DlqReasonField,
+                "Unreadable queue payload.",
+                DlqMovedAtField,
+                DateTimeOffset.UtcNow.ToString( "O", CultureInfo.InvariantCulture )
+            ] );
+        if (!((RedisValue)result).HasValue) return;
+        QueueMetrics.PelScanEntries.Add( 1,
+            new KeyValuePair<string, object?>( QueueMetricTags.Stream, stream ),
+            new KeyValuePair<string, object?>( QueueMetricTags.Outcome, "poison" ) );
+        QueueMetrics.RecordDeliveryRemoved( _provider, GetPriorityFromStream( stream ) );
+        QueueMetrics.RecordDlq( _provider, GetPriorityFromStream( stream ) );
+        QueueMetrics.RecordTerminalOutcome( _provider, GetPriorityFromStream( stream ), "poison_dlq" );
     }
 
     /// <summary>
@@ -939,14 +1401,6 @@ public sealed partial class RedisRequestQueue<T> : IRequestQueue<T> where T : cl
         Level = LogLevel.Warning,
         Message = "Message {MessageId} not found in {Stream} for requeue" )]
     internal static partial void LogMessageNotFoundForRequeue( ILogger logger, string messageId, string stream );
-
-    /// <summary>Logs that a delayed requeue was requested but the delay is not implemented (the message is requeued immediately).</summary>
-    /// <param name="logger">The logger to write to.</param>
-    [LoggerMessage(
-        EventId = LogEventIds.Infrastructure.Queue.RedisRequestQueueDelayedRequeueNotImplemented,
-        Level = LogLevel.Debug,
-        Message = "Delayed requeue requested but not yet implemented. Adding immediately." )]
-    internal static partial void LogDelayedRequeueNotImplemented( ILogger logger );
 
     /// <summary>Logs that a message was requeued.</summary>
     /// <param name="logger">The logger to write to.</param>

@@ -1,9 +1,9 @@
 # This stage is used when running from VS in fast mode (Default for Debug configuration)
-FROM mcr.microsoft.com/dotnet/aspnet:10.0@sha256:8c0b6857eab7b2aa57884c839bf4678414606bd7d17370f18a842ac5cf414711 AS base
+FROM mcr.microsoft.com/dotnet/aspnet:10.0@sha256:8af87eba5e7cdafb1514d7388be287365da97c132509e84dfe252ffd552398ca AS base
 
 
 # This stage is used to build and publish all projects
-FROM mcr.microsoft.com/dotnet/sdk:10.0@sha256:c0790639332692a0d56cdd81ed581cfd24d040d9839764c138994866df89a3b6 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0@sha256:747cbade5bfd918a175ac32f8f1d931edec2c7d0d5397a3de72eaef1ac1f66d2 AS build
 ARG TARGETARCH
 WORKDIR /build
 
@@ -26,7 +26,7 @@ RUN DOTNET_RID="linux-x64"; \
     DASHBOARD_PACKAGE_DIR=$(ls -d /root/.nuget/packages/aspire.dashboard.sdk.${DOTNET_RID}/* | sort -V | tail -n 1) && \
     cp -r "${DCP_PACKAGE_DIR}/tools"/* /build/publish/tools/dcp/ && \
     cp -r "${DASHBOARD_PACKAGE_DIR}/tools"/* /build/publish/tools/dashboard/ && \
-    chmod +x /build/publish/tools/dcp/dcp
+    chmod +x /build/publish/tools/dcp/dcp /build/publish/tools/dashboard/Aspire.Dashboard
 
 
 # Final runtime stage
@@ -54,11 +54,11 @@ RUN chown -R $APP_UID:$APP_UID /src && \
     chown -R $APP_UID:$APP_UID /app/ && \
     chown $APP_UID:$APP_UID /entrypoint.sh && \
     chmod +x /entrypoint.sh && \
-    chmod +x /app/tools/dcp/dcp
+    chmod +x /app/tools/dcp/dcp /app/tools/dashboard/Aspire.Dashboard
 
 USER $APP_UID
 
-# Aspire Dashboard configuration (13.1)
+# Aspire Dashboard configuration
 # Dashboard binds to all interfaces on 18888 for reverse proxy access
 # ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS disables all dashboard auth (Frontend, OTLP, MCP)
 # Auth is handled externally by Caddy forward_auth in production

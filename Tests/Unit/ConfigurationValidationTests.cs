@@ -2,6 +2,7 @@ using BridgeBeats.Contracts.Interfaces; // Added for IMediaLinkService
 using BridgeBeats.Web.Configuration;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Moq;
 
 namespace BridgeBeats.Tests.Unit;
 
@@ -146,6 +147,12 @@ public class ConfigurationValidationTests {
 
         // Act
         IServiceCollection services = new ServiceCollection( );
+
+        // SpotifyLookupService now requires IGenreCacheService (matching the Apple/Tidal direct
+        // lookup services). The real host registers it via AddGenreCache() ahead of this call; this
+        // test bypasses that host wiring, so it substitutes a bare instance to satisfy the dependency.
+        _ = services.AddSingleton( new Mock<IGenreCacheService>( ).Object );
+
         IConfiguration config = new ConfigurationBuilder( ).AddInMemoryCollection( overrides ).Build( );
         _ = services.AddBridgeBeatsServices( config );
         ServiceProvider sp = services.BuildServiceProvider( );

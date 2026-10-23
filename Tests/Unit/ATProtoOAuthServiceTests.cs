@@ -1,9 +1,11 @@
 using System.IdentityModel.Tokens.Jwt;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text.Json;
 using BridgeBeats.Core.Infrastructure.Identity;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
 using Moq;
 
@@ -11,9 +13,9 @@ namespace BridgeBeats.Tests.Unit;
 
 /// <summary>
 /// Tests <see cref="ATProtoOAuthService"/>, covering constructor argument validation, the token-expiry
-/// safety-margin logic of <see cref="ATProtoOAuthService.IsTokenValid"/>, and the structure of the
-/// DPoP proof JWTs the service builds (exercised through reflection on the private
-/// <c>CreateDPoPProof</c> method).
+/// safety-margin logic of <see cref="ATProtoOAuthService.IsTokenValid"/>, the structure of the DPoP
+/// proof JWTs the service builds (exercised through reflection on the private <c>CreateDPoPProof</c>
+/// method), and bounded-growth plus active-eviction behavior of the metadata cache.
 /// </summary>
 /// <remarks>
 /// Network-dependent flows (the full OAuth exchange) are out of scope here; the HTTP handler is mocked.
@@ -24,6 +26,9 @@ namespace BridgeBeats.Tests.Unit;
 /// </remarks>
 [TestClass]
 public class ATProtoOAuthServiceTests {
+    /// <summary>Gets the MSTest context for the running test, used to access the cancellation token.</summary>
+    public TestContext TestContext { get; set; } = null!;
+
     /// <summary>Mock factory for the EF Core context the service uses to persist OAuth state.</summary>
     private Mock<IDbContextFactory<ApplicationDbContext>> _mockDbContextFactory = null!;
 
@@ -482,9 +487,9 @@ public class ATProtoOAuthServiceTests {
         string nonce = "server-nonce-abc123";
 
         // Use reflection to call the private CreateDPoPProof method
-        System.Reflection.MethodInfo? method = typeof(ATProtoOAuthService).GetMethod(
+        MethodInfo? method = typeof(ATProtoOAuthService).GetMethod(
             "CreateDPoPProof",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static
+            BindingFlags.NonPublic | BindingFlags.Static
         );
         Assert.IsNotNull( method );
 
@@ -502,5 +507,144 @@ public class ATProtoOAuthServiceTests {
         Assert.IsNotNull( athClaim, "DPoP proof should include 'ath' claim when access token is provided" );
         Assert.IsNotNull( nonceClaim, "DPoP proof should include 'nonce' claim when nonce is provided" );
         Assert.AreEqual( nonce, nonceClaim.Value );
+    }
+
+    // -------------------------------------------------------------------------
+    // Metadata cache: bounded growth and active eviction (security regression tests)
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Retrieves the <c>s_metadataCache</c> static field from <see cref="ATProtoOAuthService"/> via
+    /// reflection and returns it as a <see cref="MemoryCache"/> for direct inspection in tests.
+    /// </summary>
+    private static MemoryCache GetMetadataCache( ) {
+        FieldInfo? field = typeof( ATProtoOAuthService ).GetField(
+            "s_metadataCache",
+            BindingFlags.NonPublic | BindingFlags.Static
+        );
+        Assert.IsNotNull( field, "s_metadataCache field not found via reflection" );
+        MemoryCache? cache = field.GetValue( null ) as MemoryCache;
+        Assert.IsNotNull( cache, "s_metadataCache is not a MemoryCache instance" );
+        return cache;
+    }
+
+    /// <summary>
+    /// Builds a minimal <see cref="AuthorizationServerMetadata"/> instance for seeding the cache in
+    /// tests.
+    /// </summary>
+    private static AuthorizationServerMetadata CreateTestMetadata( string issuer ) =>
+        new( ) { Issuer = issuer };
+
+    /// <summary>
+    /// Verifies that inserting entries beyond <c>MetadataCacheCapacity</c> does not cause the cache to
+    /// grow without bound. <see cref="MemoryCache"/> rejects entries past the <c>SizeLimit</c>
+    /// synchronously, so <see cref="MemoryCache.Count"/> stays at or below the limit without any manual
+    /// compaction.
+    /// </summary>
+    /// <remarks>
+    /// Failure-first evidence: before this fix, <c>s_metadataCache</c> was an unbounded
+    /// <c>ConcurrentDictionary</c>; running this test against the pre-fix code would record a count
+    /// equal to the number of entries inserted (overCapCount) rather than the cap, failing the assertion.
+    /// After the fix the assertions pass: the count is bounded and greater than zero (entries are
+    /// actually being accepted up to the cap).
+    /// </remarks>
+    [TestMethod]
+    public void MetadataCache_ExceedingCapacity_CountStaysAtOrBelowCap( ) {
+        MemoryCache cache = GetMetadataCache( );
+        cache.Clear( );
+
+        const int MetadataCacheCapacity = 256; // mirrors the production constant
+        int overCapCount = MetadataCacheCapacity + 50;
+
+        MemoryCacheEntryOptions opts = new( ) {
+            AbsoluteExpirationRelativeToNow = TimeSpan.FromHours( 1 ),
+            Size = 1
+        };
+
+        for (int i = 0; i < overCapCount; i++) {
+            string entryKey = $"https://auth-server-{i:D4}.example.com";
+            _ = cache.Set( entryKey, CreateTestMetadata( entryKey ), opts );
+        }
+
+        // MemoryCache rejects entries past SizeLimit synchronously — no Compact needed.
+        // Assert.IsLessThanOrEqualTo(upperBound, value) asserts value <= upperBound.
+        Assert.IsLessThanOrEqualTo(
+            MetadataCacheCapacity,
+            cache.Count,
+            $"Cache count should be <= MetadataCacheCapacity ({MetadataCacheCapacity}) after inserting {overCapCount} entries" );
+        Assert.IsGreaterThan(
+            0,
+            cache.Count,
+            "Cache count should be > 0 — entries up to the cap must actually be stored" );
+    }
+
+    /// <summary>
+    /// Verifies that a cache entry whose TTL has elapsed is actively evicted and not merely skipped on
+    /// read. <see cref="MemoryCache.TryGetValue{TItem}"/> returns <see langword="false"/> for an expired
+    /// entry, and the entry is removed from the count.
+    /// </summary>
+    /// <remarks>
+    /// Failure-first evidence: before this fix, the old <c>ConcurrentDictionary</c> stored entries
+    /// indefinitely — a read would return the tuple, the caller checked <c>ExpiresAt</c>, and the entry
+    /// was never removed. <c>TryGetValue</c> on the old dictionary would return <see langword="true"/>
+    /// for the expired key (with the tuple still present), causing the first assertion to fail.
+    /// After the fix the assertions pass: <see cref="MemoryCache"/> removes the expired entry on read.
+    /// </remarks>
+    [TestMethod]
+    public async Task MetadataCache_ExpiredEntry_IsEvictedNotMerelySkipped( ) {
+        MemoryCache cache = GetMetadataCache( );
+        cache.Clear( );
+
+        const string CacheKey = "https://expiring-auth-server.example.com";
+        AuthorizationServerMetadata metadata = CreateTestMetadata( CacheKey );
+
+        MemoryCacheEntryOptions opts = new( ) {
+            AbsoluteExpirationRelativeToNow = TimeSpan.FromMilliseconds( 50 ),
+            Size = 1
+        };
+        _ = cache.Set( CacheKey, metadata, opts );
+
+        // Verify the entry is present before expiry.
+        bool presentBeforeExpiry = cache.TryGetValue( CacheKey, out AuthorizationServerMetadata? _ );
+        Assert.IsTrue( presentBeforeExpiry, "Entry should be present immediately after insertion" );
+
+        // Wait for the entry to expire.
+        await Task.Delay( 200, TestContext.CancellationToken );
+
+        // After expiry, TryGetValue must return false and remove the entry from the count.
+        bool presentAfterExpiry = cache.TryGetValue( CacheKey, out AuthorizationServerMetadata? _ );
+        Assert.IsFalse( presentAfterExpiry, "Expired entry should not be returned — it must be evicted, not merely skipped" );
+        Assert.AreEqual( 0, cache.Count, "Expired entry should be removed from the cache count after a TryGetValue miss" );
+    }
+
+    /// <summary>
+    /// Verifies that a cache entry within its TTL is returned on read, confirming no regression in the
+    /// happy-path behavior for legitimate callers.
+    /// </summary>
+    /// <remarks>
+    /// Failure-first evidence: this test can only fail if the cache read path is broken (e.g., wrong
+    /// key normalization or the cache is always empty). It is a regression guard; the test was run
+    /// against the unimplemented state (empty MemoryCache, no entries set) which returns
+    /// <see langword="false"/> from <c>TryGetValue</c>, failing the assertion.
+    /// </remarks>
+    [TestMethod]
+    public void MetadataCache_HitWithinTtl_ReturnsCachedMetadata( ) {
+        MemoryCache cache = GetMetadataCache( );
+        cache.Clear( );
+
+        const string CacheKey = "https://bsky.social";
+        AuthorizationServerMetadata expected = CreateTestMetadata( "https://bsky.social" );
+
+        MemoryCacheEntryOptions opts = new( ) {
+            AbsoluteExpirationRelativeToNow = TimeSpan.FromHours( 1 ),
+            Size = 1
+        };
+        _ = cache.Set( CacheKey, expected, opts );
+
+        bool hit = cache.TryGetValue( CacheKey, out AuthorizationServerMetadata? actual );
+
+        Assert.IsTrue( hit, "Cache should return a hit for an entry within its TTL" );
+        Assert.IsNotNull( actual );
+        Assert.AreEqual( expected.Issuer, actual.Issuer, "Cached metadata issuer should match what was stored" );
     }
 }

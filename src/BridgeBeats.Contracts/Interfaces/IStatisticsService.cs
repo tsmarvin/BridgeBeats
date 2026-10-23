@@ -3,59 +3,53 @@ using BridgeBeats.Contracts.DTOs;
 namespace BridgeBeats.Contracts.Interfaces;
 
 /// <summary>
-/// Serves aggregate lookup statistics with a cached value and a background refresh, plus the
-/// live cache-bootstrap worker status that can be merged into the stats.
+/// Serves aggregate lookup statistics by reading the worker-published <c>status:statistics</c>
+/// Redis document, plus the live cache-bootstrap worker status that can be merged into the stats.
+/// Refresh requests are dispatched to the Maintenance worker over Redis Pub/Sub.
 /// </summary>
-/// <remarks>
-/// Implemented in <c>BridgeBeats.Core</c> by <c>StatisticsService</c>
-/// (<c>Domain/Services/Statistics/StatisticsService.cs</c>). <see cref="GetCachedStatistics"/>
-/// and <see cref="TriggerRefresh"/> are non-blocking; the <c>Async</c> methods may compute or
-/// recompute the statistics.
-/// </remarks>
 public interface IStatisticsService {
 
     /// <summary>
-    /// Returns the most recently cached statistics without computing or waiting. Lets a caller
-    /// distinguish "no data yet" from "data available".
+    /// Returns the full worker status document, including the snapshot, run-lifecycle flags, and
+    /// the last-failure fields, served from the same in-process memo as
+    /// <see cref="GetCachedStatistics"/>. Lets a caller select the page state (data, generating, or
+    /// error) and surface <see cref="StatisticsStatus.LastError"/> /
+    /// <see cref="StatisticsStatus.NextScheduledRun"/> without a second Redis round-trip.
     /// </summary>
     /// <returns>
-    /// The cached <see cref="LookupStatistics"/>, or <see langword="null"/> when nothing has been
-    /// computed yet.
+    /// The current <see cref="StatisticsStatus"/>, or <see langword="null"/> when the worker has
+    /// not yet published a status document (before the first run).
+    /// </returns>
+    StatisticsStatus? GetStatus( );
+
+    /// <summary>
+    /// Returns the most recently cached statistics snapshot without computing or waiting. The
+    /// value reflects the last snapshot written by the Maintenance worker. Lets a caller
+    /// distinguish "no data yet" from "data available". A projection over
+    /// <see cref="GetStatus"/> (the snapshot field of the same status document).
+    /// </summary>
+    /// <returns>
+    /// The cached <see cref="LookupStatistics"/>, or <see langword="null"/> when the worker has
+    /// not yet completed a run.
     /// </returns>
     LookupStatistics? GetCachedStatistics( );
 
     /// <summary>
-    /// Whether a background statistics refresh is currently in progress.
+    /// Whether the Maintenance worker is currently running a statistics computation, as
+    /// reported by the <c>IsRunning</c> field of the <c>status:statistics</c> Redis document. A
+    /// projection over <see cref="GetStatus"/> (the running flag of the same status document).
     /// </summary>
     bool IsRefreshing { get; }
 
     /// <summary>
-    /// Requests a background refresh of the statistics via a channel signal and returns
-    /// immediately (fire-and-forget).
+    /// Publishes a manual-refresh request to the Maintenance worker over Redis Pub/Sub.
+    /// Returns immediately (fire-and-forget). Admin-gated and rate-limited by the caller.
     /// </summary>
     /// <returns>
-    /// <see langword="true"/> when a refresh signal was sent by this call; <see langword="false"/>
-    /// when one was already running and no new refresh was started.
+    /// <see langword="true"/> when the publish succeeded; <see langword="false"/> when the
+    /// publish could not be delivered (for example, a Redis failure).
     /// </returns>
-    bool TriggerRefresh( );
-
-    /// <summary>
-    /// Returns the current statistics, serving the cached value when available and otherwise an
-    /// empty <see cref="LookupStatistics"/> (zero records, <c>GeneratedAt</c> at
-    /// <see cref="System.DateTimeOffset.MinValue"/>). Never blocks and never throws. Retained for
-    /// backward compatibility; new code should prefer <see cref="GetCachedStatistics"/>.
-    /// </summary>
-    /// <param name="cancellationToken">Token used to cancel the operation.</param>
-    /// <returns>A task whose result is the current <see cref="LookupStatistics"/>.</returns>
-    Task<LookupStatistics> GetStatisticsAsync( CancellationToken cancellationToken = default );
-
-    /// <summary>
-    /// Acquires the refresh lock, recomputes the statistics from source, updates the cache, and
-    /// returns the fresh value. Called internally by the background service.
-    /// </summary>
-    /// <param name="cancellationToken">Token used to cancel the operation.</param>
-    /// <returns>A task whose result is the freshly computed <see cref="LookupStatistics"/>.</returns>
-    Task<LookupStatistics> RefreshStatisticsAsync( CancellationToken cancellationToken = default );
+    bool RequestRefresh( );
 
     /// <summary>
     /// Reads the current cache-bootstrap worker status directly from Redis, bypassing the

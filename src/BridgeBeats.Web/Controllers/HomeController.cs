@@ -24,12 +24,14 @@ namespace BridgeBeats.Web.Controllers {
     /// <param name="mediaLinkService">Optional media-link service used to resolve lookups; when null, lookup endpoints report that the service is unavailable.</param>
     /// <param name="cardService">Optional Open Graph card service used to store results and produce shareable card URLs.</param>
     /// <param name="cacheRepository">Optional cache repository used to resolve the ATProto URI for a result.</param>
+    /// <param name="probe">Optional saga-progress probe used to set the "lookup in progress" indicator on result cards; when null, the indicator is never shown.</param>
     public partial class HomeController(
         ILogger<HomeController> logger,
         ICompositeViewEngine viewEngine,
         IMediaLinkService? mediaLinkService = null,
         IOpenGraphCardService? cardService = null,
-        IMediaLinkCacheRepository? cacheRepository = null
+        IMediaLinkCacheRepository? cacheRepository = null,
+        ILookupProgressProbe? probe = null
     ) : Controller {
 
         /// <summary>
@@ -65,9 +67,14 @@ namespace BridgeBeats.Web.Controllers {
 
             // Perform lookup server-side and collect all results
             MusicLookupViewModel viewModel = new( );
+            List<string> placeholderMessages = [];
             await foreach (MediaLinkResult result in mediaLinkService.GetInfoAsync( uri )) {
                 if (result.Results.Count == 0) {
-                    continue; // Skip empty results
+                    if (result.Messages is { Count: > 0 }) {
+                        placeholderMessages.AddRange(
+                            result.Messages.Where( message => !string.IsNullOrWhiteSpace( message ) ) );
+                    }
+                    continue;
                 }
 
                 // Find primary result
@@ -98,17 +105,26 @@ namespace BridgeBeats.Web.Controllers {
                 // Get ATProto URI from cache if available
                 string? atProtoUri = await GetATProtoUriFromCache( result );
 
+                string? urlProbeKey = result.InputLinks.Count > 0
+                    ? LookupKeyBuilder.UrlKey( result.InputLinks[0] )
+                    : null;
+                bool isLookupInProgress = urlProbeKey is not null && probe is not null
+                    && await probe.IsActiveAsync( urlProbeKey, HttpContext.RequestAborted );
+
                 viewModel.Items.Add( new MusicLookupViewModel.MusicLookupResultItem {
                     CardUrl = cardUrl,
                     ATProtoUri = atProtoUri,
                     Result = result,
                     PrimaryProvider = primaryProvider,
-                    PrimaryResult = primaryResult
+                    PrimaryResult = primaryResult,
+                    IsLookupInProgress = isLookupInProgress
                 } );
             }
 
             if (viewModel.Items.Count == 0) {
-                viewModel.Message = "No results found";
+                viewModel.Message = placeholderMessages.Count > 0
+                    ? string.Join( " ", placeholderMessages )
+                    : "No results found";
             }
 
             return PartialView( "_LookupResults", viewModel );
@@ -138,7 +154,7 @@ namespace BridgeBeats.Web.Controllers {
             }
 
             MediaLinkResult? result = await mediaLinkService.GetInfoByISRCAsync( isrc );
-            return await CreateViewModelFromResult( result, "No results found for ISRC" );
+            return await CreateViewModelFromResult( result, "No results found for ISRC", LookupKeyBuilder.IsrcKey( isrc ) );
         }
 
         /// <summary>
@@ -165,7 +181,7 @@ namespace BridgeBeats.Web.Controllers {
             }
 
             MediaLinkResult? result = await mediaLinkService.GetInfoByUPCAsync( upc );
-            return await CreateViewModelFromResult( result, "No results found for UPC" );
+            return await CreateViewModelFromResult( result, "No results found for UPC", LookupKeyBuilder.UpcKey( upc ) );
         }
 
         /// <summary>
@@ -193,25 +209,28 @@ namespace BridgeBeats.Web.Controllers {
             }
 
             MediaLinkResult? result = await mediaLinkService.GetInfoAsync( title, artist );
-            return await CreateViewModelFromResult( result, "No results found for title/artist" );
+            return await CreateViewModelFromResult( result, "No results found for title/artist", LookupKeyBuilder.MetadataKey( title, artist ) );
         }
 
         /// <summary>
         /// Builds a single-item lookup view model from a resolved result, selecting the primary provider,
-        /// storing an Open Graph card when enabled, and resolving the ATProto URI. Falls back to a message when
-        /// there is no usable result.
+        /// storing an Open Graph card when enabled, resolving the ATProto URI, and probing the saga to
+        /// set the "lookup in progress" indicator. Preserves provider guidance from result-less placeholders,
+        /// falling back to the supplied no-results message only when no guidance is available.
         /// </summary>
         /// <param name="result">The resolved media-link result, or null when nothing matched.</param>
         /// <param name="noResultsMessage">The message to display when no usable result is present.</param>
+        /// <param name="lookupKey">The normalized lookup key used to probe saga progress.</param>
         /// <returns>The <c>_LookupResults</c> partial view populated with the item or the no-results message.</returns>
         private async Task<IActionResult> CreateViewModelFromResult(
             MediaLinkResult? result,
-            string noResultsMessage
+            string noResultsMessage,
+            string lookupKey
         ) {
             MusicLookupViewModel viewModel = new( );
 
             if (result == null || result.Results.Count == 0) {
-                viewModel.Message = noResultsMessage;
+                viewModel.Message = GetResultMessage( result, noResultsMessage );
                 return PartialView( "_LookupResults", viewModel );
             }
 
@@ -231,7 +250,7 @@ namespace BridgeBeats.Web.Controllers {
             }
 
             if (primaryResult == null) {
-                viewModel.Message = noResultsMessage;
+                viewModel.Message = GetResultMessage( result, noResultsMessage );
                 return PartialView( "_LookupResults", viewModel );
             }
 
@@ -244,15 +263,31 @@ namespace BridgeBeats.Web.Controllers {
             // Get ATProto URI from cache if available
             string? atProtoUri = await GetATProtoUriFromCache( result );
 
+            bool isLookupInProgress = probe is not null
+                && await probe.IsActiveAsync( lookupKey, HttpContext.RequestAborted );
+
             viewModel.Items.Add( new MusicLookupViewModel.MusicLookupResultItem {
                 CardUrl = cardUrl,
                 ATProtoUri = atProtoUri,
                 Result = result,
                 PrimaryProvider = primaryProvider,
-                PrimaryResult = primaryResult
+                PrimaryResult = primaryResult,
+                IsLookupInProgress = isLookupInProgress
             } );
 
             return PartialView( "_LookupResults", viewModel );
+        }
+
+        private static string GetResultMessage( MediaLinkResult? result, string fallback ) {
+            if (result?.Messages is not { Count: > 0 }) {
+                return fallback;
+            }
+
+            string message = string.Join(
+                " ",
+                result.Messages.Where( value => !string.IsNullOrWhiteSpace( value ) )
+            );
+            return string.IsNullOrWhiteSpace( message ) ? fallback : message;
         }
 
         /// <summary>
@@ -426,13 +461,20 @@ namespace BridgeBeats.Web.Controllers {
                         // Get ATProto URI from cache if available
                         string? atProtoUri = await GetATProtoUriFromCache( result );
 
+                        string? streamProbeKey = result.InputLinks.Count > 0
+                            ? LookupKeyBuilder.UrlKey( result.InputLinks[0] )
+                            : null;
+                        bool streamIsInProgress = streamProbeKey is not null && probe is not null
+                            && await probe.IsActiveAsync( streamProbeKey, HttpContext.RequestAborted );
+
                         // Create single-item model
                         MusicLookupViewModel.MusicLookupResultItem item = new( ) {
                             CardUrl = cardUrl,
                             ATProtoUri = atProtoUri,
                             Result = result,
                             PrimaryProvider = primaryProvider,
-                            PrimaryResult = primaryResult
+                            PrimaryResult = primaryResult,
+                            IsLookupInProgress = streamIsInProgress
                         };
 
                         // Render partial view to string and stream it

@@ -2,7 +2,10 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Claims;
 using System.Text.Encodings.Web;
+using System.Text.Json;
 using BridgeBeats.Contracts.Constants;
+using BridgeBeats.Contracts.DTOs;
+using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Core.Infrastructure.Identity;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Hosting;
@@ -11,6 +14,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using StackExchange.Redis;
 
 namespace BridgeBeats.Tests.Integration;
 
@@ -22,6 +26,7 @@ namespace BridgeBeats.Tests.Integration;
 /// role.
 /// </summary>
 [TestClass]
+[DoNotParallelize] // Uses the process-wide Redis statistics keys also exercised by StatisticsStatusIntegrationTests.
 public class DashboardAuthorizationTests : IDisposable {
     /// <summary>The test web application factory with the stub authentication scheme installed.</summary>
     private DashboardTestWebApplicationFactory? _factory;
@@ -153,6 +158,60 @@ public class DashboardAuthorizationTests : IDisposable {
         Assert.AreEqual( HttpStatusCode.OK, response.StatusCode );
     }
 
+    /// <summary>Low-role statistics responses omit the bootstrap panel and sentinel.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task Statistics_LowRole_OmitsBootstrapPanelAndSentinel( ) {
+        await SeedStatisticsAsync( );
+        await CreateTestUserAsync( hasRole: false );
+        _client!.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue( "TestScheme" );
+        HttpResponseMessage response = await _client.GetAsync( "/Statistics", TestContext.CancellationToken );
+        string body = await response.Content.ReadAsStringAsync( TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.OK, response.StatusCode );
+        Assert.IsFalse( body.Contains( "Cache Bootstrap Status", StringComparison.Ordinal ) );
+        Assert.IsFalse( body.Contains( "987,654,321", StringComparison.Ordinal ) );
+    }
+
+    /// <summary>Dashboard-role statistics responses render the bootstrap panel and sentinel.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task Statistics_Admin_RendersBootstrapPanelAndSentinel( ) {
+        await SeedStatisticsAsync( );
+        await CreateTestUserAsync( hasRole: true );
+        _client!.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue( "TestScheme" );
+        HttpResponseMessage response = await _client.GetAsync( "/Statistics", TestContext.CancellationToken );
+        string body = await response.Content.ReadAsStringAsync( TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.OK, response.StatusCode );
+        StringAssert.Contains( body, "Cache Bootstrap Status" );
+        StringAssert.Contains( body, "987,654,321" );
+    }
+
+    /// <summary>Anonymous statistics requests are challenged without rendering page content.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task Statistics_Anonymous_IsChallengedWithoutStatsBody( ) {
+        await SeedStatisticsAsync( );
+        using HttpClient anonymous = _factory!.CreateClient( new Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactoryClientOptions {
+            AllowAutoRedirect = false
+        } );
+        HttpResponseMessage response = await anonymous.GetAsync( "/Statistics", TestContext.CancellationToken );
+        string body = await response.Content.ReadAsStringAsync( TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.Unauthorized, response.StatusCode );
+        Assert.IsFalse( body.Contains( "Total Records", StringComparison.Ordinal ) );
+    }
+
+    private async Task SeedStatisticsAsync( ) {
+        using IServiceScope scope = _factory!.Services.CreateScope( );
+        IConnectionMultiplexer redis = scope.ServiceProvider.GetRequiredService<IConnectionMultiplexer>( );
+        IDatabase db = redis.GetDatabase( );
+        _ = await db.StringSetAsync( StatisticsStatus.RedisKey, JsonSerializer.Serialize( new StatisticsStatus {
+            Snapshot = new LookupStatistics { TotalRecords = 1, GeneratedAt = DateTimeOffset.UtcNow }
+        } ) );
+        _ = await db.StringSetAsync( CacheBootstrapStatus.RedisKey, JsonSerializer.Serialize( new CacheBootstrapStatus {
+            LastSuccessCount = 987654321
+        } ) );
+    }
+
     /// <summary>
     /// Verifies that database initialization seeds the Aspire dashboard-access role.
     /// </summary>
@@ -252,6 +311,7 @@ public class DashboardAuthorizationTests : IDisposable {
 
                 // Register this factory as a singleton so the handler can access it
                 _ = services.AddSingleton( this );
+                _ = services.AddSingleton<IStatisticsService, BridgeBeats.Web.Services.RedisStatisticsReader>( );
             } );
         }
 

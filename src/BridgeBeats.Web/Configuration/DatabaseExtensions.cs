@@ -50,5 +50,8 @@ public static class DatabaseExtensions {
         if (!await roleManager.RoleExistsAsync( Roles.AspireDashboardAccess )) {
             _ = await roleManager.CreateAsync( new IdentityRole( Roles.AspireDashboardAccess ) );
         }
+        if (!await roleManager.RoleExistsAsync( Roles.PdsRecordAdministrator )) {
+            _ = await roleManager.CreateAsync( new IdentityRole( Roles.PdsRecordAdministrator ) );
+        }
     }
 }

@@ -97,7 +97,7 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BridgeBeats.Worker.JetStrea
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BridgeBeats.Worker.SagaCoordinator", "src\BridgeBeats.Worker.SagaCoordinator\BridgeBeats.Worker.SagaCoordinator.csproj", "{F9743309-01B3-4D24-82F0-599CDE492243}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BridgeBeats.Worker.CacheBootstrap", "src\BridgeBeats.Worker.CacheBootstrap\BridgeBeats.Worker.CacheBootstrap.csproj", "{6922F61C-9055-4EEA-BD92-7D32E42E600E}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BridgeBeats.Worker.Maintenance", "src\BridgeBeats.Worker.Maintenance\BridgeBeats.Worker.Maintenance.csproj", "{6922F61C-9055-4EEA-BD92-7D32E42E600E}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BridgeBeats.Worker.Discord", "src\BridgeBeats.Worker.Discord\BridgeBeats.Worker.Discord.csproj", "{0972313F-D858-4DD3-8A3A-5BE46E78E917}"
 EndProject

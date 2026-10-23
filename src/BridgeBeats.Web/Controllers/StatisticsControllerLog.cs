@@ -33,4 +33,13 @@ public partial class StatisticsController {
         Level = LogLevel.Error,
         Message = "Error refreshing statistics" )]
     private partial void LogRefreshError( Exception ex );
+
+    /// <summary>
+    /// Logs that a manual refresh request was suppressed by the per-admin throttle.
+    /// </summary>
+    [LoggerMessage(
+        EventId = Logging.LogEventIds.Controllers.StatisticsControllerRefreshThrottled,
+        Level = LogLevel.Information,
+        Message = "Statistics refresh request suppressed by per-admin throttle" )]
+    private partial void LogRefreshThrottled( );
 }

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Core.Infrastructure.Queue;
@@ -12,7 +13,27 @@ namespace BridgeBeats.Tests.Unit;
 /// with an in-process <see cref="System.Diagnostics.Metrics.MeterListener"/>.
 /// </summary>
 [TestClass]
+[DoNotParallelize]
 public class QueueMetricsTests {
+
+    /// <summary>Queue ActivitySource spans retain the required provider and priority tags.</summary>
+    [TestMethod]
+    public void ActivitySource_EmitsQueueSpanWithProviderAndPriorityTags( ) {
+        Activity? observed = null;
+        using ActivityListener listener = new( ) {
+            ShouldListenTo = source => source.Name == QueueMetrics.MeterName,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+            ActivityStarted = activity => observed = activity
+        };
+        ActivitySource.AddActivityListener( listener );
+        using (Activity? activity = QueueMetrics.ActivitySource.StartActivity( "queue.message.wall" )) {
+            _ = (activity?.SetTag( QueueMetricTags.Provider, "spotify" ));
+            _ = (activity?.SetTag( QueueMetricTags.Priority, "bulk" ));
+        }
+        Assert.IsNotNull( observed );
+        Assert.AreEqual( "spotify", observed!.GetTagItem( QueueMetricTags.Provider ) );
+        Assert.AreEqual( "bulk", observed.GetTagItem( QueueMetricTags.Priority ) );
+    }
 
     #region Meter Tests
 
@@ -65,18 +86,30 @@ public class QueueMetricsTests {
         Assert.AreEqual( "bridgebeats.queue.dequeued.total", QueueMetrics.DequeuedTotal.Name );
     }
 
-    /// <summary>The acknowledged-total counter is registered (non-null).</summary>
+    /// <summary>The delivery-removed counter is registered (non-null).</summary>
     [TestMethod]
-    public void AcknowledgedTotal_IsNotNull( ) {
+    public void DeliveryRemovedTotal_IsNotNull( ) {
         // Assert
-        Assert.IsNotNull( QueueMetrics.AcknowledgedTotal );
+        Assert.IsNotNull( QueueMetrics.DeliveryRemovedTotal );
     }
 
-    /// <summary>The acknowledged-total counter is named <c>bridgebeats.queue.acknowledged.total</c>.</summary>
+    /// <summary>The delivery-removed counter has its semantic name.</summary>
     [TestMethod]
-    public void AcknowledgedTotal_HasCorrectName( ) {
+    public void DeliveryRemovedTotal_HasCorrectName( ) {
         // Assert
-        Assert.AreEqual( "bridgebeats.queue.acknowledged.total", QueueMetrics.AcknowledgedTotal.Name );
+        Assert.AreEqual( "bridgebeats.queue.delivery.removed.total", QueueMetrics.DeliveryRemovedTotal.Name );
+        Assert.AreEqual( "bridgebeats.queue.dlq.total", QueueMetrics.DlqTotal.Name );
+    }
+
+    /// <summary>The rollout counters and timing instruments expose stable semantic names.</summary>
+    [TestMethod]
+    public void OperationalHealthInstruments_HaveExpectedNames( ) {
+        Assert.AreEqual( "bridgebeats.queue.terminal.total", QueueMetrics.TerminalOutcomeTotal.Name );
+        Assert.AreEqual( "bridgebeats.queue.saga.lifecycle.total", QueueMetrics.SagaLifecycleTotal.Name );
+        Assert.AreEqual( "bridgebeats.queue.refresh.outcome.total", QueueMetrics.MaintenanceOutcomeTotal.Name );
+        Assert.AreEqual( "bridgebeats.queue.refresh.leg.enqueued.total", QueueMetrics.RefreshLegEnqueuedTotal.Name );
+        Assert.AreEqual( "bridgebeats.queue.sojourn.duration", QueueMetrics.QueueSojournDuration.Name );
+        Assert.AreEqual( "bridgebeats.queue.ratelimit.discovery.duration", QueueMetrics.RateLimitDiscoveryDuration.Name );
     }
 
     /// <summary>The requeued-total counter is registered (non-null).</summary>
@@ -182,6 +215,13 @@ public class QueueMetricsTests {
 
         // Assert - No exception thrown means success
         Assert.IsNotNull( QueueMetrics.EnqueuedTotal );
+    }
+
+    /// <summary>Enqueue origins are exposed as a bounded telemetry dimension.</summary>
+    [TestMethod]
+    public void EnqueueOrigin_UsesTypedContract( ) {
+        QueueMetrics.RecordEnqueue( SupportedProviders.Spotify, QueuePriority.Bulk, QueueEnqueueOrigin.RefreshSweep );
+        Assert.AreEqual( "bridgebeats.queue.enqueued.total", QueueMetrics.EnqueuedTotal.Name );
     }
 
     /// <summary>The dequeued-total counter accepts an <c>Add</c> with provider and priority tags.</summary>
@@ -359,10 +399,10 @@ public class QueueMetricsTests {
         Assert.AreEqual( "{requests}", QueueMetrics.DequeuedTotal.Unit );
     }
 
-    /// <summary>The acknowledged-total counter uses the <c>{requests}</c> unit.</summary>
+    /// <summary>The delivery-removed counter uses the <c>{requests}</c> unit.</summary>
     [TestMethod]
-    public void AcknowledgedTotal_HasCorrectUnit( ) {
-        Assert.AreEqual( "{requests}", QueueMetrics.AcknowledgedTotal.Unit );
+    public void DeliveryRemovedTotal_HasCorrectUnit( ) {
+        Assert.AreEqual( "{requests}", QueueMetrics.DeliveryRemovedTotal.Unit );
     }
 
     /// <summary>The requeued-total counter uses the <c>{requests}</c> unit.</summary>
@@ -468,18 +508,19 @@ public class QueueMetricsTests {
     }
 
     /// <summary>
-    /// <c>RecordAcknowledge</c> adds 1 to the acknowledged-total counter, tagging with the
-    /// lower-cased provider (<c>tidal</c>).
+    /// <c>RecordDeliveryRemoved</c> adds 1 to the delivery-removed counter, tagging with the
+    /// lower-cased provider and source priority.
     /// </summary>
     [TestMethod]
-    public void RecordAcknowledge_RecordsWithLowercaseProvider( ) {
+    public void RecordDeliveryRemoved_RecordsProviderAndPriority( ) {
         // Arrange
         long recordedValue = 0;
         string? recordedProvider = null;
+        string? recordedPriority = null;
 
         using MeterListener listener = new( );
         listener.InstrumentPublished = ( instrument, meterListener ) => {
-            if (instrument.Meter.Name == QueueMetrics.MeterName && instrument.Name == "bridgebeats.queue.acknowledged.total") {
+            if (instrument.Meter.Name == QueueMetrics.MeterName && instrument.Name == "bridgebeats.queue.delivery.removed.total") {
                 meterListener.EnableMeasurementEvents( instrument );
             }
         };
@@ -489,6 +530,8 @@ public class QueueMetricsTests {
             foreach (KeyValuePair<string, object?> tag in tags) {
                 if (tag.Key == QueueMetricTags.Provider) {
                     recordedProvider = tag.Value?.ToString( );
+                } else if (tag.Key == QueueMetricTags.Priority) {
+                    recordedPriority = tag.Value?.ToString( );
                 }
             }
         } );
@@ -496,11 +539,12 @@ public class QueueMetricsTests {
         listener.Start( );
 
         // Act
-        QueueMetrics.RecordAcknowledge( SupportedProviders.Tidal );
+        QueueMetrics.RecordDeliveryRemoved( SupportedProviders.Tidal, QueuePriority.Background );
 
         // Assert
         Assert.AreEqual( 1, recordedValue );
         Assert.AreEqual( "tidal", recordedProvider );
+        Assert.AreEqual( "background", recordedPriority );
     }
 
     /// <summary>
@@ -666,7 +710,8 @@ public class QueueMetricsTests {
             SupportedProviders.Tidal,
             LookupRequestType.IsrcLookup,
             "success",
-            3.75
+            3.75,
+            QueuePriority.Background
         );
 
         // Assert
@@ -677,13 +722,11 @@ public class QueueMetricsTests {
     }
 
     /// <summary>
-    /// <c>RecordInteractiveDeferral</c> adds 1 to the interactive-deferred counter
-    /// (<c>bridgebeats.ratelimit.interactive_deferred.total</c>), tagging with the lower-cased
-    /// provider (<c>spotify</c>) and the endpoint (<c>tracks</c>). This counter tracks
-    /// interactive-origin requests pushed to the background lane after a rate limit.
+    /// <c>RecordInteractiveRetry</c> adds 1 to the interactive retry counter, tagging with the
+    /// lower-cased provider and endpoint.
     /// </summary>
     [TestMethod]
-    public void RecordInteractiveDeferral_RecordsWithLowercaseProviderAndEndpoint( ) {
+    public void RecordInteractiveRetry_RecordsWithLowercaseProviderAndEndpoint( ) {
         // Arrange
         long recordedValue = 0;
         string? recordedProvider = null;
@@ -691,7 +734,7 @@ public class QueueMetricsTests {
 
         using MeterListener listener = new( );
         listener.InstrumentPublished = ( instrument, meterListener ) => {
-            if (instrument.Meter.Name == QueueMetrics.MeterName && instrument.Name == "bridgebeats.ratelimit.interactive_deferred.total") {
+            if (instrument.Meter.Name == QueueMetrics.MeterName && instrument.Name == "bridgebeats.ratelimit.interactive_retry.total") {
                 meterListener.EnableMeasurementEvents( instrument );
             }
         };
@@ -710,12 +753,33 @@ public class QueueMetricsTests {
         listener.Start( );
 
         // Act
-        QueueMetrics.RecordInteractiveDeferral( SupportedProviders.Spotify, "tracks" );
+        QueueMetrics.RecordInteractiveRetry( SupportedProviders.Spotify, "tracks" );
 
         // Assert
         Assert.AreEqual( 1, recordedValue );
         Assert.AreEqual( "spotify", recordedProvider );
         Assert.AreEqual( "tracks", recordedEndpoint );
+    }
+
+    /// <summary>Verifies enqueue emits exactly one measurement with all bounded tags.</summary>
+    [TestMethod]
+    public void RecordEnqueue_EmitsOriginProviderPriorityExactlyOnce( ) {
+        long count = 0;
+        Dictionary<string, string?> tagsSeen = [];
+        using MeterListener listener = new( );
+        listener.InstrumentPublished = ( instrument, ml ) => {
+            if (instrument.Name == "bridgebeats.queue.enqueued.total") ml.EnableMeasurementEvents( instrument );
+        };
+        listener.SetMeasurementEventCallback<long>( ( _, value, tags, _ ) => {
+            count += value;
+            foreach (KeyValuePair<string, object?> tag in tags) tagsSeen[tag.Key] = tag.Value?.ToString( );
+        } );
+        listener.Start( );
+        QueueMetrics.RecordEnqueue( SupportedProviders.AppleMusic, QueuePriority.Bulk, QueueEnqueueOrigin.RefreshSweep );
+        Assert.AreEqual( 1, count );
+        Assert.AreEqual( "applemusic", tagsSeen[QueueMetricTags.Provider] );
+        Assert.AreEqual( "bulk", tagsSeen[QueueMetricTags.Priority] );
+        Assert.AreEqual( "refresh_sweep", tagsSeen[QueueMetricTags.Origin] );
     }
 
     #endregion

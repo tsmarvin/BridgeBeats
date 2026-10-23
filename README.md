@@ -8,11 +8,11 @@
 
 **Music is universal. Your links should be too.**
 
-BridgeBeats is a cross-platform music link converter that helps you share music effortlessly across streaming platforms. Share a link from Apple Music, Spotify, or Tidal, and BridgeBeats finds the same track or album on all supported services—ensuring every listener can enjoy the music, regardless of their preferred platform.
+BridgeBeats is a cross-platform music link converter that helps you share music effortlessly across streaming platforms. Share a link from Apple Music, Spotify, or Tidal, and BridgeBeats finds the same track or album on all supported services-ensuring every listener can enjoy the music, regardless of their preferred platform.
 
 ## ✨ Share once. Play anywhere.
 
-Ever wanted to share your favorite song, only to realize your friend uses a different streaming service? BridgeBeats solves this by automatically finding the same track or album on all major platforms—so everyone can listen, no matter where they stream.
+Ever wanted to share your favorite song, only to realize your friend uses a different streaming service? BridgeBeats solves this by automatically finding the same track or album on all major platforms-so everyone can listen, no matter where they stream.
 
 ## 🎵 Features
 
@@ -21,16 +21,14 @@ Ever wanted to share your favorite song, only to realize your friend uses a diff
 - **Web Interface** - Simple browser-based tool for quick conversions
 - **RESTful API** - Integrate music link conversion into your own apps
 - **Accurate Matching** - Uses ISRC (tracks) and UPC (albums) for precise cross-platform matches
-- **Rich Previews** - OpenGraph cards that work everywhere—Discord, Slack, Twitter, and more
+- **Rich Previews** - OpenGraph cards that work everywhere-Discord, Slack, Twitter, and more
 - **Aspire Dashboard** - Built-in observability and telemetry dashboard (role-based access)
 
 ## 🚀 Quick Start
 
-### Using the one-line installer (recommended)
+### Using the one-line installer
 
-The installer downloads the Compose files, creates `.env` and the `secrets/`
-directory, and generates the secrets that must be auto-generated (including the
-required `INTERNAL_SERVICE_KEY` and the ATProto OAuth signing key):
+The installer downloads the Compose files, creates `.env` and the `secrets/` directory, and generates the secrets that must be auto-generated (including the required `INTERNAL_SERVICE_KEY` and the ATProto OAuth signing key):
 
 ```bash
 # Linux / macOS
@@ -66,19 +64,11 @@ cp .env.example .env
 docker compose up -d
 ```
 
-`secrets/internal_service_key.txt` is required: it is the shared key the worker
-processes present to authenticate to the web API, and the container will not
-start without it. The installer generates it for you.
+`secrets/internal_service_key.txt` is required: it is the shared key the worker processes present to authenticate to the web API, and the container will not start without it. The installer generates it for you.
 
-`docker compose up -d` starts four containers: `bridgebeats` (the app, which
-also spawns the worker processes), `redis` (cache, request queue, and
-rate-limit tracking), `bridgebeats-pds` (a Bluesky Personal Data Server for
-ATProto caching), and `bridgebeats-caddy` (the reverse proxy that terminates
-HTTPS). Only Caddy publishes ports to the host (80 and 443); the app listens on
-port 10000 inside the internal Docker network and is reached through Caddy.
+`docker compose up -d` starts four containers: `bridgebeats` (the app, which also spawns the worker processes), `redis` (cache, request queue, and rate-limit tracking), `bridgebeats-pds` (a Bluesky Personal Data Server for ATProto caching), and `bridgebeats-caddy` (the reverse proxy that terminates HTTPS). Only Caddy publishes ports to the host (80 and 443); the app listens on port 10000 inside the internal Docker network and is reached through Caddy.
 
-Visit `https://localhost` to start converting links (accept the self-signed
-certificate warning for `localhost`).
+Visit `https://localhost` to start converting links (accept the self-signed certificate warning for `localhost`).
 
 📖 **[Complete Quick Start Guide →](docs/QUICKSTART.md)**
 
@@ -104,34 +94,31 @@ Then start the host from the repository root:
 aspire run
 ```
 
-This starts the app and the worker processes with the Aspire Dashboard for
-monitoring, tracing, and structured logging. If you prefer to run without the
-Aspire CLI, use `dotnet run --project src/BridgeBeats.AppHost`. See the
-[Local Development Guide](docs/LOCAL_DEVELOPMENT.md) for details.
+This starts the app and the worker processes with the Aspire Dashboard for monitoring, tracing, and structured logging. If you prefer to run without the Aspire CLI, use `dotnet run --project src/BridgeBeats.AppHost`. See the [Local Development Guide](docs/LOCAL_DEVELOPMENT.md) for details.
 
 ## 📁 Project Structure
 
 ```
 BridgeBeats/
 ├── src/
-│   ├── BridgeBeats.Web/                   # ASP.NET Core web app (MVC, controllers, views, API)
-│   ├── BridgeBeats.Core/                  # Domain logic and infrastructure (caching, identity, storage, queue)
-│   ├── BridgeBeats.Contracts/             # Shared DTOs, interfaces, enums, constants, records
-│   ├── BridgeBeats.AppHost/               # .NET Aspire orchestration
-│   ├── BridgeBeats.Worker.Spotify/        # Spotify lookup worker (incl. batch processor)
-│   ├── BridgeBeats.Worker.AppleMusic/     # Apple Music lookup worker
-│   ├── BridgeBeats.Worker.Tidal/          # Tidal lookup worker
-│   ├── BridgeBeats.Worker.Discord/        # Discord bot worker
+│   ├── BridgeBeats.Web/                     # ASP.NET Core web app (MVC, controllers, views, API)
+│   ├── BridgeBeats.Core/                    # Domain logic and infrastructure (caching, identity, storage, queue)
+│   ├── BridgeBeats.Contracts/               # Shared DTOs, interfaces, enums, constants, records
+│   ├── BridgeBeats.AppHost/                 # .NET Aspire orchestration
+│   ├── BridgeBeats.Worker.Spotify/          # Spotify lookup worker (incl. batch processor)
+│   ├── BridgeBeats.Worker.AppleMusic/       # Apple Music lookup worker
+│   ├── BridgeBeats.Worker.Tidal/            # Tidal lookup worker
+│   ├── BridgeBeats.Worker.Discord/          # Discord bot worker
 │   ├── BridgeBeats.Worker.JetStreamWatcher/ # AT Protocol firehose watcher
 │   ├── BridgeBeats.Worker.SagaCoordinator/  # Cross-provider lookup saga coordinator
-│   └── BridgeBeats.Worker.CacheBootstrap/   # Cache warm-up/refresh worker
-├── Tests/                                 # Single test project (BridgeBeats.Tests.csproj)
-│   ├── Unit/                              # Unit tests
-│   ├── Integration/                       # Integration tests (service interactions)
-│   └── EndToEnd/                          # End-to-end tests (full request/response flows)
-├── docs/                                  # Documentation (guides, API reference)
-├── containers/                            # Docker deployment configuration
-├── .github/                               # GitHub templates, workflows, and community files
+│   └── BridgeBeats.Worker.Maintenance/      # Cache warm-up/refresh/assorted maintenance worker
+├── Tests/                                   # Single test project (BridgeBeats.Tests.csproj)
+│   ├── Unit/                                # Unit tests
+│   ├── Integration/                         # Integration tests (service interactions)
+│   └── EndToEnd/                            # End-to-end tests (full request/response flows)
+├── docs/                                    # Documentation (guides, API reference)
+├── containers/                              # Docker deployment configuration
+├── .github/                                 # GitHub templates, workflows, and community files
 ```
 
 ## 📖 Documentation
@@ -212,8 +199,7 @@ curl -k -X POST https://localhost/music/lookup/urlList \
   -d '{"uri":"https://open.spotify.com/track/..."}'
 ```
 
-For the identifier and name-search endpoints (`isrc`, `upc`, `title`), register
-an account to get a one-time API key and send it in the `X-API-Key` header:
+For the identifier and name-search endpoints (`isrc`, `upc`, `title`), register an account to get a one-time API key and send it in the `X-API-Key` header:
 
 ```bash
 curl -k -X POST https://localhost/account/register \
@@ -262,4 +248,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-*Because music connects us—no matter where we listen.*
+*Because music connects us - no matter where we listen.*

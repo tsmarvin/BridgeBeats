@@ -19,7 +19,7 @@ using Microsoft.Extensions.Hosting;
 //   - saga-coordinator: orchestrator/finalizer; no HTTP endpoint. References redis; receives the
 //     ATProto credentials and the EnabledProviders CSV that drives secondary fan-out.
 //   - jetstream-watcher: ATProto firehose consumer; no HTTP endpoint. References redis.
-//   - cache-bootstrap: rebuilds the Redis lookup index from the PDS; no HTTP endpoint. References
+//   - maintenance: rebuilds the Redis lookup index from the PDS; no HTTP endpoint. References
 //     redis and the ATProto credentials/PDS URI.
 //   - bridgebeats (Web :10000, unproxied): public API and UI. References redis and every enabled
 //     provider worker so it can fan interactive lookups out over the WorkerApi.
@@ -101,9 +101,11 @@ IResourceBuilder<ParameterResource> resilienceAttemptTimeoutSeconds = builder.Ad
 
 // Stale-cache refresh parameters — optional; fall back to the worker's code defaults when unset.
 IResourceBuilder<ParameterResource> refreshIntervalHours = builder.AddParameter( "RefreshIntervalHours",
-    () => config["Parameters:RefreshIntervalHours"] ?? "24" );
+    () => config["Parameters:RefreshIntervalHours"] ?? "6" );
 IResourceBuilder<ParameterResource> maxRecordsPerRun = builder.AddParameter( "MaxRecordsPerRun",
-    () => config["Parameters:MaxRecordsPerRun"] ?? "100" );
+    () => config["Parameters:MaxRecordsPerRun"] ?? "500" );
+IResourceBuilder<ParameterResource> refreshRetryMinutes = builder.AddParameter( "RefreshRetryMinutes",
+    () => config["Parameters:RefreshRetryMinutes"] ?? "5" );
 
 // Redis is added as a connection-string resource only: Aspire does NOT provision it here. An external
 // Redis must already exist and ConnectionStrings:redis must be set. Every component references this
@@ -118,7 +120,7 @@ if (string.IsNullOrWhiteSpace( config["ConnectionStrings:redis"] )) {
 }
 
 // Credential-presence checks. A provider/Discord worker is only added to the topology when its
-// credentials are configured; SagaCoordinator, JetStreamWatcher, CacheBootstrap, and Web are always
+// credentials are configured; SagaCoordinator, JetStreamWatcher, Maintenance, and Web are always
 // added. These gates drive both the conditional resource registration and the EnabledProviders CSV.
 // Configuration merges environment variables, appsettings, user secrets, and command line args.
 bool HasSpotifyCredentials( ) =>
@@ -149,7 +151,8 @@ IResourceBuilder<ExecutableResource> AddProductionExecutable(
 ) {
     string dllPath = $"/src/{projectName}/{projectName}.dll";
     IResourceBuilder<ExecutableResource> resource = builder.AddExecutable( name, "dotnet", workingDirectory, dllPath )
-        .WithReference(redis);
+        .WithReference(redis)
+        .WithOtlpExporter( );
 
     if (httpPort.HasValue) {
         resource = resource.WithHttpEndpoint( targetPort: httpPort.Value, name: "http" );
@@ -336,7 +339,7 @@ if (isProduction) {
 // Cache Bootstrap Worker. Bootstraps Redis cache from ATProto public records on startup and
 // periodically (default: every 6 hours). Uses unauthenticated access for public records.
 if (isProduction) {
-    _ = AddProductionExecutable( "cache-bootstrap", "BridgeBeats.Worker.CacheBootstrap" )
+    _ = AddProductionExecutable( "maintenance", "BridgeBeats.Worker.Maintenance" )
         .WithEnvironment( "BridgeBeats__LogDirPath", logDirPath )
         .WithEnvironment( "BridgeBeats__ATProtoIdentifier", atProtoIdentifier )
         .WithEnvironment( "BridgeBeats__ATProtoPassword", atProtoPassword )
@@ -346,9 +349,10 @@ if (isProduction) {
         .WithEnvironment( "BridgeBeats__DataProtectionKeyPath", dataProtectionKeyPath )
         .WithEnvironment( "BridgeBeats__EnabledProviders", enabledProvidersValue )
         .WithEnvironment( "BridgeBeats__RefreshIntervalHours", refreshIntervalHours )
-        .WithEnvironment( "BridgeBeats__MaxRecordsPerRun", maxRecordsPerRun );
+        .WithEnvironment( "BridgeBeats__MaxRecordsPerRun", maxRecordsPerRun )
+        .WithEnvironment( "BridgeBeats__RefreshRetryMinutes", refreshRetryMinutes );
 } else {
-    _ = builder.AddProject<Projects.BridgeBeats_Worker_CacheBootstrap>( "cache-bootstrap" )
+    _ = builder.AddProject<Projects.BridgeBeats_Worker_Maintenance>( "maintenance" )
         .WithReference( redis )
         .WithEnvironment( "BridgeBeats__LogDirPath", logDirPath )
         .WithEnvironment( "BridgeBeats__ATProtoIdentifier", atProtoIdentifier )
@@ -359,7 +363,8 @@ if (isProduction) {
         .WithEnvironment( "BridgeBeats__DataProtectionKeyPath", dataProtectionKeyPath )
         .WithEnvironment( "BridgeBeats__EnabledProviders", enabledProvidersValue )
         .WithEnvironment( "BridgeBeats__RefreshIntervalHours", refreshIntervalHours )
-        .WithEnvironment( "BridgeBeats__MaxRecordsPerRun", maxRecordsPerRun );
+        .WithEnvironment( "BridgeBeats__MaxRecordsPerRun", maxRecordsPerRun )
+        .WithEnvironment( "BridgeBeats__RefreshRetryMinutes", refreshRetryMinutes );
 }
 
 // Main Web Application. In production, service discovery uses resource names for endpoint resolution.

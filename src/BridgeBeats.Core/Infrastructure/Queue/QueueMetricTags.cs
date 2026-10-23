@@ -51,4 +51,19 @@ public static class QueueMetricTags {
     /// Literal value: <c>"method"</c>.
     /// </summary>
     public const string Method = "method";
+
+    /// <summary>Tag key for enqueue origin.</summary>
+    public const string Origin = "origin";
+
+    /// <summary>Tag key for a Redis stream name.</summary>
+    public const string Stream = "stream";
+
+    /// <summary>Tag key for an operational outcome.</summary>
+    public const string Outcome = "outcome";
+
+    /// <summary>Tag key indicating whether maintenance selected a record again.</summary>
+    public const string Reselected = "reselected";
+
+    /// <summary>Tag key for the authoritative saga state observed after a leg completes.</summary>
+    public const string SagaState = "saga_state";
 }

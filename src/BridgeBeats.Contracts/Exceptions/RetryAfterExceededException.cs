@@ -12,29 +12,13 @@ namespace BridgeBeats.Contracts.Exceptions {
     /// resilience handler is configured not to retry this exception, so it propagates immediately
     /// rather than waiting out the rate limit.
     /// </remarks>
-    public class RetryAfterExceededException : Exception {
-
-        /// <summary>
-        /// The provider's requested <c>Retry-After</c> wait duration that triggered this exception.
-        /// </summary>
-        public TimeSpan RetryAfterValue { get; }
+    public class RetryAfterExceededException : ProviderRateLimitException {
 
         /// <summary>
         /// The maximum retry wait the caller is willing to tolerate. When
-        /// <see cref="RetryAfterValue"/> exceeds this, the exception is raised.
+        /// <see cref="ProviderRateLimitException.RetryAfterValue"/> exceeds this, the exception is raised.
         /// </summary>
         public TimeSpan Threshold { get; }
-
-        /// <summary>
-        /// The request URI that was rate-limited, if known; otherwise <see langword="null"/>.
-        /// </summary>
-        public Uri? RequestUri { get; }
-
-        /// <summary>
-        /// The provider that issued the rate limit, if known; otherwise <see langword="null"/>.
-        /// Typically inferred from the request URI host via <see cref="DetermineProviderFromUri"/>.
-        /// </summary>
-        public SupportedProviders? Provider { get; }
 
         /// <summary>
         /// Initializes a new instance with the rate-limit context, building a descriptive message.
@@ -48,11 +32,8 @@ namespace BridgeBeats.Contracts.Exceptions {
             TimeSpan threshold,
             Uri? requestUri,
             SupportedProviders? provider
-        ) : base( BuildMessage( retryAfterValue, threshold, requestUri, provider ) ) {
-            RetryAfterValue = retryAfterValue;
-            Threshold = threshold;
-            RequestUri = requestUri;
-            Provider = provider;
+        ) : base( BuildExceededMessage( retryAfterValue, threshold, requestUri, provider ), retryAfterValue, requestUri, provider ) {
+            Threshold = ValidateThreshold( threshold );
         }
 
         /// <summary>
@@ -70,24 +51,20 @@ namespace BridgeBeats.Contracts.Exceptions {
             Uri? requestUri,
             SupportedProviders? provider,
             Exception innerException
-        ) : base( BuildMessage( retryAfterValue, threshold, requestUri, provider ), innerException ) {
-            RetryAfterValue = retryAfterValue;
-            Threshold = threshold;
-            RequestUri = requestUri;
-            Provider = provider;
+        ) : base( BuildExceededMessage( retryAfterValue, threshold, requestUri, provider ), retryAfterValue, requestUri, provider, innerException ) {
+            Threshold = ValidateThreshold( threshold );
         }
 
-        private static string BuildMessage(
-            TimeSpan retryAfterValue,
-            TimeSpan threshold,
-            Uri? requestUri,
-            SupportedProviders? provider
-        ) {
-            string providerName = provider?.ToString( ) ?? "Unknown";
-            string uri = requestUri?.ToString( ) ?? "Unknown";
-            return $"Rate limit exceeded for {providerName}. Retry-After of {retryAfterValue.TotalSeconds:F0} seconds " +
-                   $"exceeds maximum threshold of {threshold.TotalSeconds:F0} seconds. Request URI: {uri}";
+        private static TimeSpan ValidateThreshold( TimeSpan threshold ) {
+            if (threshold < TimeSpan.Zero) {
+                throw new ArgumentOutOfRangeException( nameof( threshold ), "Retry threshold must be nonnegative." );
+            }
+            return threshold;
         }
+
+        private static string BuildExceededMessage( TimeSpan retryAfterValue, TimeSpan threshold, Uri? requestUri, SupportedProviders? provider )
+            => $"Rate limit exceeded for {provider?.ToString( ) ?? "Unknown"}; retry after {retryAfterValue.TotalSeconds:F0} seconds exceeds threshold {threshold.TotalSeconds:F0}. " +
+               $"Request URI: {requestUri?.ToString( ) ?? "Unknown"}";
 
         /// <summary>
         /// Infers the <see cref="SupportedProviders"/> from a request URI by matching a substring of

@@ -44,4 +44,36 @@ public static class LookupKeyBuilder {
     public static string UrlKey( string url ) {
         return $"{LookupRequestType.UriLookup}:{HashUtility.HashUrl( url )}";
     }
+
+    /// <summary>
+    /// Builds the cache and saga lookup key for an ISRC lookup. The ISRC is trimmed and
+    /// upper-cased — byte-identical to the orchestrator's inline normalization.
+    /// </summary>
+    /// <param name="isrc">The raw ISRC value.</param>
+    /// <returns>A key of the form <c>IsrcLookup:{ISRC}</c>.</returns>
+    public static string IsrcKey( string isrc ) {
+        return $"{LookupRequestType.IsrcLookup}:{isrc.Trim( ).ToUpperInvariant( )}";
+    }
+
+    /// <summary>
+    /// Builds the cache and saga lookup key for a UPC lookup. The UPC is trimmed only (no
+    /// upper-casing) — byte-identical to the orchestrator's inline normalization.
+    /// </summary>
+    /// <param name="upc">The raw UPC value.</param>
+    /// <returns>A key of the form <c>UpcLookup:{UPC}</c>.</returns>
+    public static string UpcKey( string upc ) {
+        return $"{LookupRequestType.UpcLookup}:{upc.Trim( )}";
+    }
+
+    /// <summary>
+    /// Builds the cache and saga lookup key for a metadata (title/artist) lookup. Both title
+    /// and artist are trimmed and upper-cased — byte-identical to the orchestrator's inline
+    /// normalization.
+    /// </summary>
+    /// <param name="title">The raw track or album title.</param>
+    /// <param name="artist">The raw artist name.</param>
+    /// <returns>A key of the form <c>SongLookup:{TITLE}:{ARTIST}</c>.</returns>
+    public static string MetadataKey( string title, string artist ) {
+        return $"{LookupRequestType.SongLookup}:{title.Trim( ).ToUpperInvariant( )}:{artist.Trim( ).ToUpperInvariant( )}";
+    }
 }

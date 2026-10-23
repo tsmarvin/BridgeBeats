@@ -426,5 +426,23 @@ public class ProviderUrlParserTests {
         Assert.IsNull( id );
     }
 
+    /// <summary>Storefront extraction accepts only Apple Music country path segments.</summary>
+    [TestMethod]
+    [DataRow( SupportedProviders.AppleMusic, "https://music.apple.com/JP/album/example/123", "jp" )]
+    [DataRow( SupportedProviders.AppleMusic, "https://music.apple.com/us/song/example/123", "us" )]
+    [DataRow( SupportedProviders.AppleMusic, "https://example.com/us/album/example/123", null )]
+    [DataRow( SupportedProviders.Spotify, "https://music.apple.com/us/album/example/123", null )]
+    [DataRow( SupportedProviders.Tidal, "https://tidal.com/browse/track/123", null )]
+    [DataRow( SupportedProviders.AppleMusic, "not-a-url", null )]
+    public void ExtractStorefront_ProviderAndUrlShape_ReturnsExpected(
+        SupportedProviders provider,
+        string url,
+        string? expected
+    ) {
+        string? storefront = ProviderUrlParser.ExtractStorefront( provider, url );
+
+        Assert.AreEqual( expected, storefront );
+    }
+
     #endregion
 }

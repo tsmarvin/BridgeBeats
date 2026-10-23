@@ -23,6 +23,9 @@ This separation lets the Discord bot scale independently of the web application 
 
 The bot will now appear in your server and is ready to convert music links.
 
+See [Discord Bot Server Settings](DISCORD_SETTINGS.md) to configure which channels the bot can use
+and whether it removes link-only messages.
+
 ## How It Works
 
 ### Sharing music links
@@ -38,6 +41,12 @@ When you or anyone in your server shares a music link from **Spotify**, **Apple 
 
 The bot recognizes links on the `open.spotify.com`, `music.apple.com`, `tidal.com`, and `listen.tidal.com` hosts.
 
+For a link-only message, BridgeBeats posts the conversion and removes the original message:
+
+![BridgeBeats response for All I Want by Bob Moses](images/Discord/SharedTrack-1.png)
+
+![BridgeBeats response for Send Me On My Way by Rusted Root](images/Discord/SharedTrack-2.png)
+
 ### Message cleanup
 
 To keep your channels clean, BridgeBeats automatically **deletes link-only messages** after posting the conversion embed. For example:
@@ -51,6 +60,11 @@ The key rule: if your message is only music links (and whitespace), it gets dele
 
 If you want to keep a link around, just add a comment or emoji with it.
 
+In this example, the user's comment remains visible while BridgeBeats posts the converted links
+below it:
+
+![A music link shared with extra text remains above the BridgeBeats response](images/Discord/SharedTrack-Extra-Text.png)
+
 ## Channel Permissions
 
 ### Required bot permissions
@@ -59,12 +73,14 @@ For the bot to work properly, it needs these permissions in your channels:
 
 | Permission | Purpose |
 |-----------|---------|
-| **Read Messages** | Ensure that the bot is in the channel |
+| **View Channel** | Detect supported music links in the channel |
 | **Send Messages** | Post conversion embeds |
 | **Embed Links** | Display music previews with rich formatting |
 | **Manage Messages** | Delete link-only messages to prevent multiple embeds for the same content |
 
 **Note:** If the bot lacks the **Manage Messages** permission, it will still convert links and post embeds, but won't be able to delete the original link-only messages.
+
+For illustrated setup instructions, see [Discord Bot Server Settings](DISCORD_SETTINGS.md).
 
 ### Restricting the bot to specific channels
 
@@ -81,7 +97,7 @@ If you want to limit where BridgeBeats operates in your server:
 ### Bot not responding
 
 1. **Check if the bot is online**: Look at the server member list. You should see the BridgeBeats bot with a green online indicator.
-2. **Verify permissions**: Make sure the bot is in the channel and has **Send Messages** and **Embed Links** permissions.
+2. **Verify permissions**: Make sure the bot has **View Channel**, **Send Messages**, and **Embed Links** permissions.
 3. **Validate the link**: Ensure you're sharing a valid link from Spotify, Apple Music, or Tidal (not a screenshot or description).
 4. **Try directly on the BridgeBeats website**: Validate the link on [BridgeBeats](https://bridgebeats.link) to see if it can find matches.
 
@@ -113,7 +129,10 @@ A: No, it only works in server channels.
 A: Yes. Add a comment, reaction, or any text with your link and it won't be deleted.
 
 **Q: What if the bot is broken or not responding?**
-A: First, check that the bot is online in your server member list and has the required permissions. If it's still not working, contact your server admin or submit an issue on [GitHub](https://github.com/tsmarvin/BridgeBeats/issues).
+A: First, check that the bot is online in your server member list and has the required permissions.
+If it is still not working, ask for help in the
+[BridgeBeats support server](https://discord.gg/T98sGP2nX8) or submit an issue on
+[GitHub](https://github.com/tsmarvin/BridgeBeats/issues).
 
 **Q: Who can see the bot's messages?**
 A: Everyone in the channel can see the conversion embeds posted by the bot. The embeds display music service URLs (Spotify, Apple Music, Tidal links) and album artwork so anyone in the channel can access the music from their preferred platform. Your original message is visible to everyone until deleted (which only happens for link-only messages).
@@ -123,4 +142,5 @@ A: The bot sees the content of all messages in channels where it has access, inc
 
 ---
 
-For more information or to report issues, visit the [BridgeBeats GitHub](https://github.com/tsmarvin/BridgeBeats).
+For help, join the [BridgeBeats support server](https://discord.gg/T98sGP2nX8). To report an issue,
+visit the [BridgeBeats GitHub](https://github.com/tsmarvin/BridgeBeats).

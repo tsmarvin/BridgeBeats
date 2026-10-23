@@ -22,10 +22,11 @@ public sealed record LookupResult {
 
     /// <summary>
     /// <see langword="true"/> when this result is partial, meaning not every provider has
-    /// responded yet and a more complete result may follow.
+    /// responded yet and a more complete result may follow. Derived from <see cref="SagaId"/>:
+    /// a result is partial if and only if it has a non-empty saga identifier.
     /// </summary>
     [JsonPropertyName( "isPartial" )]
-    public bool IsPartial { get; init; }
+    public bool IsPartial => !string.IsNullOrEmpty( SagaId );
 
     /// <summary>The identifier of the saga coordinating this lookup, when one is in play.</summary>
     [JsonPropertyName( "sagaId" )]

@@ -6,13 +6,13 @@ using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
 using BridgeBeats.Core.Domain.Extensions;
-using BridgeBeats.Core.Domain.Services;
 using BridgeBeats.Core.Infrastructure.Cache;
 using BridgeBeats.Core.Infrastructure.Extensions;
 using BridgeBeats.Core.Infrastructure.Identity;
 using BridgeBeats.Core.Infrastructure.Storage;
 using BridgeBeats.Web.Authentication;
 using BridgeBeats.Web.Middleware;
+using BridgeBeats.Web.Services;
 using idunno.Security;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.StaticFiles;
@@ -54,6 +54,12 @@ namespace BridgeBeats.Web.Configuration {
             // Register Redis client via Aspire (provides IConnectionMultiplexer)
             // In tests, CustomWebApplicationFactory provides the connection string via Testcontainers
             builder.AddRedisClient( "redis" );
+
+            // The direct-mode Apple Music, Tidal, and Spotify lookup services require the track genre
+            // cache. It is registered unconditionally (not only in direct-provider mode) so that
+            // the ASP.NET Core Development-environment default for ValidateOnBuild can resolve those
+            // services' dependencies regardless of which provider mode is configured.
+            _ = builder.Services.AddGenreCache( );
 
             _ = builder.WebHost.ConfigureBridgeBeatsServices(
                 builder.Services,
@@ -108,6 +114,7 @@ namespace BridgeBeats.Web.Configuration {
 
             // Common singletons and caching
             _ = services.AddSingleton( new JsonSerializerOptions { WriteIndented = true } );
+            _ = services.AddSingleton( TimeProvider.System );
             _ = services.AddMemoryCache( );
 
             // Configure QueueSettings from configuration (with defaults)
@@ -220,10 +227,8 @@ namespace BridgeBeats.Web.Configuration {
             _ = app.Use( async ( ctx, next ) => {
                 string path = ctx.Request.Path.Value ?? string.Empty;
                 bool isEmbed =
-                    path.EndsWith( "/embed", StringComparison.OrdinalIgnoreCase )    ||
-                    path.EndsWith( "/embed/qr", StringComparison.OrdinalIgnoreCase ) ||
-                    path.StartsWith( "/card/", StringComparison.OrdinalIgnoreCase )  ||
-                    path.StartsWith( "/playlist/", StringComparison.OrdinalIgnoreCase )
+                    path.EndsWith( "/embed", StringComparison.OrdinalIgnoreCase ) ||
+                    path.EndsWith( "/embed/qr", StringComparison.OrdinalIgnoreCase )
                 ;
                 bool isAppleMusic = path.StartsWith( "/applemusic", StringComparison.OrdinalIgnoreCase );
 
@@ -640,23 +645,8 @@ namespace BridgeBeats.Web.Configuration {
                 settings.ATProtoUserDID
             ) );
 
-            // Register statistics service for the Statistics page
-            Uri pdsUri = new( settings.ATProtoPdsUri ?? "https://pds.bridgebeats.link" );
-            StatisticsSettings statsSettings = new(
-                pdsUri,
-                settings.ATProtoUserDID,
-                TimeSpan.FromHours(6), // Cache statistics for 6 hours
-                TimeSpan.FromSeconds(30)
-            );
-            _ = services.AddSingleton( statsSettings );
-            _ = services.AddSingleton<StatisticsService>( s => new StatisticsService(
-                s.GetRequiredService<IATProtoStorageService>( ),
-                s.GetRequiredService<IConnectionMultiplexer>( ),
-                statsSettings,
-                s.GetRequiredService<ILogger<StatisticsService>>( )
-            ) );
-            _ = services.AddSingleton<IStatisticsService>( s => s.GetRequiredService<StatisticsService>( ) );
-            _ = services.AddHostedService<StatisticsRefreshBackgroundService>( );
+            // Register statistics reader (reads status:statistics from Redis; worker computes)
+            _ = services.AddSingleton<IStatisticsService, RedisStatisticsReader>( );
 
             // Register queue infrastructure (deduplicator, rate limit tracker, saga manager)
             // and provider-specific queues for the LookupOrchestrator.
@@ -664,6 +654,7 @@ namespace BridgeBeats.Web.Configuration {
             // routing Spotify SongIdLookup/AlbumIdLookup to the type-specific bulk streams.
             _ = services.AddQueueInfrastructure( );
             _ = services.AddAllProviderQueues<QueuedLookupRequest>( );
+            _ = services.AddScoped<IRefreshReviewDispositionService, RefreshReviewDispositionService>( );
 
         }
 

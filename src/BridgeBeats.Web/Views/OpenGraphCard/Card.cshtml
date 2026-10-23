@@ -374,7 +374,7 @@
                             </button>
                         </li>
                         <li>
-                            <button class="dropdown-item copy-embed-btn" type="button" data-url="@Context.Request.Path" data-title="@Html.Raw(System.Text.Json.JsonSerializer.Serialize(title))">
+                            <button class="dropdown-item copy-embed-btn" type="button" data-url="@Context.Request.Path" data-title='@Html.Raw(System.Text.Json.JsonSerializer.Serialize(title, ViewSecurityHelpers.HtmlSafeJsonOptions))'>
                                 <span class="dropdown-icon">🖼️</span> Copy Embed
                             </button>
                         </li>
@@ -397,7 +397,7 @@
                         var providerName = provider.Key.GetDescription();
                         var providerUrl = provider.Value.URL;
 
-                        <a href="@providerUrl" class="provider-link" target="_blank" rel="noopener noreferrer">
+                        <a href="@(ViewSecurityHelpers.IsHttpOrHttps(providerUrl) ? providerUrl : "#")" class="provider-link" target="_blank" rel="noopener noreferrer">
                             <span class="provider-icon">
                                 @provider.Key.GetProviderLogo( )
                             </span>

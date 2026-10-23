@@ -54,14 +54,26 @@ namespace BridgeBeats.Providers.AppleMusic {
                 string? uri = s_appleLink.GetGroupValues(link, "URI").FirstOrDefault();
 
                 if (uri != null && (s_validAlbum.IsMatch( uri ) || s_validSong.IsMatch( uri ))) {
+                    string candidateStorefront = GetUriStoreFront( uri );
+                    if (!s_validStorefront.IsMatch( candidateStorefront )) {
+                        return false;
+                    }
+
                     string id = GetUriId(uri);
                     string albumSongId = GetSongId(uri);
 
-                    storefront = GetUriStoreFront( uri );
                     if (string.IsNullOrWhiteSpace( albumSongId )) {
+                        if (!s_validCatalogId.IsMatch( id )) {
+                            return false;
+                        }
+                        storefront = candidateStorefront;
                         requestUri = GetAlbumsURI( storefront, id );
                         isAlbum = true;
                     } else {
+                        if (!s_validCatalogId.IsMatch( albumSongId )) {
+                            return false;
+                        }
+                        storefront = candidateStorefront;
                         requestUri = GetSongsURI( storefront, albumSongId );
                     }
                     return true;
@@ -98,46 +110,79 @@ namespace BridgeBeats.Providers.AppleMusic {
         /// <param name="storefront">The storefront (country) segment.</param>
         /// <param name="artist">The artist name; URL-escaped into the query.</param>
         /// <returns>The relative search API path filtered to artist results.</returns>
-        public static string GetArtistSearchUri( string storefront, string artist )
-            => ArtistsSearchURI
-                .Replace( "{storefront}", storefront )
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="storefront"/> is not a 2–3-letter alphabetic code.
+        /// </exception>
+        public static string GetArtistSearchUri( string storefront, string artist ) {
+            ValidateStorefront( storefront );
+            return ArtistsSearchURI
+                .Replace( "{storefront}", Uri.EscapeDataString( storefront ) )
                 .Replace( "{artist}", Uri.EscapeDataString( artist ) );
+        }
 
         /// <summary>Builds the Apple Music API path that finds songs by ISRC.</summary>
         /// <param name="storefront">The storefront (country) segment.</param>
         /// <param name="isrc">The International Standard Recording Code to filter on.</param>
         /// <returns>The relative API path filtered by ISRC.</returns>
-        public static string GetSongsIsrcURI( string storefront, string isrc )
-            => SongsIsrcURI
-                .Replace( "{storefront}", storefront )
-                .Replace( "{isrc}", isrc );
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="storefront"/> is not a 2–3-letter alphabetic code, or when
+        /// <paramref name="isrc"/> contains characters outside the expected alphanumeric set.
+        /// </exception>
+        public static string GetSongsIsrcURI( string storefront, string isrc ) {
+            ValidateStorefront( storefront );
+            ValidateIsrc( isrc );
+            return SongsIsrcURI
+                .Replace( "{storefront}", Uri.EscapeDataString( storefront ) )
+                .Replace( "{isrc}", Uri.EscapeDataString( isrc ) );
+        }
 
         /// <summary>Builds the Apple Music API path that finds albums by UPC.</summary>
         /// <param name="storefront">The storefront (country) segment.</param>
         /// <param name="upc">The Universal Product Code to filter on.</param>
         /// <returns>The relative API path filtered by UPC.</returns>
-        public static string GetAlbumUpcURI( string storefront, string upc )
-            => AlbumsUpcURI
-                .Replace( "{storefront}", storefront )
-                .Replace( "{upc}", upc );
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="storefront"/> is not a 2–3-letter alphabetic code, or when
+        /// <paramref name="upc"/> contains characters outside the expected numeric set.
+        /// </exception>
+        public static string GetAlbumUpcURI( string storefront, string upc ) {
+            ValidateStorefront( storefront );
+            ValidateUpc( upc );
+            return AlbumsUpcURI
+                .Replace( "{storefront}", Uri.EscapeDataString( storefront ) )
+                .Replace( "{upc}", Uri.EscapeDataString( upc ) );
+        }
 
         /// <summary>Builds the Apple Music API path that lists an artist's albums.</summary>
         /// <param name="storefront">The storefront (country) segment.</param>
         /// <param name="artistId">The Apple Music artist identifier.</param>
         /// <returns>The relative API path for the artist's albums.</returns>
-        public static string GetArtistAlbumsURI( string storefront, string artistId )
-            => ArtistAlbumsURI
-                .Replace( "{storefront}", storefront )
-                .Replace( "{artist}", artistId );
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="storefront"/> is not a 2–3-letter alphabetic code, or when
+        /// <paramref name="artistId"/> is not a numeric catalog identifier.
+        /// </exception>
+        public static string GetArtistAlbumsURI( string storefront, string artistId ) {
+            ValidateStorefront( storefront );
+            ValidateCatalogId( artistId );
+            return ArtistAlbumsURI
+                .Replace( "{storefront}", Uri.EscapeDataString( storefront ) )
+                .Replace( "{artist}", Uri.EscapeDataString( artistId ) );
+        }
 
         /// <summary>Builds the Apple Music API path that lists an artist's songs.</summary>
         /// <param name="storefront">The storefront (country) segment.</param>
         /// <param name="artistId">The Apple Music artist identifier.</param>
         /// <returns>The relative API path for the artist's songs.</returns>
-        public static string GetArtistSongsURI( string storefront, string artistId )
-            => ArtistSongsURI
-                .Replace( "{storefront}", storefront )
-                .Replace( "{artist}", artistId );
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="storefront"/> is not a 2–3-letter alphabetic code, or when
+        /// <paramref name="artistId"/> is not a numeric catalog identifier.
+        /// </exception>
+        public static string GetArtistSongsURI( string storefront, string artistId ) {
+            ValidateStorefront( storefront );
+            ValidateCatalogId( artistId );
+            return ArtistSongsURI
+                .Replace( "{storefront}", Uri.EscapeDataString( storefront ) )
+                .Replace( "{artist}", Uri.EscapeDataString( artistId ) );
+        }
 
         /// <summary>Template for the catalog album-by-id endpoint path.</summary>
         private const string AlbumsURI = "{storefront}/albums/{id}";
@@ -176,8 +221,17 @@ namespace BridgeBeats.Providers.AppleMusic {
         /// <param name="storefront">The storefront (country) segment.</param>
         /// <param name="id">The album identifier.</param>
         /// <returns>The relative API path for the album.</returns>
-        private static string GetAlbumsURI( string storefront, string id )
-            => AlbumsURI.Replace( "{storefront}", storefront ).Replace( "{id}", id );
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="storefront"/> is not a 2–3-letter alphabetic code, or when
+        /// <paramref name="id"/> is not a numeric catalog identifier.
+        /// </exception>
+        private static string GetAlbumsURI( string storefront, string id ) {
+            ValidateStorefront( storefront );
+            ValidateCatalogId( id );
+            return AlbumsURI
+                .Replace( "{storefront}", Uri.EscapeDataString( storefront ) )
+                .Replace( "{id}", Uri.EscapeDataString( id ) );
+        }
 
         /// <summary>
         /// Extracts the song identifier from a parsed URI, preferring the <c>?i=</c> in-album selector and
@@ -196,8 +250,82 @@ namespace BridgeBeats.Providers.AppleMusic {
         /// <param name="storefront">The storefront (country) segment.</param>
         /// <param name="id">The song identifier.</param>
         /// <returns>The relative API path for the song.</returns>
-        private static string GetSongsURI( string storefront, string id )
-            => SongsURI.Replace( "{storefront}", storefront ).Replace( "{id}", id );
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="storefront"/> is not a 2–3-letter alphabetic code, or when
+        /// <paramref name="id"/> is not a numeric catalog identifier.
+        /// </exception>
+        private static string GetSongsURI( string storefront, string id ) {
+            ValidateStorefront( storefront );
+            ValidateCatalogId( id );
+            return SongsURI
+                .Replace( "{storefront}", Uri.EscapeDataString( storefront ) )
+                .Replace( "{id}", Uri.EscapeDataString( id ) );
+        }
+
+        #region Validation
+
+        /// <summary>
+        /// Validates that <paramref name="storefront"/> is a 2–3-letter alphabetic Apple Music storefront code
+        /// (ISO 3166-1 alpha-2, or the special-purpose "all" value).
+        /// </summary>
+        /// <param name="storefront">The storefront segment to validate.</param>
+        /// <exception cref="ArgumentException">Thrown when the value does not match the expected pattern.</exception>
+        private static void ValidateStorefront( string storefront ) {
+            if (!s_validStorefront.IsMatch( storefront )) {
+                throw new ArgumentException(
+                    "Storefront must be 2–3 alphabetic characters.",
+                    nameof( storefront )
+                );
+            }
+        }
+
+        /// <summary>
+        /// Validates that <paramref name="id"/> is a purely numeric Apple Music catalog identifier.
+        /// </summary>
+        /// <param name="id">The catalog identifier to validate.</param>
+        /// <exception cref="ArgumentException">Thrown when the value contains non-numeric characters.</exception>
+        private static void ValidateCatalogId( string id ) {
+            if (!s_validCatalogId.IsMatch( id )) {
+                throw new ArgumentException(
+                    "Catalog id must contain only numeric digits.",
+                    nameof( id )
+                );
+            }
+        }
+
+        /// <summary>
+        /// Validates that <paramref name="isrc"/> conforms to a conservative alphanumeric ISRC pattern.
+        /// Apple Music strips ISRC hyphens, so the expected form is 4–18 uppercase letters and digits.
+        /// The canonical 12-character ISRC (hyphens stripped) fits well within this range; the upper
+        /// bound is intentionally permissive to avoid rejecting non-standard registrant codes.
+        /// </summary>
+        /// <param name="isrc">The ISRC value to validate.</param>
+        /// <exception cref="ArgumentException">Thrown when the value does not match the expected pattern.</exception>
+        private static void ValidateIsrc( string isrc ) {
+            if (!s_validIsrc.IsMatch( isrc )) {
+                throw new ArgumentException(
+                    "ISRC must be 4–18 alphanumeric characters.",
+                    nameof( isrc )
+                );
+            }
+        }
+
+        /// <summary>
+        /// Validates that <paramref name="upc"/> is a numeric barcode in the range of standard UPC/EAN lengths
+        /// (8–14 digits).
+        /// </summary>
+        /// <param name="upc">The UPC value to validate.</param>
+        /// <exception cref="ArgumentException">Thrown when the value does not match the expected pattern.</exception>
+        private static void ValidateUpc( string upc ) {
+            if (!s_validUpc.IsMatch( upc )) {
+                throw new ArgumentException(
+                    "UPC must be 8–14 numeric digits.",
+                    nameof( upc )
+                );
+            }
+        }
+
+        #endregion Validation
 
         #region Regex
 
@@ -232,6 +360,53 @@ namespace BridgeBeats.Providers.AppleMusic {
         /// <returns>The compiled song-URL regex.</returns>
         [GeneratedRegex( @"(?<StoreFront>\w+)/[Ss][Oo][Nn][Gg](?:/.*)?/(?<Identifier>[^?#]*)", RegexOptions.Compiled )]
         private static partial Regex ValidSongURI( );
+
+        /// <summary>
+        /// Compiled regex that accepts a valid Apple Music storefront: 2–3 alphabetic characters
+        /// (ISO 3166-1 alpha-2 country codes, or the special "all" value). Full-string match enforced
+        /// by anchors.
+        /// </summary>
+        private static readonly Regex s_validStorefront = ValidStorefront();
+
+        /// <summary>Source-generated factory for <see cref="s_validStorefront"/>.</summary>
+        /// <returns>The compiled storefront validation regex.</returns>
+        [GeneratedRegex( @"\A[a-zA-Z]{2,3}\z", RegexOptions.Compiled )]
+        private static partial Regex ValidStorefront( );
+
+        /// <summary>
+        /// Compiled regex that accepts a valid Apple Music numeric catalog identifier (one or more
+        /// decimal digits). Full-string match enforced by anchors.
+        /// </summary>
+        private static readonly Regex s_validCatalogId = ValidCatalogId();
+
+        /// <summary>Source-generated factory for <see cref="s_validCatalogId"/>.</summary>
+        /// <returns>The compiled catalog-id validation regex.</returns>
+        [GeneratedRegex( @"\A[0-9]+\z", RegexOptions.Compiled )]
+        private static partial Regex ValidCatalogId( );
+
+        /// <summary>
+        /// Compiled regex that accepts a conservative ISRC value: 4–18 uppercase or lowercase letters
+        /// and digits, with no hyphens (Apple Music strips ISRC hyphens). The canonical 12-character
+        /// ISRC fits within this range; the upper bound is intentionally permissive to avoid rejecting
+        /// non-standard registrant codes.
+        /// </summary>
+        private static readonly Regex s_validIsrc = ValidIsrc();
+
+        /// <summary>Source-generated factory for <see cref="s_validIsrc"/>.</summary>
+        /// <returns>The compiled ISRC validation regex.</returns>
+        [GeneratedRegex( @"\A[A-Za-z0-9]{4,18}\z", RegexOptions.Compiled )]
+        private static partial Regex ValidIsrc( );
+
+        /// <summary>
+        /// Compiled regex that accepts a numeric barcode in the range of standard UPC/EAN lengths
+        /// (EAN-8 through EAN-14, inclusive). Full-string match enforced by anchors.
+        /// </summary>
+        private static readonly Regex s_validUpc = ValidUpc();
+
+        /// <summary>Source-generated factory for <see cref="s_validUpc"/>.</summary>
+        /// <returns>The compiled UPC validation regex.</returns>
+        [GeneratedRegex( @"\A[0-9]{8,14}\z", RegexOptions.Compiled )]
+        private static partial Regex ValidUpc( );
 
         #endregion Regex
 

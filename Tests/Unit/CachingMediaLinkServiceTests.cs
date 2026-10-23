@@ -103,7 +103,7 @@ public class CachingMediaLinkServiceTests {
         MediaLinkResult expectedResult = CreateMediaLinkResult( );
         _ = _orchestratorMock
             .Setup( o => o.LookupByMetadataAsync( TestTitle, TestArtist ) )
-            .ReturnsAsync( new LookupResult { Result = expectedResult, IsPartial = false } );
+            .ReturnsAsync( new LookupResult { Result = expectedResult } );
 
         // Act
         MediaLinkResult? result = await _service.GetInfoAsync( TestTitle, TestArtist );
@@ -122,7 +122,7 @@ public class CachingMediaLinkServiceTests {
         // Arrange
         _ = _orchestratorMock
             .Setup( o => o.LookupByMetadataAsync( It.IsAny<string>( ), It.IsAny<string>( ) ) )
-            .ReturnsAsync( new LookupResult { Result = null, IsPartial = false } );
+            .ReturnsAsync( new LookupResult { Result = null } );
 
         // Act
         MediaLinkResult? result = await _service.GetInfoAsync( TestTitle, TestArtist );
@@ -145,7 +145,7 @@ public class CachingMediaLinkServiceTests {
         MediaLinkResult expectedResult = CreateMediaLinkResult( );
         _ = _orchestratorMock
             .Setup( o => o.LookupByIsrcAsync( TestIsrc ) )
-            .ReturnsAsync( new LookupResult { Result = expectedResult, IsPartial = false } );
+            .ReturnsAsync( new LookupResult { Result = expectedResult } );
 
         // Act
         MediaLinkResult? result = await _service.GetInfoByISRCAsync( TestIsrc );
@@ -163,7 +163,7 @@ public class CachingMediaLinkServiceTests {
         // Arrange
         _ = _orchestratorMock
             .Setup( o => o.LookupByIsrcAsync( It.IsAny<string>( ) ) )
-            .ReturnsAsync( new LookupResult { Result = null, IsPartial = false } );
+            .ReturnsAsync( new LookupResult { Result = null } );
 
         // Act
         MediaLinkResult? result = await _service.GetInfoByISRCAsync( TestIsrc );
@@ -186,7 +186,7 @@ public class CachingMediaLinkServiceTests {
         MediaLinkResult expectedResult = CreateMediaLinkResult( );
         _ = _orchestratorMock
             .Setup( o => o.LookupByUpcAsync( TestUpc ) )
-            .ReturnsAsync( new LookupResult { Result = expectedResult, IsPartial = false } );
+            .ReturnsAsync( new LookupResult { Result = expectedResult } );
 
         // Act
         MediaLinkResult? result = await _service.GetInfoByUPCAsync( TestUpc );
@@ -204,7 +204,7 @@ public class CachingMediaLinkServiceTests {
         // Arrange
         _ = _orchestratorMock
             .Setup( o => o.LookupByUpcAsync( It.IsAny<string>( ) ) )
-            .ReturnsAsync( new LookupResult { Result = null, IsPartial = false } );
+            .ReturnsAsync( new LookupResult { Result = null } );
 
         // Act
         MediaLinkResult? result = await _service.GetInfoByUPCAsync( TestUpc );
@@ -228,7 +228,7 @@ public class CachingMediaLinkServiceTests {
         MediaLinkResult expectedResult = CreateMediaLinkResult( );
         _ = _orchestratorMock
             .Setup( o => o.LookupByProviderIdAsync( TestProviderId, SupportedProviders.Spotify, false ) )
-            .ReturnsAsync( new LookupResult { Result = expectedResult, IsPartial = false } );
+            .ReturnsAsync( new LookupResult { Result = expectedResult } );
 
         // Act
         MediaLinkResult? result = await _service.GetInfoByProviderIdAsync( TestProviderId, SupportedProviders.Spotify, false );
@@ -252,7 +252,7 @@ public class CachingMediaLinkServiceTests {
         MediaLinkResult expectedResult = CreateMediaLinkResult( );
         _ = _orchestratorMock
             .Setup( o => o.LookupByProviderIdAsync( TestProviderId, SupportedProviders.AppleMusic, true ) )
-            .ReturnsAsync( new LookupResult { Result = expectedResult, IsPartial = false } );
+            .ReturnsAsync( new LookupResult { Result = expectedResult } );
 
         // Act
         MediaLinkResult? result = await _service.GetInfoByProviderIdAsync( TestProviderId, SupportedProviders.AppleMusic, true );
@@ -273,7 +273,7 @@ public class CachingMediaLinkServiceTests {
         // Arrange
         _ = _orchestratorMock
             .Setup( o => o.LookupByProviderIdAsync( It.IsAny<string>( ), It.IsAny<SupportedProviders>( ), It.IsAny<bool>( ) ) )
-            .ReturnsAsync( new LookupResult { Result = null, IsPartial = false } );
+            .ReturnsAsync( new LookupResult { Result = null } );
 
         // Act
         MediaLinkResult? result = await _service.GetInfoByProviderIdAsync( TestProviderId, SupportedProviders.Spotify, false );
@@ -297,7 +297,7 @@ public class CachingMediaLinkServiceTests {
         MediaLinkResult expectedResult = CreateMediaLinkResult( );
         _ = _orchestratorMock
             .Setup( o => o.LookupByContentAsync( TestContent ) )
-            .Returns( CreateAsyncEnumerable( new LookupResult { Result = expectedResult, IsPartial = false } ) );
+            .Returns( CreateAsyncEnumerable( new LookupResult { Result = expectedResult } ) );
 
         // Act
         List<MediaLinkResult> results = [];
@@ -321,8 +321,8 @@ public class CachingMediaLinkServiceTests {
         _ = _orchestratorMock
             .Setup( o => o.LookupByContentAsync( TestContent ) )
             .Returns( CreateAsyncEnumerable(
-                new LookupResult { Result = null, IsPartial = false },
-                new LookupResult { Result = CreateMediaLinkResult( ), IsPartial = false }
+                new LookupResult { Result = null },
+                new LookupResult { Result = CreateMediaLinkResult( ) }
             ) );
 
         // Act
@@ -361,6 +361,31 @@ public class CachingMediaLinkServiceTests {
     #region Partial Result Message Tests
 
     /// <summary>
+    /// Verifies that a rate-limited saga with no provider payload still returns an API DTO marked
+    /// partial, rather than forcing clients to infer its state from the message text.
+    /// </summary>
+    [TestMethod]
+    public async Task GetInfoByISRCAsync_WhenRateLimitedWithoutPayload_ShouldReturnPartialPlaceholder( ) {
+        DateTimeOffset retryAfter = DateTimeOffset.UtcNow.AddMinutes( 5 );
+        _ = _orchestratorMock
+            .Setup( o => o.LookupByIsrcAsync( TestIsrc ) )
+            .ReturnsAsync( new LookupResult {
+                Result = null,
+                SagaId = "test-saga",
+                RateLimitedProviders = [
+                    new ProviderRateLimitInfo( SupportedProviders.AppleMusic, retryAfter, "/v1/catalog" )
+                ]
+            } );
+
+        MediaLinkResult? result = await _service.GetInfoByISRCAsync( TestIsrc );
+
+        Assert.IsNotNull( result );
+        Assert.IsTrue( result.IsPartial );
+        Assert.IsNotNull( result.RateLimitedProviders );
+        Assert.Contains( SupportedProviders.AppleMusic, result.RateLimitedProviders );
+    }
+
+    /// <summary>
     /// Verifies that a partial result with one rate-limited provider produces a single message naming
     /// that provider and describing it as temporarily unavailable.
     /// </summary>
@@ -374,7 +399,6 @@ public class CachingMediaLinkServiceTests {
             .Setup( o => o.LookupByIsrcAsync( TestIsrc ) )
             .ReturnsAsync( new LookupResult {
                 Result = expectedResult,
-                IsPartial = true,
                 SagaId = "test-saga",
                 RateLimitedProviders = [
                     new ProviderRateLimitInfo( SupportedProviders.AppleMusic, retryAfter, "/v1/catalog" )
@@ -386,6 +410,7 @@ public class CachingMediaLinkServiceTests {
 
         // Assert
         Assert.IsNotNull( result );
+        Assert.IsTrue( result.IsPartial, "A saga-backed partial result must expose isPartial on the API DTO." );
         Assert.IsNotNull( result.Messages );
         Assert.HasCount( 1, result.Messages );
         Assert.Contains( "AppleMusic", result.Messages[0] );
@@ -406,7 +431,6 @@ public class CachingMediaLinkServiceTests {
             .Setup( o => o.LookupByIsrcAsync( TestIsrc ) )
             .ReturnsAsync( new LookupResult {
                 Result = expectedResult,
-                IsPartial = true,
                 SagaId = "test-saga",
                 RateLimitedProviders = [
                     new ProviderRateLimitInfo( SupportedProviders.AppleMusic, retryAfter, "/v1/catalog" ),
@@ -419,6 +443,7 @@ public class CachingMediaLinkServiceTests {
 
         // Assert
         Assert.IsNotNull( result );
+        Assert.IsTrue( result.IsPartial, "A saga-backed partial result must expose isPartial on the API DTO." );
         Assert.IsNotNull( result.Messages );
         Assert.HasCount( 2, result.Messages );
         Assert.Contains( "AppleMusic", result.Messages[0] );
@@ -437,8 +462,7 @@ public class CachingMediaLinkServiceTests {
         _ = _orchestratorMock
             .Setup( o => o.LookupByIsrcAsync( TestIsrc ) )
             .ReturnsAsync( new LookupResult {
-                Result = expectedResult,
-                IsPartial = false
+                Result = expectedResult
             } );
 
         // Act
@@ -446,6 +470,7 @@ public class CachingMediaLinkServiceTests {
 
         // Assert
         Assert.IsNotNull( result );
+        Assert.IsFalse( result.IsPartial, "A finalized result must expose isPartial=false on the API DTO." );
         Assert.IsNull( result.Messages );
     }
 
@@ -462,7 +487,6 @@ public class CachingMediaLinkServiceTests {
             .Setup( o => o.LookupByIsrcAsync( TestIsrc ) )
             .ReturnsAsync( new LookupResult {
                 Result = expectedResult,
-                IsPartial = true,
                 SagaId = "test-saga",
                 RateLimitedProviders = []
             } );
@@ -472,37 +496,10 @@ public class CachingMediaLinkServiceTests {
 
         // Assert
         Assert.IsNotNull( result );
-        Assert.IsTrue( result.IsPartial, "The DTO should be flagged partial for downstream consumers" );
+        Assert.IsTrue( result.IsPartial, "Pending secondary lookups must be machine-readable without parsing Messages." );
         Assert.IsNotNull( result.Messages );
         Assert.HasCount( 1, result.Messages );
         Assert.Contains( "still being fetched", result.Messages[0] );
-    }
-
-    /// <summary>
-    /// Verifies that when the orchestrator reports a partial lookup, the translated
-    /// <see cref="MediaLinkResult"/> has its <see cref="MediaLinkResult.IsPartial"/> flag set even
-    /// though the source result started non-partial.
-    /// </summary>
-    [TestMethod]
-    public async Task GetInfoByISRCAsync_WhenPartial_ShouldFlagResultPartial( ) {
-        // Arrange
-        MediaLinkResult expectedResult = CreateMediaLinkResult( );
-        Assert.IsFalse( expectedResult.IsPartial );
-
-        _ = _orchestratorMock
-            .Setup( o => o.LookupByIsrcAsync( TestIsrc ) )
-            .ReturnsAsync( new LookupResult {
-                Result = expectedResult,
-                IsPartial = true,
-                SagaId = "test-saga"
-            } );
-
-        // Act
-        MediaLinkResult? result = await _service.GetInfoByISRCAsync( TestIsrc );
-
-        // Assert
-        Assert.IsNotNull( result );
-        Assert.IsTrue( result.IsPartial );
     }
 
     #endregion

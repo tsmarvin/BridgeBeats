@@ -1,6 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <Sdk Name="Aspire.AppHost.Sdk" Version="13.1.0" />
+  <Sdk Name="Aspire.AppHost.Sdk" Version="13.6.3" />
   <PropertyGroup>
+    <!-- The container packages DCP and Dashboard from NuGet for standalone execution. -->
+    <AspireUseCliBundle>false</AspireUseCliBundle>
+    <NoWarn>$(NoWarn);ASPIRE010</NoWarn>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <UserSecretsId>bridgebeats-apphost</UserSecretsId>
@@ -14,14 +17,13 @@
     <Deterministic>true</Deterministic>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
-    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>  
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Aspire.Hosting.AppHost" Version="13.4.3" />
-    <PackageReference Include="Aspire.Hosting.Redis" Version="13.4.3" />
-    <!-- Pin: overrides the vulnerable MessagePack 2.5.192 pulled in via Aspire.Hosting → StreamJsonRpc. -->
-    <PackageReference Include="MessagePack" Version="2.5.301" />
+    <PackageReference Include="Aspire.Hosting.AppHost" Version="13.6.3" />
+    <PackageReference Include="Aspire.Hosting.Redis" Version="13.6.3" />
+    <PackageReference Include="MessagePack" Version="3.1.12" />
 
     <ProjectReference Include="..\BridgeBeats.Web\BridgeBeats.Web.csproj" />
     <ProjectReference Include="..\BridgeBeats.Worker.Discord\BridgeBeats.Worker.Discord.csproj" />
@@ -30,6 +32,6 @@
     <ProjectReference Include="..\BridgeBeats.Worker.Tidal\BridgeBeats.Worker.Tidal.csproj" />
     <ProjectReference Include="..\BridgeBeats.Worker.SagaCoordinator\BridgeBeats.Worker.SagaCoordinator.csproj" />
     <ProjectReference Include="..\BridgeBeats.Worker.JetStreamWatcher\BridgeBeats.Worker.JetStreamWatcher.csproj" />
-    <ProjectReference Include="..\BridgeBeats.Worker.CacheBootstrap\BridgeBeats.Worker.CacheBootstrap.csproj" />
+    <ProjectReference Include="..\BridgeBeats.Worker.Maintenance\BridgeBeats.Worker.Maintenance.csproj" />
   </ItemGroup>
 </Project>

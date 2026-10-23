@@ -94,7 +94,7 @@ public class CarRepoReaderTests {
         ReadOnlyMemory<byte> carMemory = carBytes;
 
         // Act: enumerate only the lookup collection
-        List<(string Rkey, System.Text.Json.Nodes.JsonNode Record)> lookupResults = [
+        List<(string Rkey, string Cid, System.Text.Json.Nodes.JsonNode Record)> lookupResults = [
             .. CarRepoReader.EnumerateCollection( carMemory, "link.bridgebeats.lookup", TestContext.CancellationToken ).Records
         ];
 
@@ -115,7 +115,7 @@ public class CarRepoReaderTests {
             []
         );
 
-        List<(string Rkey, System.Text.Json.Nodes.JsonNode Record)> results = [
+        List<(string Rkey, string Cid, System.Text.Json.Nodes.JsonNode Record)> results = [
             .. CarRepoReader.EnumerateCollection( carBytes, "link.bridgebeats.lookup", TestContext.CancellationToken ).Records
         ];
 
@@ -137,7 +137,7 @@ public class CarRepoReaderTests {
             ]
         );
 
-        List<(string Rkey, System.Text.Json.Nodes.JsonNode Record)> results = [
+        List<(string Rkey, string Cid, System.Text.Json.Nodes.JsonNode Record)> results = [
             .. CarRepoReader.EnumerateCollection( carBytes, "link.bridgebeats.lookup", TestContext.CancellationToken ).Records
         ];
 

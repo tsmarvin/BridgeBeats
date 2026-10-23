@@ -177,4 +177,7 @@ public static class LogEventIds {
 
     /// <summary>A stream entry carried a malformed <c>enqueuedAt</c> field; it was treated as absent.</summary>
     public const int MalformedEnqueuedAt = 5376;
+
+    /// <summary>The bulk endpoint returned a deterministic 4xx; each item is being re-enqueued as an individual lookup.</summary>
+    public const int BulkBatchRejected = 5377;
 }

@@ -42,11 +42,11 @@ internal static class CarV1Reader {
     /// block's bytes do not hash to its CID digest.
     /// </exception>
     /// <remarks>
-    /// Memory is bounded by the 512 MB download-buffer cap enforced upstream in
-    /// ATProtoStorageService.MaxCarBytes, not by a block count. A per-block count cap would
-    /// false-positive against legitimate repo growth (the production repo grows ~1,810 records
-    /// per 6-hour cycle; every record is its own IPLD block). The per-block 2 MB size cap and
-    /// per-block sha256 digest verification remain active.
+    /// The download is currently unbounded at the byte-count level; no upstream cap is enforced.
+    /// A per-block count cap is intentionally omitted because it would false-positive against
+    /// legitimate repo growth (the production repo grows ~1,810 records per 6-hour cycle; every
+    /// record is its own IPLD block). The per-block 2 MB size cap and per-block sha256 digest
+    /// verification remain active.
     /// </remarks>
     internal static CarFile Read( ReadOnlyMemory<byte> buffer ) {
         int offset = 0;

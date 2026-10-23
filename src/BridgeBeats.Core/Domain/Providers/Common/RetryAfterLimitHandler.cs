@@ -11,9 +11,8 @@ namespace BridgeBeats.Core.Domain.Providers.Common {
     /// On <see cref="System.Net.HttpStatusCode.TooManyRequests"/>, the handler reads the
     /// <c>Retry-After</c> header in both delta-seconds and HTTP-date forms. When the wait exceeds
     /// <paramref name="maxRetryAfterSeconds"/> it throws <see cref="RetryAfterExceededException"/>;
-    /// otherwise the original response flows through unchanged. Register this handler before the
-    /// resilience handler in the HTTP client pipeline so 429 responses are intercepted before retry
-    /// logic is applied.
+    /// otherwise the original response flows through unchanged. Register this handler inside the
+    /// resilience handler so every Polly attempt can fail fast when the requested wait is excessive.
     /// </remarks>
     /// <param name="maxRetryAfterSeconds">The maximum tolerable <c>Retry-After</c> wait, in seconds, before failing fast.</param>
     /// <param name="logger">Logger used to record fail-fast decisions.</param>
@@ -74,7 +73,7 @@ namespace BridgeBeats.Core.Domain.Providers.Common {
         /// The wait duration; <see cref="TimeSpan.Zero"/> when a date-form value is already in the past;
         /// or <see langword="null"/> when no <c>Retry-After</c> header is present.
         /// </returns>
-        private static TimeSpan? GetRetryAfterValue( HttpResponseMessage response ) {
+        internal static TimeSpan? GetRetryAfterValue( HttpResponseMessage response ) {
             // Check for delta seconds (e.g., "Retry-After: 120")
             if (response.Headers.RetryAfter?.Delta.HasValue == true) {
                 return response.Headers.RetryAfter.Delta;

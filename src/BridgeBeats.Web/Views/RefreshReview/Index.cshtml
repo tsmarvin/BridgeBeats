@@ -1,0 +1,85 @@
+@model IReadOnlyList<BridgeBeats.Contracts.Records.RefreshReviewEntry>
+@{
+    ViewData["Title"] = "Refresh Review";
+}
+
+<div class="container py-4">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h1 class="mb-1">Refresh Review</h1>
+            <p class="text-muted mb-0">PDS records that no enabled provider could resolve during refresh.</p>
+        </div>
+        <a asp-controller="Statistics" asp-action="Index" class="btn btn-outline-secondary btn-sm">Statistics</a>
+    </div>
+
+    @if (TempData["RefreshReviewNotice"] is string notice)
+    {
+        <div class="alert alert-info" role="status">@notice</div>
+    }
+
+    @if (Model.Count == 0)
+    {
+        <div class="alert alert-success" role="status">There are no unresolved refreshes.</div>
+    }
+    else
+    {
+        <div class="table-responsive">
+            <table class="table table-striped align-middle">
+                <thead>
+                    <tr>
+                        <th>Failed</th>
+                        <th>Type</th>
+                        <th>Lookup value</th>
+                        <th>Last-known providers</th>
+                        <th>Source record</th>
+                        <th class="text-end">Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var entry in Model)
+                    {
+                        <tr>
+                            <td>@entry.FailedAt?.ToString("yyyy-MM-dd HH:mm:ss 'UTC'")</td>
+                            <td>@(entry.IsAlbum is null ? "Unknown" : entry.IsAlbum.Value ? "Album" : "Track")</td>
+                            <td><code>@entry.LookupValue</code></td>
+                            <td>
+                                @if (entry.SourceResult?.Results.Count > 0)
+                                {
+                                    @foreach (var provider in entry.SourceResult.Results)
+                                    {
+                                        <div>
+                                            @provider.Key (@(provider.Value.MarketRegion ?? "default"))
+                                        </div>
+                                    }
+                                }
+                                else
+                                {
+                                    <span class="text-muted">Unavailable</span>
+                                }
+                            </td>
+                            <td class="text-break"><code>@entry.SourceRecordUri</code></td>
+                            <td class="text-end">
+                                @if (User.IsInRole(BridgeBeats.Contracts.Constants.Roles.PdsRecordAdministrator))
+                                {
+                                    <form asp-action="Delete" method="post" class="d-inline">
+                                        @Html.AntiForgeryToken()
+                                        <input type="hidden" name="sourceRecordUri" value="@entry.SourceRecordUri" />
+                                        <input type="hidden" name="expectedSagaId" value="@entry.SagaId" />
+                                        <input type="hidden" name="expectedSourceRecordCid" value="@entry.SourceRecordCid" />
+                                        <button type="submit" class="btn btn-outline-danger btn-sm">
+                                            Delete PDS record
+                                        </button>
+                                    </form>
+                                }
+                                else
+                                {
+                                    <span class="text-muted">Disposition role required</span>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    }
+</div>

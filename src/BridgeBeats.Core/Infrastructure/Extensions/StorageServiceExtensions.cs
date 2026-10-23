@@ -68,6 +68,12 @@ namespace BridgeBeats.Core.Infrastructure.Extensions {
         /// first via <see cref="AddATProtoSessionManager"/>.
         /// </summary>
         /// <param name="services">The service collection to add the registrations to.</param>
+        /// <param name="carCacheTtl">
+        /// Time-to-live for the in-process CAR result cache. The cache holds the already-materialized
+        /// record list so multiple consumers within one TTL window share a single download. Defaults to
+        /// 5 minutes, which covers the startup overlap between the cache-bootstrap and stale-cache
+        /// refresh workers while remaining well under the ~1-hour refresh cadence.
+        /// </param>
         /// <returns>The same <paramref name="services"/> instance, to allow call chaining.</returns>
         /// <remarks>
         /// Configures a named HttpClient (named by <c>ATProtoStorageService.ATProtoSyncHttpClientName</c>)
@@ -75,18 +81,24 @@ namespace BridgeBeats.Core.Infrastructure.Extensions {
         /// service resolves the ATProto session manager, a typed logger, and the HttpClient factory at
         /// activation time. Registered with singleton lifetime.
         /// </remarks>
-        public static IServiceCollection AddATProtoStorage( this IServiceCollection services ) {
+        public static IServiceCollection AddATProtoStorage(
+            this IServiceCollection services,
+            TimeSpan? carCacheTtl = null
+        ) {
             // CAR downloads (com.atproto.sync.getRepo) join the global resilience pipeline.
             // HttpClient.Timeout is a transport backstop above the global 120s AttemptTimeout.
             _ = services
                 .AddHttpClient( ATProtoStorageService.ATProtoSyncHttpClientName )
                 .ConfigureHttpClient( c => c.Timeout = TimeSpan.FromSeconds( 130 ) );
 
+            TimeSpan ttl = carCacheTtl ?? TimeSpan.FromMinutes( 5 );
+
             _ = services.AddSingleton<IATProtoStorageService>( sp =>
                 new ATProtoStorageService(
                     sp.GetRequiredService<IATProtoSessionManager>( ),
                     sp.GetRequiredService<ILogger<ATProtoStorageService>>( ),
-                    sp.GetRequiredService<IHttpClientFactory>( )
+                    sp.GetRequiredService<IHttpClientFactory>( ),
+                    ttl
                 )
             );
 

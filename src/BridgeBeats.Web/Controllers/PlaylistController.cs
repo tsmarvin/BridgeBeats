@@ -1,3 +1,4 @@
+using System.ComponentModel.DataAnnotations;
 using System.Security.Claims;
 using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Interfaces;
@@ -45,6 +46,10 @@ public partial class PlaylistController( IPlaylistService? playlistService, IOpe
     [HttpPost( "create" )]
     [ValidateAntiForgeryToken]
     public async Task<IActionResult> CreatePlaylist( [FromBody] CreatePlaylistRequest request ) {
+        if (!ModelState.IsValid) {
+            return BadRequest( ModelState );
+        }
+
         if (_playlistService?.IsEnabled != true) {
             return BadRequest( new { error = "Playlist service not available" } );
         }
@@ -300,10 +305,12 @@ public partial class PlaylistController( IPlaylistService? playlistService, IOpe
         /// <summary>The rkeys corresponding to each card id, used to regenerate cards that are no longer cached.</summary>
         public List<string> CardRkeys { get; init; } = [];
 
-        /// <summary>The optional playlist title; stored only for authenticated callers.</summary>
+        /// <summary>The optional playlist title; stored only for authenticated callers. Maximum 200 characters.</summary>
+        [StringLength( 200, MinimumLength = 1 )]
         public string? Title { get; init; }
 
-        /// <summary>The optional playlist description; stored only for authenticated callers.</summary>
+        /// <summary>The optional playlist description; stored only for authenticated callers. Maximum 1000 characters.</summary>
+        [StringLength( 1000, MinimumLength = 1 )]
         public string? Description { get; init; }
     }
 }

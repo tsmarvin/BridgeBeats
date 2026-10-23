@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.IdentityModel.Tokens.Jwt;
 using System.Net;
 using System.Security.Cryptography;
@@ -11,6 +10,7 @@ using idunno.AtProto;
 using idunno.Bluesky;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.IdentityModel.Tokens;
 
 namespace BridgeBeats.Core.Infrastructure.Identity;
@@ -71,10 +71,21 @@ public partial class ATProtoOAuthService : IATProtoOAuthService {
     private const int MaxDPoPNonceRetries = 2;
 
     /// <summary>
-    /// Process-wide cache of authorization server metadata to avoid repeated discovery requests.
-    /// Key: authorization server URI (normalized). Value: the metadata and its expiration time.
+    /// Maximum number of distinct authorization server URIs to cache metadata for.
+    /// Bounds process-wide memory growth on the anonymous OAuth login path: entries past this
+    /// cap are dropped rather than cached, preventing resource-exhaustion via attacker-supplied handles.
     /// </summary>
-    private static readonly ConcurrentDictionary<string, (AuthorizationServerMetadata Metadata, DateTime ExpiresAt)> s_metadataCache = new();
+    private const int MetadataCacheCapacity = 256;
+
+    /// <summary>
+    /// Process-wide bounded cache of authorization server metadata to avoid repeated discovery requests.
+    /// Capped at <see cref="MetadataCacheCapacity"/> entries; each entry expires after
+    /// <see cref="s_metadataCacheDuration"/> and is actively evicted by the cache runtime rather than
+    /// merely skipped on read.
+    /// </summary>
+    private static readonly MemoryCache s_metadataCache = new( new MemoryCacheOptions {
+        SizeLimit = MetadataCacheCapacity
+    } );
 
     private readonly IDbContextFactory<ApplicationDbContext> _dbContextFactory;
     private readonly ILogger<ATProtoOAuthService> _logger;
@@ -501,13 +512,14 @@ public partial class ATProtoOAuthService : IATProtoOAuthService {
     ) {
         string cacheKey = authorizationServer.ToString().TrimEnd('/').ToLowerInvariant();
 
-        // Check cache first
-        if (s_metadataCache.TryGetValue( cacheKey, out (AuthorizationServerMetadata Metadata, DateTime ExpiresAt) cached ) && cached.ExpiresAt > DateTime.UtcNow) {
+        // Check cache first. MemoryCache handles expiry and eviction natively; expired entries are
+        // never returned and are actively removed, not merely skipped on read.
+        if (s_metadataCache.TryGetValue( cacheKey, out AuthorizationServerMetadata? cached )) {
             if (_logger.IsEnabled( LogLevel.Debug )) {
                 string authServerString = authorizationServer.ToString( );
                 LogUsingCachedMetadata( _logger, authServerString );
             }
-            return cached.Metadata;
+            return cached!;
         }
 
         // Fetch metadata from well-known endpoint
@@ -555,8 +567,14 @@ public partial class ATProtoOAuthService : IATProtoOAuthService {
             throw new InvalidOperationException( "Failed to parse authorization server metadata", ex );
         }
 
-        // Cache the metadata
-        s_metadataCache[cacheKey] = (metadata, DateTime.UtcNow.Add( s_metadataCacheDuration ));
+        // Cache the metadata with a bounded entry. Size = 1 counts against SizeLimit so the total
+        // entry count never exceeds MetadataCacheCapacity; entries beyond the cap are dropped rather
+        // than cached, and expired entries are actively evicted by the cache runtime.
+        MemoryCacheEntryOptions entryOptions = new( ) {
+            AbsoluteExpirationRelativeToNow = s_metadataCacheDuration,
+            Size = 1
+        };
+        _ = s_metadataCache.Set( cacheKey, metadata, entryOptions );
 
         if (_logger.IsEnabled( LogLevel.Debug )) {
             string authServerString = authorizationServer.ToString( );

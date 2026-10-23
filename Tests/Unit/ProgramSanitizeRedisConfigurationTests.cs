@@ -3,7 +3,7 @@ using System.Text.RegularExpressions;
 namespace BridgeBeats.Tests.Unit;
 
 /// <summary>
-/// Tests <see cref="BridgeBeats.Worker.CacheBootstrap.Program.SanitizeRedisConfiguration"/>, which
+/// Tests <see cref="BridgeBeats.Worker.Maintenance.Program.SanitizeRedisConfiguration"/>, which
 /// masks the Redis password in connection strings before they are emitted to structured logs.
 /// </summary>
 [TestClass]
@@ -28,7 +28,7 @@ public partial class ProgramSanitizeRedisConfigurationTests {
     /// </summary>
     [TestMethod]
     public void SanitizeRedisConfiguration_WithPassword_MasksPassword( ) {
-        string result = BridgeBeats.Worker.CacheBootstrap.Program.SanitizeRedisConfiguration( ConfigWithPassword );
+        string result = BridgeBeats.Worker.Maintenance.Program.SanitizeRedisConfiguration( ConfigWithPassword );
 
         StringAssert.DoesNotMatch(
             result,
@@ -52,7 +52,7 @@ public partial class ProgramSanitizeRedisConfigurationTests {
     /// </summary>
     [TestMethod]
     public void SanitizeRedisConfiguration_Null_ReturnsUnavailable( ) {
-        string result = BridgeBeats.Worker.CacheBootstrap.Program.SanitizeRedisConfiguration( null );
+        string result = BridgeBeats.Worker.Maintenance.Program.SanitizeRedisConfiguration( null );
 
         Assert.AreEqual( "(unavailable)", result,
             "Null configuration must return the sentinel string without throwing." );
@@ -64,7 +64,7 @@ public partial class ProgramSanitizeRedisConfigurationTests {
     /// </summary>
     [TestMethod]
     public void SanitizeRedisConfiguration_Empty_ReturnsUnavailable( ) {
-        string result = BridgeBeats.Worker.CacheBootstrap.Program.SanitizeRedisConfiguration( string.Empty );
+        string result = BridgeBeats.Worker.Maintenance.Program.SanitizeRedisConfiguration( string.Empty );
 
         Assert.AreEqual( "(unavailable)", result,
             "Empty configuration must return the sentinel string without throwing." );

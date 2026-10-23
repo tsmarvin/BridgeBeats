@@ -10,6 +10,10 @@ namespace BridgeBeats.Contracts.Records;
 /// </summary>
 public sealed record LookupSagaState {
 
+    /// <summary>Redis-only instance token used to guard delete/recreate races.</summary>
+    [JsonIgnore]
+    public string? InstanceToken { get; init; }
+
     /// <summary>The unique identifier of this saga. Derived deterministically from the lookup key.</summary>
     [JsonPropertyName( "sagaId" )]
     [JsonRequired]

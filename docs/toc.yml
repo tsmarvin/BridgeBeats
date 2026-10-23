@@ -18,6 +18,8 @@
   href: SPOTIFY_BATCH_AND_ROUTING.md
 - name: Discord Bot
   href: DISCORD_BOT.md
+- name: Discord Bot Settings
+  href: DISCORD_SETTINGS.md
 - name: ATProto Lexicon Setup
   href: ATPROTO_LEXICON.md
 - name: Caddy + Cloudflare

@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
@@ -35,6 +37,22 @@ public sealed partial class RedisRateLimitTracker(
 
     /// <summary>Key prefix for all rate-limit entries. Literal value: <c>"ratelimit:"</c>.</summary>
     private const string RateLimitPrefix = "ratelimit:";
+    private const string RateLimitIndexPrefix = "ratelimit:active:";
+    private const string SetRateLimitScript = """
+        redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+        redis.call('ZADD', KEYS[2], ARGV[4], ARGV[3])
+        return 1
+        """;
+    private const string ClearRateLimitScript = """
+        local deleted = redis.call('DEL', KEYS[1])
+        redis.call('ZREM', KEYS[2], ARGV[1])
+        return deleted
+        """;
+    private static readonly TimeSpan s_activeEndpointCacheDuration = TimeSpan.FromMilliseconds( 250 );
+    private readonly ConcurrentDictionary<SupportedProviders, ActiveEndpointCache> _activeEndpointCache = [];
+    private sealed record ActiveEndpointCache(
+        DateTimeOffset ValidUntil,
+        IReadOnlyList<RateLimitedEndpoint> Endpoints );
 
     /// <summary>
     /// Reads the current rate-limit state for one provider endpoint.
@@ -70,7 +88,11 @@ public sealed partial class RedisRateLimitTracker(
 
         if (!DateTimeOffset.TryParse( value.ToString( ), out DateTimeOffset retryAfter )) {
             // Invalid value, clean it up
-            _ = await db.KeyDeleteAsync( key );
+            _ = await db.ScriptEvaluateAsync(
+                ClearRateLimitScript,
+                [key, GetIndexKey( provider )],
+                [NormalizeEndpoint( endpoint )] );
+            _ = _activeEndpointCache.TryRemove( provider, out _ );
             LogInvalidValueRemoved( _logger, provider, endpoint );
 
             return new RateLimitState(
@@ -84,7 +106,11 @@ public sealed partial class RedisRateLimitTracker(
 
         if (remaining <= TimeSpan.Zero) {
             // Expired but TTL hasn't cleaned up yet, remove manually
-            _ = await db.KeyDeleteAsync( key );
+            _ = await db.ScriptEvaluateAsync(
+                ClearRateLimitScript,
+                [key, GetIndexKey( provider )],
+                [NormalizeEndpoint( endpoint )] );
+            _ = _activeEndpointCache.TryRemove( provider, out _ );
 
             return new RateLimitState(
                 IsRateLimited: false,
@@ -132,7 +158,13 @@ public sealed partial class RedisRateLimitTracker(
         string key = GetKey( provider, endpoint );
         IDatabase db = _redis.GetDatabase( );
 
-        _ = await db.StringSetAsync( key, retryAfter.ToString( "O" ), ttl );
+        string normalizedEndpoint = NormalizeEndpoint( endpoint );
+        _ = await db.ScriptEvaluateAsync(
+            SetRateLimitScript,
+            [key, GetIndexKey( provider )],
+            [retryAfter.ToString( "O" ), Math.Max( 1L, (long)ttl.TotalMilliseconds ),
+                normalizedEndpoint, retryAfter.ToUnixTimeMilliseconds( )] );
+        _ = _activeEndpointCache.TryRemove( provider, out _ );
 
         // Record rate limit metrics
         QueueMetrics.RecordRateLimitEvent( provider, endpoint, ttl.TotalSeconds );
@@ -158,7 +190,12 @@ public sealed partial class RedisRateLimitTracker(
         string key = GetKey( provider, endpoint );
         IDatabase db = _redis.GetDatabase( );
 
-        bool deleted = await db.KeyDeleteAsync( key );
+        RedisResult result = await db.ScriptEvaluateAsync(
+            ClearRateLimitScript,
+            [key, GetIndexKey( provider )],
+            [NormalizeEndpoint( endpoint )] );
+        bool deleted = (int)result == 1;
+        _ = _activeEndpointCache.TryRemove( provider, out _ );
 
         if (deleted) {
             LogRateLimitCleared( _logger, provider, endpoint );
@@ -168,54 +205,44 @@ public sealed partial class RedisRateLimitTracker(
     /// <summary>
     /// Returns every currently rate-limited endpoint for a provider.
     /// </summary>
-    /// <param name="provider">The provider to scan.</param>
+    /// <param name="provider">The provider to query.</param>
     /// <param name="cancellationToken">A cancellation token (not currently observed).</param>
     /// <returns>The endpoints that are still within their Retry-After window, with their retry times.</returns>
     /// <remarks>
-    /// Implemented with a pattern key scan (<c>ratelimit:{provider}:*</c>) on the first available
-    /// server. The rate-limit-aware dequeue calls this once per dequeue cycle to refresh the set
-    /// of blocked endpoints, so the scan runs frequently; treat it as a scaling consideration as
-    /// the keyspace grows. Keys whose value is missing, unparseable, or already expired are skipped.
+    /// Reads a provider-scoped sorted-set index rather than scanning the Redis keyspace. Expired
+    /// members are pruned before the active range is returned, keeping dequeue cost proportional
+    /// to the number of throttled endpoints rather than the total Redis key count.
     /// </remarks>
-    /// <exception cref="InvalidOperationException">Thrown when no Redis server is available to scan.</exception>
     public async Task<IReadOnlyList<RateLimitedEndpoint>> GetAllRateLimitedAsync(
         SupportedProviders provider,
         CancellationToken cancellationToken = default
     ) {
-        IDatabase db = _redis.GetDatabase( );
-        IServer server = _redis.GetServers( ).FirstOrDefault( )
-            ?? throw new InvalidOperationException( "No Redis servers available" );
-
-        string pattern = $"{RateLimitPrefix}{provider}:*";
-        List<RateLimitedEndpoint> endpoints = [];
-
-        // Use SCAN to find all rate limit keys for this provider
-        await foreach (RedisKey redisKey in server.KeysAsync( pattern: pattern )) {
-            string key = redisKey.ToString( );
-            RedisValue value = await db.StringGetAsync( key );
-
-            if (value.IsNullOrEmpty) {
-                continue;
+        cancellationToken.ThrowIfCancellationRequested( );
+        Stopwatch stopwatch = Stopwatch.StartNew( );
+        try {
+            DateTimeOffset nowUtc = DateTimeOffset.UtcNow;
+            if (_activeEndpointCache.TryGetValue( provider, out ActiveEndpointCache? cached )
+                && cached.ValidUntil > nowUtc) {
+                return cached.Endpoints;
             }
 
-            if (!DateTimeOffset.TryParse( value.ToString( ), out DateTimeOffset retryAfter )) {
-                continue;
-            }
+            IDatabase db = _redis.GetDatabase( );
+            string indexKey = GetIndexKey( provider );
+            long now = nowUtc.ToUnixTimeMilliseconds( );
+            _ = await db.SortedSetRemoveRangeByScoreAsync( indexKey, double.NegativeInfinity, now );
+            SortedSetEntry[] active = await db.SortedSetRangeByScoreWithScoresAsync(
+                indexKey, now, double.PositiveInfinity );
 
-            if (retryAfter <= DateTimeOffset.UtcNow) {
-                // Expired, skip (will be cleaned up by TTL)
-                continue;
-            }
-
-            // Extract endpoint from key: ratelimit:{provider}:{endpoint}
-            string prefix = $"{RateLimitPrefix}{provider}:";
-            if (key.StartsWith( prefix, StringComparison.OrdinalIgnoreCase )) {
-                string endpoint = key[prefix.Length..];
-                endpoints.Add( new RateLimitedEndpoint( endpoint, retryAfter ) );
-            }
+            IReadOnlyList<RateLimitedEndpoint> endpoints = [.. active.Select( entry => new RateLimitedEndpoint(
+                entry.Element.ToString( ),
+                DateTimeOffset.FromUnixTimeMilliseconds( checked((long)entry.Score) ) ) )];
+            _activeEndpointCache[provider] = new ActiveEndpointCache(
+                nowUtc + s_activeEndpointCacheDuration, endpoints );
+            return endpoints;
+        } finally {
+            stopwatch.Stop( );
+            QueueMetrics.RecordRateLimitDiscoveryDuration( provider, stopwatch.Elapsed.TotalSeconds );
         }
-
-        return endpoints;
     }
 
     /// <summary>Builds the Redis key for a provider endpoint: <c>ratelimit:{provider}:{endpoint}</c> (endpoint trimmed and lower-cased).</summary>
@@ -223,7 +250,12 @@ public sealed partial class RedisRateLimitTracker(
     /// <param name="endpoint">The endpoint component of the key.</param>
     /// <returns>The composed rate-limit key.</returns>
     private static string GetKey( SupportedProviders provider, string endpoint ) =>
-        $"{RateLimitPrefix}{provider}:{endpoint.Trim( ).ToLowerInvariant( )}";
+        $"{RateLimitPrefix}{provider}:{NormalizeEndpoint( endpoint )}";
+
+    private static string GetIndexKey( SupportedProviders provider ) =>
+        $"{RateLimitIndexPrefix}{provider.ToString( ).ToLowerInvariant( )}";
+
+    private static string NormalizeEndpoint( string endpoint ) => endpoint.Trim( ).ToLowerInvariant( );
 
     #region LoggerMessage Methods
 

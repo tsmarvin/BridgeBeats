@@ -57,6 +57,15 @@ internal readonly struct Cid {
     /// </summary>
     internal string KeyHex => Convert.ToHexStringLower( _digest );
 
+    /// <summary>Rehydrates a CID from the lowercase digest key used by the CAR block map.</summary>
+    internal static Cid FromKeyHex( string keyHex ) {
+        ArgumentException.ThrowIfNullOrWhiteSpace( keyHex );
+        byte[] digest = Convert.FromHexString( keyHex );
+        return digest.Length == 32
+            ? new Cid( digest )
+            : throw new CarParseException( $"CID digest must be 32 bytes, got {digest.Length}." );
+    }
+
     /// <summary>
     /// Parses a CID from its exact 36-byte binary encoding, validating that it is the
     /// CIDv1 dag-cbor sha2-256 shape atproto requires.

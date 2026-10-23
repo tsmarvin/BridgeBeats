@@ -51,6 +51,12 @@ public static class QueueServiceExtensions {
             sp.GetRequiredService<IOptions<QueueSettings>>( )
         ) );
 
+        _ = services.AddSingleton<IRefreshReviewStore>( sp => new RedisRefreshReviewStore(
+            sp.GetRequiredService<IConnectionMultiplexer>( ),
+            sp.GetRequiredService<IOptions<QueueSettings>>( ),
+            sp.GetRequiredService<ILogger<RedisRefreshReviewStore>>( )
+        ) );
+
         // Register queue depth metrics if requested. A hosted service is used so the gauges
         // are registered eagerly at host start after the DI container is built and Redis is
         // connected, rather than lazily on first resolution (which never happens for a marker).
@@ -276,8 +282,11 @@ internal sealed class ProviderQueueResolver<T>(
 
 /// <summary>
 /// Hosted service that eagerly registers the queue-depth observable gauges at host start, after
-/// the DI container is built and the Redis connection is available. Runs once per host startup;
-/// the underlying registration is idempotent so multiple hosts each registering is safe.
+/// the DI container is built and the Redis connection is available. Runs once per host startup. The
+/// gauge instruments are created only once per process, but the Redis connection the gauge callbacks
+/// read from tracks the most recent caller: when several hosts in the same process each register
+/// their own connection, the last one to register wins, and an earlier host's connection is no
+/// longer read from once superseded — see <see cref="QueueMetrics.RegisterQueueDepthGauges"/>.
 /// </summary>
 internal sealed class QueueMetricsRegistration( IConnectionMultiplexer redis ) : IHostedService {
 

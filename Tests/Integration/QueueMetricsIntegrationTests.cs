@@ -4,6 +4,7 @@ using BridgeBeats.Core.Infrastructure.Extensions;
 using BridgeBeats.Core.Infrastructure.Queue;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Moq;
 using StackExchange.Redis;
 
 namespace BridgeBeats.Tests.Integration;
@@ -18,6 +19,8 @@ namespace BridgeBeats.Tests.Integration;
 [TestClass]
 [TestCategory( "Integration" )]
 [TestCategory( "Docker" )]
+// [DoNotParallelize]: the registration-supersession fix's correctness depends on no other host
+// registering or disposing a connection concurrently with these assertions.
 [DoNotParallelize]
 public class QueueMetricsIntegrationTests {
 
@@ -126,6 +129,67 @@ public class QueueMetricsIntegrationTests {
 
         // Assert - No exception means success
         Assert.IsNotNull( s_redis );
+    }
+
+    /// <summary>Consumer-group pending, oldest-age, and lag gauges are all published.</summary>
+    [TestMethod]
+    public void RegisterQueueDepthGauges_PublishesConsumerHealthGauges( ) {
+        QueueMetrics.RegisterQueueDepthGauges( s_redis! );
+        HashSet<string> published = [];
+        using MeterListener listener = new( );
+        listener.InstrumentPublished = ( instrument, meterListener ) => {
+            if (instrument.Meter.Name == QueueMetrics.MeterName) {
+                _ = published.Add( instrument.Name );
+                meterListener.EnableMeasurementEvents( instrument );
+            }
+        };
+
+        listener.Start( );
+        listener.RecordObservableInstruments( );
+
+        Assert.Contains( "bridgebeats.queue.pending", published );
+        Assert.Contains( "bridgebeats.queue.pending.oldest_age", published );
+        Assert.Contains( "bridgebeats.queue.consumer.lag", published );
+    }
+
+    /// <summary>
+    /// Verifies observable gauge collection remains non-fatal when the current Redis multiplexer
+    /// cannot provide a database, as can happen while a host-owned connection is being torn down.
+    /// </summary>
+    [TestMethod]
+    public void QueueDepthGauges_WhenDatabaseAcquisitionFails_DoNotThrow( ) {
+        // Arrange: make every gauge callback encounter a connection-level failure before it can
+        // read an individual stream. MeterListener aggregates exceptions escaping observable
+        // callbacks, so RecordObservableInstruments below is the regression assertion.
+        Mock<IConnectionMultiplexer> unavailableRedis = new( MockBehavior.Strict );
+        _ = unavailableRedis
+            .Setup( redis => redis.GetDatabase( It.IsAny<int>( ), It.IsAny<object?>( ) ) )
+            .Throws( new ObjectDisposedException( nameof( IConnectionMultiplexer ) ) );
+
+        QueueMetrics.RegisterQueueDepthGauges( unavailableRedis.Object );
+
+        using MeterListener listener = new( );
+        listener.InstrumentPublished = ( instrument, meterListener ) => {
+            if (instrument.Meter.Name == QueueMetrics.MeterName
+                && instrument.Name is "bridgebeats.queue.depth"
+                    or "bridgebeats.queue.spotify.bulk.track.depth"
+                    or "bridgebeats.queue.spotify.bulk.album.depth") {
+                meterListener.EnableMeasurementEvents( instrument );
+            }
+        };
+        listener.SetMeasurementEventCallback<long>( ( _, _, _, _ ) => { } );
+        listener.Start( );
+
+        try {
+            // Act & Assert: no AggregateException should escape metric collection.
+            listener.RecordObservableInstruments( );
+            unavailableRedis.Verify(
+                redis => redis.GetDatabase( It.IsAny<int>( ), It.IsAny<object?>( ) ),
+                Times.Exactly( 3 ) );
+        } finally {
+            // Restore the class's live connection for subsequent tests sharing the static gauges.
+            QueueMetrics.RegisterQueueDepthGauges( s_redis! );
+        }
     }
 
     /// <summary>
@@ -341,6 +405,102 @@ public class QueueMetricsIntegrationTests {
         Assert.HasCount( 9, recordedCombinations, "Should have exactly 9 provider/priority combinations" );
     }
 
+    /// <summary>
+    /// Regression guard for the registration-supersession fix in
+    /// <see cref="QueueMetrics.RegisterQueueDepthGauges"/>: registers the gauges with one connection,
+    /// disposes it, then registers again with a second, live connection — reproducing the shape of
+    /// several independent hosts sharing this process, where an earlier host's factory-backed
+    /// connection is disposed after a later host registers its own. The gauge must read from the
+    /// most recently registered (live) connection, not silently keep reading a disposed one.
+    /// </summary>
+    /// <remarks>
+    /// Pre-fix, the gauge closures captured whichever connection first won the once-only
+    /// registration latch and never updated on subsequent calls: if that connection was later
+    /// disposed, every following read threw inside the gauge callback, was swallowed by the
+    /// callback's own <c>catch { length = 0; }</c>, and the gauge silently reported zero forever —
+    /// regardless of a later caller's live connection. Mutation-verified under a single-test filter
+    /// (this test as the process's first registrant): reverting <see cref="QueueMetrics"/>'s
+    /// <c>s_redis</c> reassignment to its pre-fix shape (no <c>s_redis</c> field; gauge closures
+    /// capture the <c>redis</c> parameter directly and the once-only early return never updates it)
+    /// reproduces the pre-fix failure (actual: 0) for this test. That evidence does not hold under a
+    /// whole-class run: an earlier test in this class registers first and wins the once-only latch,
+    /// and because connection A and B here share the same connection string and keyspace, the
+    /// pre-fix latch still reads the entries this test writes — the test passes either way in that
+    /// shape. Re-verify with a single-test filter, not a class-scoped run.
+    /// </remarks>
+    [TestMethod]
+    public async Task RegisterQueueDepthGauges_SupersedesEarlierDisposedConnection( ) {
+        IConnectionMultiplexer? connectionA = null;
+        IConnectionMultiplexer? connectionB = null;
+        try {
+            // Arrange: register with connection A, then dispose it — mirroring a factory-backed
+            // host whose connection is torn down after a later host takes over the registration.
+            connectionA = await ConnectionMultiplexer.ConnectAsync( SharedTestInfrastructure.RedisConnectionString );
+            QueueMetrics.RegisterQueueDepthGauges( connectionA );
+            await connectionA.CloseAsync( );
+            connectionA.Dispose( );
+
+            connectionB = await ConnectionMultiplexer.ConnectAsync( SharedTestInfrastructure.RedisConnectionString );
+
+            // Act: a later caller registers its own live connection, which must supersede A.
+            QueueMetrics.RegisterQueueDepthGauges( connectionB );
+
+            IDatabase db = connectionB.GetDatabase( );
+            for (int i = 0; i < 5; i++) {
+                _ = await db.StreamAddAsync( "queue:spotify:interactive", "data", $"message-{i}" );
+            }
+
+            long spotifyInteractiveDepth = -1;
+
+            using MeterListener listener = new( );
+            listener.InstrumentPublished = ( instrument, meterListener ) => {
+                if (instrument.Meter.Name == QueueMetrics.MeterName && instrument.Name == "bridgebeats.queue.depth") {
+                    meterListener.EnableMeasurementEvents( instrument );
+                }
+            };
+
+            listener.SetMeasurementEventCallback<long>( ( instrument, measurement, tags, state ) => {
+                string? provider = null;
+                string? priority = null;
+
+                foreach (KeyValuePair<string, object?> tag in tags) {
+                    if (tag.Key == QueueMetricTags.Provider) {
+                        provider = tag.Value?.ToString( );
+                    } else if (tag.Key == QueueMetricTags.Priority) {
+                        priority = tag.Value?.ToString( );
+                    }
+                }
+
+                if (provider == "spotify" && priority == "interactive") {
+                    spotifyInteractiveDepth = measurement;
+                }
+            } );
+
+            listener.Start( );
+
+            // Act - Trigger observable gauge collection
+            listener.RecordObservableInstruments( );
+
+            // Assert - the gauge must read connection B's live stream depth, not a disposed
+            // connection A's swallowed-to-zero read.
+            Assert.AreEqual( 5, spotifyInteractiveDepth,
+                "Gauge must report the most recently registered (live) connection's stream depth, "
+                + "not a stale or disposed connection's swallowed-to-zero read" );
+        } finally {
+            if (connectionB is not null) {
+                await connectionB.CloseAsync( );
+                connectionB.Dispose( );
+            }
+
+            // Restore class state: point the shared gauges back at this class's own long-lived
+            // connection so later tests in this class are unaffected by this test's connections,
+            // even if an earlier step above (e.g. connecting B) failed and left the gauges bound
+            // to A after it was disposed.
+            QueueMetrics.RegisterQueueDepthGauges( s_redis! );
+            _ = await s_redis!.GetDatabase( ).KeyDeleteAsync( "queue:spotify:interactive" );
+        }
+    }
+
     #endregion
 
     #region Alarm Observability Tests
@@ -369,8 +529,10 @@ public class QueueMetricsIntegrationTests {
         Assert.IsTrue( hasMetricsService,
             "AddQueueInfrastructure(registerMetrics: true) must register a QueueMetricsRegistration IHostedService" );
 
-        // Start the hosted service so the gauges are registered (idempotent — latch already set
-        // by earlier tests in this class, but StartAsync must not throw)
+        // Start the hosted service so the gauges are registered. Instrument creation is
+        // once-per-process (already done by earlier tests in this class), but StartAsync rebinds
+        // the connection the gauge callbacks read from to this call's connection — last writer
+        // wins, per QueueMetricsRegistration's remarks — and must not throw.
         QueueMetricsRegistration metricsService = (QueueMetricsRegistration)hostedServices.First( svc => svc is QueueMetricsRegistration );
         await metricsService.StartAsync( CancellationToken.None );
 

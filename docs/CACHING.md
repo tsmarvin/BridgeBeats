@@ -44,7 +44,7 @@ rather than your main account password.
 
 ### Stale-cache refresh sweep
 
-The `StaleCacheRefreshBackgroundService` (in `BridgeBeats.Worker.CacheBootstrap`) runs on a
+The `StaleCacheRefreshBackgroundService` (in `BridgeBeats.Worker.Maintenance`) runs on a
 periodic timer, defaulting to every 24 hours (`RefreshIntervalHours`). Each run queries Redis for
 the oldest stale or expired media-link records and re-enqueues up to `MaxRecordsPerRun` of them at
 bulk priority. The provider workers process these lookups and write refreshed records back to the
@@ -90,13 +90,19 @@ record present on the PDS but missing from Redis can still be served.
 
 ### Staleness
 
-`CheckRecordFreshness` marks a record stale when either condition holds:
+`CheckRecordFreshness` marks a record stale on age alone: the record is stale when its `lookedUpAt`
+timestamp is older than `CacheDays`. Nothing else drives the freshness check.
 
-- The record's `lookedUpAt` is older than `CacheDays`, or
-- The record is partial (`isPartial` is `true`).
+Partiality does not affect cache freshness. Interactive lookups may publish an interim PDS result
+while secondary provider legs are outstanding so their synchronous waiters can receive available
+links. The terminal write replaces that interim body once every leg reaches a terminal state.
 
-Partial results are always treated as stale-eligible so callers re-enter the lookup path and wait for
-the complete result rather than serving a partial result as final.
+Maintenance refreshes are different: a pending refresh context suppresses all interim PDS writes.
+The saga still records each provider leg independently, and only failed legs are retried. Once all
+legs are terminal, one refresh write preserves every successful sibling result even if another
+provider exhausted its retries. Only a refresh with no successful provider result is promoted to the
+unresolved-review workflow. Thus one provider outage neither discards other providers nor causes an
+incomplete refresh body to replace the currently served record.
 
 ### Storage flow
 

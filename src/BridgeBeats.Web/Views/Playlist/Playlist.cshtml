@@ -29,7 +29,7 @@
                         </button>
                     </li>
                     <li>
-                        <button class="dropdown-item copy-embed-btn" type="button" data-url="/playlist/@Model.PlaylistId" data-title="@Html.Raw(System.Text.Json.JsonSerializer.Serialize(Model.Title))" data-items="@Model.Items.Count">
+                        <button class="dropdown-item copy-embed-btn" type="button" data-url="/playlist/@Model.PlaylistId" data-title='@Html.Raw(System.Text.Json.JsonSerializer.Serialize(Model.Title, ViewSecurityHelpers.HtmlSafeJsonOptions))' data-items="@Model.Items.Count">
                             <span class="dropdown-icon">🖼️</span> Copy Embed
                         </button>
                     </li>
@@ -66,7 +66,7 @@
                                                 </button>
                                             </li>
                                             <li>
-                                                <button class="dropdown-item copy-embed-btn" type="button" data-url="@item.CardUrl" data-title="@Html.Raw(System.Text.Json.JsonSerializer.Serialize(item.Title))">
+                                                <button class="dropdown-item copy-embed-btn" type="button" data-url="@item.CardUrl" data-title='@Html.Raw(System.Text.Json.JsonSerializer.Serialize(item.Title, ViewSecurityHelpers.HtmlSafeJsonOptions))'>
                                                     <span class="dropdown-icon">🖼️</span> Copy Embed
                                                 </button>
                                             </li>
@@ -95,7 +95,7 @@
                             </div>
                             <div class="embed-providers">
                                 @foreach (var provider in item.Result.Results.OrderBy(kv => kv.Key)) {
-                                    <a href="@provider.Value.URL" target="_blank" rel="noopener noreferrer" class="provider-button">
+                                    <a href="@(ViewSecurityHelpers.IsHttpOrHttps(provider.Value.URL) ? provider.Value.URL : "#")" target="_blank" rel="noopener noreferrer" class="provider-button">
                                         @provider.Key.GetProviderLogo()
                                         <span class="visually-hidden">@provider.Key.GetDescription()</span>
                                     </a>

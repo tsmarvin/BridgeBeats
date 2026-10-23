@@ -157,20 +157,23 @@ Its `EnqueueAsync` re-routes a request to a type-specific bulk stream only when 
 conditions hold:
 
 - the lookup type is `SongIdLookup` or `AlbumIdLookup`, and
-- the priority is not `Interactive`.
+- the priority is not `Interactive`, and
+- `BypassBulkRouting` is false.
 
 When routed, `SongIdLookup` goes to `SpotifyConstants.BulkTrackIdStream`
 (`queue:spotify:bulk:track-id`) and `AlbumIdLookup` goes to
 `SpotifyConstants.BulkAlbumIdStream` (`queue:spotify:bulk:album-id`). The request is
-serialized and written directly with `XADD`, carrying the `payload` and `enqueuedAt`
-fields, and an enqueue metric is recorded at bulk priority so dashboards can tell
-bulk-stream enqueues apart from generic ones.
+serialized and written directly with `XADD`, carrying the `payload` and `enqueuedAt` fields.
+After Redis returns a non-null stream id, the bulk enqueue acceptance metric is recorded at
+bulk priority so dashboards can tell bulk-stream enqueues apart from generic ones.
 
 Everything else passes through to the inner queue unchanged: interactive `SongIdLookup`
 and `AlbumIdLookup` (so an interactive caller is served on the interactive lane with a
 single-item call, preserving its latency budget), and every other lookup type at any
 priority. All non-enqueue operations on the decorator delegate straight to the inner
-queue.
+queue. `BypassBulkRouting` is used only by deterministic bulk-rejection isolation: the
+replacement stays on the background lane and cannot be routed straight back to the bulk
+stream that rejected it.
 
 Using the shared stream-name constants on both the producer and consumer side matters:
 the constant's own remarks call out that a producer and consumer disagreeing on the stream
@@ -206,19 +209,21 @@ The bulk path keeps work moving across crashes, bad data, and transient provider
 
 ### Stale-entry recovery with XAUTOCLAIM
 
-`SpotifyBatchQueueHelper` dequeues in two steps. First it runs an `XAUTOCLAIM` sweep to
-reclaim pending entries that have been idle longer than `AutoClaimMinIdleMs` (60 seconds),
-deserializing and appending them to the result; then it reads new entries with
-`XREADGROUP`. Reclaimed entries count against the requested batch size, so a single
-dequeue never returns more than asked. The 60-second idle threshold is chosen to be long
-enough that a slow-but-alive processing cycle is never reclaimed, yet short enough that a
-crashed consumer does not block the stream for more than a minute. There is exactly one
-consumer service reading these streams, which is what makes reclaiming another consumer's
-pending entries safe after the idle window.
+`SpotifyBatchQueueHelper` dequeues in three bounded-budget stages. It first reads the current
+consumer's pending entries for immediate recovery, then runs `XAUTOCLAIM` for entries owned by
+dead consumers that have been idle longer than `AutoClaimMinIdleMs` (15 minutes), and finally
+reads new entries with `XREADGROUP` using `>`. Entries recovered or reclaimed in either pending
+stage count against the requested batch size, so a single dequeue never returns more than asked.
+The 15-minute idle threshold is chosen to be long enough that a slow-but-alive processing cycle
+is never reclaimed, yet short enough that a crashed consumer does not block the stream for more
+than 15 minutes. There is exactly one consumer service reading these streams, which is what
+makes reclaiming another consumer's pending entries safe after the idle window.
 
 `XAUTOCLAIM` requires Redis 6.2 or newer. If the server is older, the reclaim step throws,
-is logged, and is skipped — the dequeue still reads new entries, only pending-entry
-recovery is unavailable.
+is logged, and is skipped. Current-consumer PEL recovery remains available because it uses the
+ordinary pending-entry read; only dead-consumer recovery through `XAUTOCLAIM` is unavailable.
+The dequeue still reads new entries, so a Redis version below 6.2 loses only that dead-consumer
+recovery path.
 
 ### Poison-entry handling
 
@@ -228,16 +233,44 @@ loop forever under repeated `XAUTOCLAIM` re-claims. Such entries are acknowledge
 deleted (`XACK` + `XDEL`) on both the reclaim and the new-read paths rather than retried,
 so they leave the pending list permanently.
 
+### Deterministic bulk rejection
+
+When Spotify rejects a bulk request with a deterministic 4xx, each source delivery is moved to
+`queue:spotify:background` for single-item isolation. The replacement carries
+`BypassBulkRouting = true`, so the decorator does not return it to the bulk stream. This avoids
+promoting maintenance-origin traffic into the live-user lane. The destination `XADD` and source
+`XACK`/`XDEL` execute in one Redis Lua script. The script first checks that the source entry still
+exists, so retrying an ambiguously completed handoff cannot create a duplicate background copy.
+This route change preserves `AttemptCount` and records the replacement as a requeue enqueue.
+
+### Generic-provider throughput and delayed retries
+
+Each generic provider worker uses one dequeue producer and a bounded set of processing tasks.
+`QueueSettings.ProviderConcurrency` controls the per-provider limit; the default is 4 and values
+are constrained to 1–32. Redis stream reads remain serialized while provider HTTP work can overlap.
+
+Ordinary transient failures do not sleep inside a provider's consumer loop. The failed delivery is
+replaced with an incremented `AttemptCount` and a `NotBefore` timestamp using the existing
+1/2/4/8-second schedule, then the original is acknowledged. Dequeue skips a future-dated request
+until it becomes eligible, so one failing lookup no longer blocks unrelated work for that provider.
+
+Active rate-limit discovery uses a per-provider sorted-set index rather than scanning the Redis
+keyspace. A short in-process cache further removes repeated Redis reads from the hot dequeue path;
+set and clear operations invalidate it immediately.
+
 ### Requeue cap and finalization
 
 Requeue is bounded by `LookupConstants.MaxQueueRetryAttempts` (5), the same cap the generic
-queue processor enforces. `SpotifyBatchQueueHelper.RequeueAsync` always acknowledges and
-deletes the original entry first, then:
+queue processor enforces. `SpotifyBatchQueueHelper.RequeueAsync` handles replacement and
+terminal-discard paths separately:
 
 - if the current attempt count is below the cap, it re-adds a fresh entry with a new
-  `enqueuedAt` and `AttemptCount + 1` and returns `Requeued`;
+  `enqueuedAt` and `AttemptCount + 1`. Once Redis accepts that replacement with `XADD`, the
+  enqueue acceptance metric is incremented, then the original delivery is acknowledged and deleted
+  (`XACK` + `XDEL`), and the helper returns `Requeued`;
 - if the cap is reached, or the payload cannot be deserialized to read its attempt count,
-  it discards the message and returns `CapReached`;
+  it terminally acknowledges and deletes the original message without adding a replacement, then
+  returns `CapReached`;
 - if the original entry no longer exists (already deleted, for example after an
   `XAUTOCLAIM` re-claim by a duplicate in flight), it returns `NotFound`.
 
@@ -245,6 +278,30 @@ The processor reacts to the outcome. On `CapReached` it writes a failed Spotify 
 state ("Bulk lookup failed after 5 attempts") and publishes saga-level and per-lookup
 completion so the saga coordinator and any interactive waiter unblock instead of hanging.
 On `NotFound` it leaves the saga untouched, since another consumer handled the entry.
+
+### Rollout metrics
+
+Queue health is observable by provider, priority, and stream through live pending count
+(`bridgebeats.queue.pending`), oldest pending age
+(`bridgebeats.queue.pending.oldest_age`), and consumer-group lag
+(`bridgebeats.queue.consumer.lag`). `bridgebeats.queue.sojourn.duration` measures enqueue-to-dequeue
+age, while dequeue, PEL scan, rate-limit discovery, provider HTTP, saga update, and message wall
+histograms isolate processing time sinks.
+
+`bridgebeats.queue.terminal.total` records terminal delivery outcomes;
+`bridgebeats.queue.saga.lifecycle.total` records fencing/finalization outcomes; and
+`bridgebeats.queue.refresh.outcome.total` records maintenance selection and disposition.
+Refresh enqueue volume is provider-leg based and is named
+`bridgebeats.queue.refresh.leg.enqueued.total`. Source deliveries removed with `XACK` + `XDEL`
+are counted by `bridgebeats.queue.delivery.removed.total`; this is deliberately not a success
+counter. Dead-letter moves are counted independently by `bridgebeats.queue.dlq.total`, so the
+terminal outcome counter remains one disposition per delivery. Poison destruction and
+missing/ghost PEL entries use distinct outcome tags, and new
+`XREADGROUP` deliveries are excluded from PEL-scan entry counts.
+
+For every replacement requeue, the new stream entry is accepted with `XADD` before the original
+delivery is removed with `XACK` and `XDEL`. This ordering preserves the retry if cleanup fails and
+is also the boundary used by enqueue telemetry.
 
 ### Failure shapes in the bulk dispatch
 

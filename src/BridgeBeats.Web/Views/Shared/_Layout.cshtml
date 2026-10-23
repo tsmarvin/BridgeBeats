@@ -13,17 +13,12 @@
     <link rel="stylesheet" href="~/public/docfx.min.css">
     <link rel="stylesheet" href="~/public/main.css">
     <link rel="stylesheet" href="~/public/BridgeBeats.styles.css">
-    <meta name="loc:themeLight" content="Light">
-    <meta name="loc:themeDark" content="Dark">
-    <meta name="loc:themeAuto" content="Auto">
-    <meta name="loc:changeTheme" content="Change theme">
-    <script type="module" src="~/public/docfx.min.js"></script>
+    <script src="~/public/bootstrap.bundle.min.js" defer></script>
     <script src="~/public/antiforgery.js"></script>
     <script src="~/public/share-buttons.js"></script>
     <script nonce="@cspNonce">
         // FOUC mitigation: Apply theme before page render
-        // NOTE: This logic must stay synchronized with docfx.min.js theme management
-        // If theme logic in docfx.min.js changes, update this inline script accordingly
+        // Keep this theme resolution synchronized with _Header.cshtml.
         const theme = localStorage.getItem('theme') || 'auto'
         document.documentElement.setAttribute('data-bs-theme', theme === 'auto' ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : theme)
     </script>

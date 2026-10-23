@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using BridgeBeats.Contracts.Enums;
 
 namespace BridgeBeats.Contracts.Records;
 
@@ -21,4 +22,8 @@ public sealed record QueuedMessage<T>(
     [property: JsonPropertyName( "enqueuedAt" )]
     DateTimeOffset EnqueuedAt
 
-);
+) {
+    /// <summary>The actual priority lane from which the broker delivered this message.</summary>
+    [JsonIgnore]
+    public QueuePriority Priority { get; init; } = QueuePriority.Background;
+}

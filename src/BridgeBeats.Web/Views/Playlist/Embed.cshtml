@@ -348,7 +348,7 @@
                         @if (item.Result?.Results != null) {
                             foreach (var provider in item.Result.Results.Keys.OrderBy(k => k)) {
                                 var providerResult = item.Result.Results[provider];
-                                <a href="@providerResult.URL"
+                                <a href="@(ViewSecurityHelpers.IsHttpOrHttps(providerResult.URL) ? providerResult.URL : "#")"
                                    target="_blank"
                                    rel="noopener noreferrer"
                                    class="provider-button provider-@provider.ToString().ToLowerInvariant()"

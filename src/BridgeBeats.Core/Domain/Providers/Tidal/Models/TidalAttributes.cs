@@ -26,11 +26,18 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal.Models {
 
         /// <summary>
         /// Gets or sets the artist name, mapped from the Tidal <c>name</c> member.
-        /// Genre names are carried by a separate <c>genreName</c> field on
-        /// <c>TidalGenreAttributes</c>, not by this property.
+        /// Genre names are carried by the separate <see cref="GenreName"/> field,
+        /// not by this property.
         /// </summary>
         [JsonPropertyName( "name" )]
         public string? Name { get; set; }
+
+        /// <summary>
+        /// Gets or sets the genre name, mapped from the Tidal <c>genreName</c> member.
+        /// This is populated only for resources whose type is <c>genres</c>.
+        /// </summary>
+        [JsonPropertyName( "genreName" )]
+        public string? GenreName { get; set; }
 
         /// <summary>
         /// Gets or sets the track's ISRC, mapped from the Tidal <c>isrc</c> member.

@@ -85,7 +85,7 @@
         <div class="embed-providers">
             @if (result != null) {
                 foreach (var providerResult in result.Results) {
-                    <a href="@providerResult.Value.URL" target="_blank" rel="noopener noreferrer" class="provider-button">
+                    <a href="@(ViewSecurityHelpers.IsHttpOrHttps(providerResult.Value.URL) ? providerResult.Value.URL : "#")" target="_blank" rel="noopener noreferrer" class="provider-button">
                         <span class="provider-icon provider-icon-@providerResult.Key.ToString().ToLowerInvariant()">
                             @providerResult.Key.GetProviderLogo( )
                         </span>

@@ -168,4 +168,115 @@ public class AppleMusicLinkParserTests {
         Assert.AreEqual( "us", storefront, "Should extract 'us' as storefront" );
         Assert.AreEqual( "us/songs/987654321", requestUri, "Should extract song ID '987654321' without query parameters" );
     }
+
+    /// <summary>
+    /// Verifies that <see cref="AppleMusicLinkParser.TryParseUri"/> returns <see langword="false"/>
+    /// and does NOT throw when a URL matches the album URL regex (via the loose <c>\w+</c> storefront
+    /// capture) but carries a storefront value that fails strict validation. Before the fix,
+    /// <c>TryParseUri</c> called <c>GetAlbumsURI</c> directly, which threw
+    /// <see cref="ArgumentException"/> on the invalid storefront—breaking the <c>bool Try*</c>
+    /// contract and propagating the exception into the queue-processor loop.
+    /// </summary>
+    /// <remarks>
+    /// Failure-first evidence: before the guard was added to <c>TryParseUri</c>, this call threw
+    /// <see cref="ArgumentException"/> (validator rejection inside <c>GetAlbumsURI</c>); it now
+    /// returns <see langword="false"/> without throwing.
+    /// </remarks>
+    [TestMethod]
+    public void TryParseUri_RegexMatchButInvalidStorefront_ReturnsFalseWithoutThrowing( ) {
+        // Arrange - storefront "foo_bar" matches the loose \w+ album regex but fails ValidateStorefront
+        // (underscore is not a letter; length exceeds 3). The id "abc123" also fails ValidateCatalogId
+        // (non-numeric). Either failure is sufficient; the storefront check is the first guard.
+        string link = "https://music.apple.com/foo_bar/album/test-album/abc123";
+
+        // Act / Assert - must not throw; must return false
+        bool result = AppleMusicLinkParser.TryParseUri( link, out string requestUri, out string storefront, out bool isAlbum );
+
+        Assert.IsFalse( result, "TryParseUri must return false for an invalid storefront, not throw" );
+        Assert.AreEqual( string.Empty, requestUri, "requestUri must be empty on a false return" );
+        Assert.AreEqual( string.Empty, storefront, "storefront must be empty on a false return" );
+        Assert.IsFalse( isAlbum, "isAlbum must be false on a false return" );
+    }
+
+    /// <summary>
+    /// Verifies that URL builder methods reject a storefront value containing URL injection characters
+    /// (<c>&amp;</c>, <c>/</c>, <c>?</c>, and a percent-encoded separator). Before the validation fix,
+    /// these builders performed raw string substitution, so an attacker-controlled storefront could
+    /// inject extra query parameters or path segments into the JWT-bearing outbound Apple Music API
+    /// request. Post-fix, each builder validates against the expected 2–3-letter alphabetic pattern
+    /// and throws <see cref="ArgumentException"/>, ensuring no injected character survives into the
+    /// built URL.
+    /// </summary>
+    [TestMethod]
+    public void UrlBuilders_StorefrontWithInjectionCharacters_ThrowArgumentException( ) {
+        // Arrange - storefronts containing characters that could alter URL structure
+        string[] maliciousStorefronts = [
+            "us&evil=1",         // query-parameter injection via &
+            "us/../../etc",      // path traversal via /
+            "us?extra=param",    // query string injection via ?
+            "us%2fevil",         // percent-encoded path separator
+        ];
+
+        foreach (string badStorefront in maliciousStorefronts) {
+            // Assert - every builder must reject the bad storefront; no injection survives into any URL.
+            // Failure-first: before validation was added, these methods performed bare .Replace()
+            // and returned a URL containing the unescaped injection; they did NOT throw.
+            _ = Assert.ThrowsExactly<ArgumentException>(
+                ( ) => AppleMusicLinkParser.GetSongIdUri( badStorefront, "12345" )
+            );
+            _ = Assert.ThrowsExactly<ArgumentException>(
+                ( ) => AppleMusicLinkParser.GetAlbumIdUri( badStorefront, "12345" )
+            );
+            _ = Assert.ThrowsExactly<ArgumentException>(
+                ( ) => AppleMusicLinkParser.GetSongsIsrcURI( badStorefront, "USRC12345678" )
+            );
+            _ = Assert.ThrowsExactly<ArgumentException>(
+                ( ) => AppleMusicLinkParser.GetAlbumUpcURI( badStorefront, "012345678901" )
+            );
+            _ = Assert.ThrowsExactly<ArgumentException>(
+                ( ) => AppleMusicLinkParser.GetArtistAlbumsURI( badStorefront, "12345" )
+            );
+            _ = Assert.ThrowsExactly<ArgumentException>(
+                ( ) => AppleMusicLinkParser.GetArtistSongsURI( badStorefront, "12345" )
+            );
+            _ = Assert.ThrowsExactly<ArgumentException>(
+                ( ) => AppleMusicLinkParser.GetArtistSearchUri( badStorefront, "Test Artist" )
+            );
+        }
+    }
+
+    /// <summary>
+    /// Verifies that URL builder methods reject an identifier value containing URL injection characters
+    /// (<c>&amp;</c>, <c>/</c>, <c>?</c>, and a percent-encoded separator). Post-fix, numeric catalog
+    /// ids are validated against <c>^[0-9]+$</c> and throw <see cref="ArgumentException"/> on any
+    /// non-numeric content, so no injected character survives into the built URL.
+    /// </summary>
+    [TestMethod]
+    public void UrlBuilders_IdWithInjectionCharacters_ThrowArgumentException( ) {
+        // Arrange - ids containing characters that could alter URL structure
+        string[] maliciousIds = [
+            "12345&evil=1",      // query-parameter injection via &
+            "12345/../../etc",   // path traversal via /
+            "12345?extra=param", // query string injection via ?
+            "12345%2fevil",      // percent-encoded path separator
+        ];
+
+        foreach (string badId in maliciousIds) {
+            // Assert - song and album id builders must both reject the bad id.
+            // Failure-first: before validation, these returned a URL with the raw injection; they
+            // did NOT throw.
+            _ = Assert.ThrowsExactly<ArgumentException>(
+                ( ) => AppleMusicLinkParser.GetSongIdUri( "us", badId )
+            );
+            _ = Assert.ThrowsExactly<ArgumentException>(
+                ( ) => AppleMusicLinkParser.GetAlbumIdUri( "us", badId )
+            );
+            _ = Assert.ThrowsExactly<ArgumentException>(
+                ( ) => AppleMusicLinkParser.GetArtistAlbumsURI( "us", badId )
+            );
+            _ = Assert.ThrowsExactly<ArgumentException>(
+                ( ) => AppleMusicLinkParser.GetArtistSongsURI( "us", badId )
+            );
+        }
+    }
 }

@@ -31,9 +31,11 @@ namespace BridgeBeats.Worker.JetStreamWatcher;
 /// </summary>
 /// <param name="logger">The logger for connection lifecycle and processing diagnostics.</param>
 /// <param name="queueResolver">Resolves the per-provider queue a discovered link is enqueued to.</param>
+/// <param name="sagaManager">Creates the fenced saga before its queue delivery is published.</param>
 public sealed partial class JetStreamWatcherService(
     ILogger<JetStreamWatcherService> logger,
-    IProviderQueueResolver<QueuedLookupRequest> queueResolver
+    IProviderQueueResolver<QueuedLookupRequest> queueResolver,
+    ISagaStateManager sagaManager
 ) : BackgroundService {
 
     /// <summary>
@@ -81,11 +83,8 @@ public sealed partial class JetStreamWatcherService(
         using AtProtoJetstream jetStream = new( collections: ["app.bsky.feed.post", "app.bsky.feed.repost"] );
 
         jetStream.RecordReceived += async ( sender, e ) => {
-            if (e.ParsedEvent is AtJetstreamCommitEvent commitEvent &&
-                string.Equals( commitEvent.Commit.Operation, "create", StringComparison.OrdinalIgnoreCase ) &&
-                commitEvent.Commit.Record is not null
-            ) {
-                await HandleCommitRecordAsync( commitEvent.Commit.Record, commitEvent.Commit.Collection.ToString( ), blueskyAgent, stoppingToken );
+            if (e.ParsedEvent is JetstreamCommitEvent commitEvent) {
+                await HandleCommitEventAsync( commitEvent, blueskyAgent, stoppingToken );
             }
         };
 
@@ -103,17 +102,35 @@ public sealed partial class JetStreamWatcherService(
     }
 
     /// <summary>
+    /// Dispatches created Jetstream records, ignoring updates, deletions, and commits without a record.
+    /// </summary>
+    /// <param name="commitEvent">The parsed Jetstream commit event.</param>
+    /// <param name="blueskyAgent">The agent used to hydrate quoted posts and reposts.</param>
+    /// <param name="cancellationToken">Signals host shutdown.</param>
+    /// <returns>A task that completes when the record is processed or skipped.</returns>
+    internal async Task HandleCommitEventAsync(
+        JetstreamCommitEvent commitEvent,
+        BlueskyAgent blueskyAgent,
+        CancellationToken cancellationToken
+    ) {
+        if (commitEvent.Commit.Operation == JetstreamCommitOperation.Create &&
+            commitEvent.Commit.Record is JsonElement record) {
+            await HandleCommitRecordAsync( record, commitEvent.Commit.Collection.ToString( ), blueskyAgent, cancellationToken );
+        }
+    }
+
+    /// <summary>
     /// Dispatches a single committed record to the appropriate handler based on its collection, skipping
     /// malformed or unrecognized records cleanly. Known benign parsing errors are swallowed silently;
     /// unexpected errors are logged at Warning so they are visible above the file-sink floor.
     /// </summary>
-    /// <param name="record">The raw record document from the commit event.</param>
+    /// <param name="record">The raw record value from the commit event.</param>
     /// <param name="collection">The collection name (e.g. <c>app.bsky.feed.post</c>).</param>
     /// <param name="blueskyAgent">The agent used to hydrate quoted posts and reposts.</param>
     /// <param name="cancellationToken">Signals host shutdown.</param>
     /// <returns>A task that completes when the record has been processed or skipped.</returns>
     internal async Task HandleCommitRecordAsync(
-        JsonDocument record,
+        JsonElement record,
         string collection,
         BlueskyAgent blueskyAgent,
         CancellationToken cancellationToken
@@ -160,7 +177,7 @@ public sealed partial class JetStreamWatcherService(
     /// <param name="cancellationToken">Signals host shutdown.</param>
     /// <returns>A task that completes when the post has been processed.</returns>
     private async Task ProcessPostAsync(
-        JsonDocument record,
+        JsonElement record,
         BlueskyAgent blueskyAgent,
         CancellationToken cancellationToken
     ) {
@@ -202,11 +219,11 @@ public sealed partial class JetStreamWatcherService(
     /// <param name="cancellationToken">Signals host shutdown.</param>
     /// <returns>A task that completes when the repost has been processed.</returns>
     private async Task ProcessRepostAsync(
-        JsonDocument record,
+        JsonElement record,
         BlueskyAgent blueskyAgent,
         CancellationToken cancellationToken
     ) {
-        if (!record.RootElement.TryGetProperty( "subject", out JsonElement repostSubject )) {
+        if (!record.TryGetProperty( "subject", out JsonElement repostSubject )) {
             return;
         }
 
@@ -354,6 +371,8 @@ public sealed partial class JetStreamWatcherService(
             ? LookupKeyBuilder.TypedKey( lookupType, provider.Value, lookupValue )
             : LookupKeyBuilder.UrlKey( lookupValue );
         string sagaId = ISagaStateManager.GenerateSagaId( lookupKey );
+        LookupSagaState saga = await sagaManager.GetOrCreateAsync(
+            sagaId, lookupKey, lookupType, lookupValue, QueuePriority.Bulk, cancellationToken );
 
         // Create the lookup request with a saga ID for coordinating cross-provider lookups.
         // Bulk origin priority is persisted into the saga so secondary lookups spawned by
@@ -364,6 +383,7 @@ public sealed partial class JetStreamWatcherService(
             LookupType = lookupType,
             LookupValue = lookupValue,
             SagaId = sagaId,
+            SagaInstanceToken = saga.InstanceToken,
             IsAlbum = isAlbum,
             OriginPriority = QueuePriority.Bulk
         };

@@ -1,4 +1,5 @@
 using BridgeBeats.Core.Infrastructure.Playlists;
+using BridgeBeats.Core.Infrastructure.Settings;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
@@ -46,6 +47,9 @@ public class ApplicationDbContext(
     /// Gets or sets the set of transient ATProto OAuth state rows held during the authentication flow.
     /// </summary>
     public DbSet<AtProtoOAuthState> AtProtoOAuthStates { get; set; }
+
+    /// <summary>Gets the singleton database-backed application-settings record.</summary>
+    internal DbSet<ApplicationSettingsRecord> ApplicationSettings { get; set; }
 
     /// <summary>
     /// Registers the <see cref="ApplicationDbContextModelCacheKeyFactory"/> so that every
@@ -117,6 +121,26 @@ public class ApplicationDbContext(
                 .Property( u => u.AtProtoDPoPKey )
                 .HasConversion( encryptConverter );
         }
+
+        _ = builder.Entity<ApplicationSettingsRecord>( entity => {
+            _ = entity.ToTable(
+                "ApplicationSettings",
+                table => table.HasCheckConstraint( "CK_ApplicationSettings_Singleton", "\"Id\" = 1" )
+            );
+            _ = entity.HasKey( record => record.Id );
+            _ = entity.Property( record => record.Id ).ValueGeneratedNever( );
+            _ = entity.Property( record => record.SchemaVersion ).IsRequired( );
+            _ = entity.Property( record => record.ValuesJson ).IsRequired( );
+            _ = entity.Property( record => record.SecretsProtectionScheme )
+                .IsRequired( )
+                .HasMaxLength( 64 );
+            _ = entity.Property( record => record.ProtectedSecrets ).IsRequired( );
+            _ = entity.Property( record => record.Revision )
+                .IsRequired( )
+                .HasMaxLength( 32 )
+                .IsConcurrencyToken( );
+            _ = entity.Property( record => record.UpdatedAtUtc ).IsRequired( );
+        } );
 
         // Add indexes for performance
         _ = builder.Entity<ApplicationUser>( )

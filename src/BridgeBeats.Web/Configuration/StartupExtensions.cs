@@ -129,6 +129,7 @@ namespace BridgeBeats.Web.Configuration {
 
             ConfigureDatabases( services, settings );
             ConfigureIdentity( services, settings );
+            _ = services.AddDatabaseApplicationSettings( );
             ConfigureApiKeyAuth( services, settings );
             ConfigureSwagger( services );
 

@@ -124,12 +124,15 @@ The Discord integration runs as a separate worker service (`BridgeBeats.Worker.D
 | `REDIS_PORT` | Redis port | `6379` |
 | `IDENTITY_CONNECTION_STRING` | SQLite connection string for the identity database | `Data Source=/app/data/bridgebeats.db` |
 | `RATE_LIMIT_REQUESTS_PER_HOUR` | Rate-limited lookup requests permitted per user per hour | `20` |
+| `OAUTH_TRUSTED_PROXY_HOST` | DNS hostname of the proxy trusted to supply the client IP for OAuth login rate limits; only the resolved proxy address may supply `X-Forwarded-For` | `bridgebeats-caddy` |
 | `DOMAIN` | Base domain for the application (HTTPS certificates, cookie scope, OpenGraph card URLs) | `bridgebeats.link` (container default) |
 | `DATA_PROTECTION_KEY_PATH` | Directory where ASP.NET Data Protection keys are persisted | `/app/keys` |
 | `CARD_CACHE_EXPIRATION_HOURS` | Hours to cache OpenGraph cards in memory | `1` |
 | `CARD_CACHE_CLEANUP_INTERVAL` | Operations between cleanup cycles for expired cards | `500` |
 | `REFRESH_INTERVAL_HOURS` | Hours between stale-cache refresh sweeps | `24` |
 | `MAX_RECORDS_PER_RUN` | Maximum stale records re-enqueued per refresh sweep | `100` |
+
+`OAUTH_TRUSTED_PROXY_HOST` is used only for the Bluesky login-start rate limit. The application resolves that hostname periodically and accepts a single `X-Forwarded-For` IP only from the resolved proxy address. A custom proxy must overwrite any client-supplied `X-Forwarded-For` value, as the shipped Caddyfile does. Set this value to empty when there is no reverse proxy.
 
 > Note: `RATE_LIMIT_REQUESTS_PER_HOUR` defaults to `20` in the container entrypoint and application code. The shipped `.env.example` sets it to `100`; whichever value you place in `.env` wins for a Docker deployment.
 

@@ -81,10 +81,12 @@ internal static class BlueskyAuthenticationConfiguration {
         // PostConfigure runs after its registration, so this bound wins.
         _ = services.PostConfigure<HttpClientFactoryOptions>( "idunno.atproto", options =>
             options.HttpClientActions.Add( client => client.Timeout = TimeSpan.FromSeconds( 30 ) ) );
+        _ = services.AddSingleton( new OAuthLoginClientAddressResolver( settings.OAuthTrustedProxyHost ) );
+        _ = services.AddHostedService( provider => provider.GetRequiredService<OAuthLoginClientAddressResolver>( ) );
         _ = services.AddRateLimiter( options => {
             options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
             options.AddPolicy( LoginStartRateLimitPolicy, context =>
-                RateLimitPartition.GetFixedWindowLimiter( context.Connection.RemoteIpAddress?.ToString( ) ?? "unknown",
+                RateLimitPartition.GetFixedWindowLimiter( context.RequestServices.GetRequiredService<OAuthLoginClientAddressResolver>( ).GetPartitionKey( context ),
                     _ => new FixedWindowRateLimiterOptions {
                         PermitLimit = 60,
                         Window = TimeSpan.FromMinutes( 1 ),

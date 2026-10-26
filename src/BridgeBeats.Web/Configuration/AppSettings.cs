@@ -126,6 +126,12 @@ namespace BridgeBeats.Web.Configuration {
         /// </summary>
         public string ATProtoOAuthSigningKeyPath { get; set; } = string.Empty;
 
+        /// <summary>
+        /// DNS hostname of the reverse proxy trusted to supply X-Forwarded-For for OAuth login
+        /// rate limiting. Leave empty when the app is reached directly.
+        /// </summary>
+        public string OAuthTrustedProxyHost { get; set; } = string.Empty;
+
         /// <summary>Previous OAuth signing keys retained for refresh and revocation of existing sessions.</summary>
         public string[] ATProtoOAuthAdditionalSigningKeyPaths { get; set; } = [];
 

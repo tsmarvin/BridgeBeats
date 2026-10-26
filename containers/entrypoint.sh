@@ -100,6 +100,7 @@ if [ -z "$INTERNAL_SERVICE_KEY" ]; then
     exit 1
 fi
 RATE_LIMIT_REQUESTS_PER_HOUR="${RATE_LIMIT_REQUESTS_PER_HOUR:-20}"
+OAUTH_TRUSTED_PROXY_HOST="${OAUTH_TRUSTED_PROXY_HOST:-bridgebeats-caddy}"
 
 # Logging configuration
 LOG_DIR_PATH="${LOG_DIR_PATH:-/app/data/logs}"
@@ -157,6 +158,7 @@ cat > /src/BridgeBeats.Web/appsettings.json <<EOF
     "ApiKeySalt": "$API_KEY_SALT",
     "InternalServiceKey": "$INTERNAL_SERVICE_KEY",
     "RateLimitRequestsPerHour": $RATE_LIMIT_REQUESTS_PER_HOUR,
+    "OAuthTrustedProxyHost": "$OAUTH_TRUSTED_PROXY_HOST",
     "ATProtoIdentifier": "$ATPROTO_IDENTIFIER",
     "ATProtoUserDID": "$ATPROTO_USER_DID",
     "ATProtoPassword": "$ATPROTO_PASSWORD",
@@ -226,6 +228,7 @@ export ConnectionStrings__redis="$REDIS_CONNECTION_STRING"
 export Parameters__NodeNumber="$NODE_NUMBER"
 export Parameters__Domain="$DOMAIN"
 export Parameters__RateLimitRequestsPerHour="$RATE_LIMIT_REQUESTS_PER_HOUR"
+export Parameters__OAuthTrustedProxyHost="$OAUTH_TRUSTED_PROXY_HOST"
 export Parameters__CacheDays="$CACHE_DAYS"
 export Parameters__RefreshIntervalHours="$REFRESH_INTERVAL_HOURS"
 export Parameters__MaxRecordsPerRun="$MAX_RECORDS_PER_RUN"

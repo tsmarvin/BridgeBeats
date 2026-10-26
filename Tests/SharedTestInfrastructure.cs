@@ -1,3 +1,4 @@
+using BridgeBeats.Core.Infrastructure.Identity;
 using Testcontainers.Redis;
 
 namespace BridgeBeats.Tests;
@@ -18,6 +19,9 @@ public static class SharedTestInfrastructure {
     private static bool s_initialized;
     /// <summary>Holds the Docker error message when container startup fails, used in skip messages.</summary>
     private static string? s_dockerError;
+    private static string? s_oauthSigningKeyPath;
+    private static string? s_previousOAuthSigningKeyPath;
+    private const string OAuthSigningKeyEnvironmentVariable = "BridgeBeats__ATProtoOAuthSigningKeyPath";
 
     /// <summary>
     /// The connection string for the shared Redis container, or an empty string when Docker is
@@ -68,6 +72,12 @@ public static class SharedTestInfrastructure {
     /// <param name="_">The MSTest assembly-level test context (unused).</param>
     [AssemblyInitialize]
     public static void AssemblyInitialize( TestContext _ ) {
+        // WebApplicationFactory registers OAuth before its configuration overlay is applied.
+        // Supply a real test key through the process environment for the entire assembly run.
+        s_previousOAuthSigningKeyPath = Environment.GetEnvironmentVariable( OAuthSigningKeyEnvironmentVariable );
+        s_oauthSigningKeyPath = Path.Combine( Path.GetTempPath( ), $"BridgeBeats_Test_OAuth_{Guid.NewGuid():N}.json" );
+        File.WriteAllText( s_oauthSigningKeyPath, ATProtoSigningKeyProvider.GenerateNewSigningKeyJwk( ) );
+        Environment.SetEnvironmentVariable( OAuthSigningKeyEnvironmentVariable, s_oauthSigningKeyPath );
         // Trigger initialization early during assembly setup
         EnsureInitialized( );
     }
@@ -77,9 +87,16 @@ public static class SharedTestInfrastructure {
     /// </summary>
     [AssemblyCleanup]
     public static async Task AssemblyCleanup( ) {
-        if (s_redisContainer is not null) {
-            await s_redisContainer.StopAsync( CancellationToken.None );
-            await s_redisContainer.DisposeAsync( );
+        try {
+            if (s_redisContainer is not null) {
+                await s_redisContainer.StopAsync( CancellationToken.None );
+                await s_redisContainer.DisposeAsync( );
+            }
+        } finally {
+            Environment.SetEnvironmentVariable( OAuthSigningKeyEnvironmentVariable, s_previousOAuthSigningKeyPath );
+            if (s_oauthSigningKeyPath is not null) {
+                File.Delete( s_oauthSigningKeyPath );
+            }
         }
     }
 

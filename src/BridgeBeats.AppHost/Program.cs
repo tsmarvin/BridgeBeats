@@ -84,6 +84,8 @@ IResourceBuilder<ParameterResource> internalServiceKey = builder.AddParameter( "
 // Additional configuration parameters.
 IResourceBuilder<ParameterResource> nodeNumber               = builder.AddParameter( "NodeNumber" );
 IResourceBuilder<ParameterResource> domain                   = builder.AddParameter( "Domain" );
+IResourceBuilder<ParameterResource> oauthTrustedProxyHost    = builder.AddParameter( "OAuthTrustedProxyHost",
+    () => config["Parameters:OAuthTrustedProxyHost"] ?? "" );
 IResourceBuilder<ParameterResource> rateLimitRequestsPerHour = builder.AddParameter( "RateLimitRequestsPerHour" );
 IResourceBuilder<ParameterResource> cacheDays                = builder.AddParameter( "CacheDays" );
 IResourceBuilder<ParameterResource> identityConnectionString = builder.AddParameter( "IdentityConnectionString" );
@@ -387,6 +389,7 @@ if (isProduction) {
         .WithEnvironment( "BridgeBeats__ApiKeySalt", apiKeySalt )
         .WithEnvironment( "BridgeBeats__InternalServiceKey", internalServiceKey )
         .WithEnvironment( "BridgeBeats__Domain", domain )
+        .WithEnvironment( "BridgeBeats__OAuthTrustedProxyHost", oauthTrustedProxyHost )
         .WithEnvironment( "BridgeBeats__RateLimitRequestsPerHour", rateLimitRequestsPerHour )
         .WithEnvironment( "BridgeBeats__CacheDays", cacheDays )
         .WithEnvironment( "BridgeBeats__IdentityConnectionString", identityConnectionString )
@@ -416,6 +419,7 @@ if (isProduction) {
         .WithEnvironment( "BridgeBeats__ApiKeySalt", apiKeySalt )
         .WithEnvironment( "BridgeBeats__InternalServiceKey", internalServiceKey )
         .WithEnvironment( "BridgeBeats__Domain", domain )
+        .WithEnvironment( "BridgeBeats__OAuthTrustedProxyHost", oauthTrustedProxyHost )
         .WithEnvironment( "BridgeBeats__RateLimitRequestsPerHour", rateLimitRequestsPerHour )
         .WithEnvironment( "BridgeBeats__CacheDays", cacheDays )
         .WithEnvironment( "BridgeBeats__IdentityConnectionString", identityConnectionString )

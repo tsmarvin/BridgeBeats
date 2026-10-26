@@ -8,8 +8,12 @@ using idunno.Bluesky.AspNet.Authentication.SQLite;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Http;
+using Microsoft.Extensions.Http.Resilience;
 using OpenTelemetry.Metrics;
+using System.Threading.RateLimiting;
 
 namespace BridgeBeats.Web.Configuration;
 
@@ -19,13 +23,19 @@ internal static class BlueskyAuthenticationConfiguration {
     internal const string ClientMetadataPath = "/oauth-client-metadata.json";
     internal const string LegacyIdentityCookieName = ".AspNetCore.Identity.Application";
     internal const string UpgradedIdentityCookieName = "__Secure-BridgeBeats.Identity.v2";
+    internal const string LoginStartRateLimitPolicy = "bluesky-login-start";
+    internal const int LoginStartTimeoutSeconds = 30;
     private const string ValidatedPasswordCookie = "BridgeBeats.ValidatedPasswordCookie";
+    internal static readonly object PasswordSignInKey = new( );
 
     internal static IServiceCollection AddBridgeBeatsBluesky(
         this IServiceCollection services, AppSettings settings, string clientId, string domain
     ) {
-        OAuthClientSigningKey? signingKey = LoadSigningKey( settings.ATProtoOAuthSigningKeyPath, optional: true );
-        OAuthClientSigningKey[] previousKeys = [.. settings.ATProtoOAuthAdditionalSigningKeyPaths.Select( path => LoadSigningKey( path, optional: false )! )];
+        if (string.IsNullOrWhiteSpace( settings.ATProtoOAuthSigningKeyPath )) {
+            throw new InvalidOperationException( "BridgeBeats:ATProtoOAuthSigningKeyPath is required when Bluesky sign-in is enabled." );
+        }
+        OAuthClientSigningKey signingKey = LoadSigningKey( settings.ATProtoOAuthSigningKeyPath );
+        OAuthClientSigningKey[] previousKeys = [.. settings.ATProtoOAuthAdditionalSigningKeyPaths.Select( LoadSigningKey )];
         _ = services.Configure<BlueskyAgentOptions>( options => {
             options.EnableBackgroundTokenRefresh = false;
             options.OAuthOptions = new OAuthOptions(
@@ -58,6 +68,29 @@ internal static class BlueskyAuthenticationConfiguration {
             options.ExpireTimeSpan = TimeSpan.FromDays( 7 );
             options.SlidingExpiration = true;
             options.EventsType = typeof( BlueskyAccountEvents );
+        } );
+        // OAuth discovery follows untrusted handles. Bound each outbound request and exclude
+        // the app-wide retry policy, which otherwise honors multi-minute Retry-After delays.
+        // This .NET extension is currently marked experimental, but is the supported way
+        // to remove the inherited standard pipeline from a single named client.
+#pragma warning disable EXTEXP0001
+        _ = services.AddHttpClient( "idunno.atproto" )
+            .RemoveAllResilienceHandlers( );
+#pragma warning restore EXTEXP0001
+        // The SDK also configures this named client and sets a five-minute timeout.
+        // PostConfigure runs after its registration, so this bound wins.
+        _ = services.PostConfigure<HttpClientFactoryOptions>( "idunno.atproto", options =>
+            options.HttpClientActions.Add( client => client.Timeout = TimeSpan.FromSeconds( 30 ) ) );
+        _ = services.AddRateLimiter( options => {
+            options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+            options.AddPolicy( LoginStartRateLimitPolicy, context =>
+                RateLimitPartition.GetFixedWindowLimiter( context.Connection.RemoteIpAddress?.ToString( ) ?? "unknown",
+                    _ => new FixedWindowRateLimiterOptions {
+                        PermitLimit = 60,
+                        Window = TimeSpan.FromMinutes( 1 ),
+                        QueueLimit = 0,
+                        AutoReplenishment = true
+                    } ) );
         } );
         _ = services.AddOptions<BlueskyAuthenticationOptions>( BlueskyAuthenticationDefaults.AuthenticationScheme )
             .Configure<ILoggerFactory, IHttpContextAccessor>( ( options, loggerFactory, httpContextAccessor ) => {
@@ -92,6 +125,9 @@ internal static class BlueskyAuthenticationConfiguration {
             Func<CookieSigningInContext, Task> signIn = options.Events.OnSigningIn;
             options.Events.OnSigningIn = async context => {
                 DeleteLegacyHostOnlyIdentityCookie( context.HttpContext, options );
+                if (context.HttpContext.Items.ContainsKey( PasswordSignInKey )) {
+                    context.Properties.SetString( ValidatedPasswordCookie, "1" );
+                }
                 await signIn( context );
             };
             Func<CookieSigningOutContext, Task> signOut = options.Events.OnSigningOut;
@@ -122,10 +158,8 @@ internal static class BlueskyAuthenticationConfiguration {
     }
 
     // Keep existing installer-generated JWK secrets and their key IDs valid; PEM is also accepted.
-    internal static OAuthClientSigningKey? LoadSigningKey( string path, bool optional ) {
-        if (optional && string.IsNullOrWhiteSpace( path )) {
-            return null;
-        }
+    internal static OAuthClientSigningKey LoadSigningKey( string path ) {
+        ArgumentException.ThrowIfNullOrWhiteSpace( path );
         string contents = File.ReadAllText( path );
         if (string.IsNullOrWhiteSpace( contents ) || contents.Trim( ) == "{}") {
             throw new InvalidDataException( $"ATProto OAuth signing key file is empty: {path}" );

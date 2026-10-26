@@ -1,4 +1,5 @@
 using System.Diagnostics.Metrics;
+using System.Security.Claims;
 using System.Text.Encodings.Web;
 using idunno.Bluesky;
 using idunno.Bluesky.AspNet.Authentication;
@@ -17,7 +18,8 @@ internal sealed class BridgeBeatsBlueskyAuthenticationHandler(
     IMeterFactory meterFactory,
     UrlEncoder encoder,
     IHttpClientFactory httpClientFactory,
-    BlueskyAccountEvents accountEvents
+    BlueskyAccountEvents accountEvents,
+    BlueskySessionService sessions
 ) : BlueskyAuthenticationHandler( options, agentOptions, logger, meterFactory, encoder, httpClientFactory ) {
     private static readonly object s_rejectedCookie = new( );
 
@@ -40,6 +42,17 @@ internal sealed class BridgeBeatsBlueskyAuthenticationHandler(
         Context.Items[s_rejectedCookie] = Options.Cookie.Name;
         Options.CookieManager.DeleteCookie( Context, Options.Cookie.Name!, Options.Cookie.Build( Context ) );
     }
+
+    protected override Task HandleSignInAsync( ClaimsPrincipal user, AuthenticationProperties? properties ) {
+        // SDK v8 revokes the current DID before SigningIn runs. Preserve it until the new
+        // account has passed our authority and lockout checks and its browser row is stored.
+        Context.Items[s_rejectedCookie] = Options.Cookie.Name;
+        CurrentUserDid = null;
+        return base.HandleSignInAsync( user, properties );
+    }
+
+    protected override Task HandleSignOutAsync( AuthenticationProperties? properties ) =>
+        sessions.EndSessionAsync( Context, null );
 
     internal sealed class GuardedCookieManager( ICookieManager inner ) : ICookieManager {
         public string? GetRequestCookie( HttpContext context, string key ) =>

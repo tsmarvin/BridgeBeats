@@ -4,12 +4,14 @@ using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
 using BridgeBeats.Core.Infrastructure.Identity;
 using BridgeBeats.Web.Authentication;
+using BridgeBeats.Web.Configuration;
 using idunno.AtProto;
 using idunno.Bluesky.AspNet.Authentication;
 using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 
 namespace BridgeBeats.Web.Controllers;
@@ -141,6 +143,7 @@ public partial class AccountController(
         }
 
         // Sign in the user automatically with a cookie for web UI
+        HttpContext.Items[BlueskyAuthenticationConfiguration.PasswordSignInKey] = true;
         await signInManager.SignInAsync( user, isPersistent: false );
 
         LogUserRegistered( user.Id );
@@ -189,6 +192,7 @@ public partial class AccountController(
         // Sign in the user with a cookie for web UI
         await SignOutBlueskyAsync( );
         await ReloadLinkedAccountAsync( user );
+        HttpContext.Items[BlueskyAuthenticationConfiguration.PasswordSignInKey] = true;
         await signInManager.SignInAsync( user, isPersistent: false );
 
         // Generate new API key only if user doesn't have one
@@ -404,6 +408,7 @@ public partial class AccountController(
     /// <summary>Starts SDK-managed OAuth and sets its browser correlation cookie.</summary>
     [HttpPost]
     [ValidateAntiForgeryToken]
+    [EnableRateLimiting( BlueskyAuthenticationConfiguration.LoginStartRateLimitPolicy )]
     [Route( "account/login-atproto" )]
     public async Task<IActionResult> LoginWithAtProto(
         [FromBody] AtProtoLoginRequest request,
@@ -417,8 +422,10 @@ public partial class AccountController(
         }
         try {
             Handle handle = new( request.Handle.Trim( ).TrimStart( '@' ) );
+            using CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource( HttpContext.RequestAborted );
+            deadline.CancelAfter( TimeSpan.FromSeconds( BlueskyAuthenticationConfiguration.LoginStartTimeoutSeconds ) );
             Uri authorizationUrl = await blueskySignInManager.CreateRedirectUri(
-                handle, cancellationToken: HttpContext.RequestAborted );
+                handle, cancellationToken: deadline.Token );
             return Ok( new { authorizationUrl = authorizationUrl.ToString( ) } );
         } catch (Exception ex) when (ex is not OperationCanceledException || !HttpContext.RequestAborted.IsCancellationRequested) {
             LogAtProtoOAuthStartFailed( ex, request.Handle );

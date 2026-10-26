@@ -20,11 +20,11 @@ internal sealed class AuthenticationOrigin {
             ? value
             : $"https://{value}";
         if (!Uri.TryCreate( absoluteValue, UriKind.Absolute, out Uri? origin )) {
-            throw new InvalidOperationException( "BridgeBeats:Domain must be a host or HTTPS origin with an optional port and no path, query, or fragment." );
+            throw new InvalidOperationException( "BridgeBeats:Domain must be a host or HTTPS origin without a non-default port, path, query, or fragment." );
         }
 
         if (origin.Host.EndsWith( "..", StringComparison.Ordinal )) {
-            throw new InvalidOperationException( "BridgeBeats:Domain must be a host or HTTPS origin with an optional port and no path, query, or fragment." );
+            throw new InvalidOperationException( "BridgeBeats:Domain must be a host or HTTPS origin without a non-default port, path, query, or fragment." );
         }
         if (origin.Host.EndsWith( ".", StringComparison.Ordinal )) {
             origin = new UriBuilder( origin ) { Host = origin.Host[..^1] }.Uri;
@@ -35,9 +35,10 @@ internal sealed class AuthenticationOrigin {
             origin.AbsolutePath != "/" ||
             !string.IsNullOrEmpty( origin.Query ) ||
             !string.IsNullOrEmpty( origin.Fragment ) ||
+            !origin.IsDefaultPort ||
             !IsValidHost( origin.Host ) ||
             !HasValidPort( absoluteValue )) {
-            throw new InvalidOperationException( "BridgeBeats:Domain must be a host or HTTPS origin with an optional port and no path, query, or fragment." );
+            throw new InvalidOperationException( "BridgeBeats:Domain must be a host or HTTPS origin without a non-default port, path, query, or fragment." );
         }
 
         string? cookieDomain = Uri.CheckHostName( origin.Host ) == UriHostNameType.Dns &&

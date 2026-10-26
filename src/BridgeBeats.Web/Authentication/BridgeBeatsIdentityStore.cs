@@ -20,9 +20,14 @@ internal sealed class BridgeBeatsIdentityStore(
     ILoggerFactory loggerFactory
 ) : IIdentityStore {
     internal static readonly object ExpectedStampKey = new( );
+    internal static readonly object ExpectedBrowserSessionKey = new( );
+    internal sealed record BrowserSessionExpectation( string Did, string SessionId );
     private static readonly object s_observedSessions = new( );
     private static readonly TimeSpan s_entryLifetime = TimeSpan.FromDays( 7 );
+    private static readonly TimeSpan s_sweepInterval = TimeSpan.FromMinutes( 5 );
     private readonly SqliteIdentityStore _sdkStore = new( connectionString, loggerFactory: loggerFactory );
+    private readonly ILogger _logger = loggerFactory.CreateLogger<BridgeBeatsIdentityStore>( );
+    private long _lastSweepTicks;
 
     public IdentityStoreEvents Events {
         get => _sdkStore.Events;
@@ -69,6 +74,9 @@ internal sealed class BridgeBeatsIdentityStore(
               INSERT INTO "idunno_bluesky_identities" ("Did", "Identity", "ExpiresAtUtcTicks", "ProofKeyHash")
               SELECT @did, @identity, @expires, @proof
               WHERE EXISTS (SELECT 1 FROM AspNetUsers WHERE AtProtoDid = @did AND SecurityStamp = @stamp)
+                AND (@previousSession IS NULL OR EXISTS (
+                    SELECT 1 FROM "bridgebeats_bluesky_sessions"
+                    WHERE "SessionId" = @previousSession AND "Did" = @previousDid AND "ExpiresAtUtcTicks" > @now))
               ON CONFLICT("Did") DO UPDATE SET
                   "Identity" = excluded."Identity",
                   "ExpiresAtUtcTicks" = excluded."ExpiresAtUtcTicks",
@@ -83,16 +91,39 @@ internal sealed class BridgeBeatsIdentityStore(
         command.Parameters.Add( "@identity", SqliteType.Blob ).Value = setting.Identity.ToArray( );
         command.Parameters.Add( "@expires", SqliteType.Integer ).Value = DateTime.UtcNow.Add( s_entryLifetime ).Ticks;
         command.Parameters.Add( "@proof", SqliteType.Text ).Value = proofKeyHash;
+        command.Parameters.Add( "@now", SqliteType.Integer ).Value = DateTime.UtcNow.Ticks;
         if (add) {
             string expectedStamp = httpContextAccessor.HttpContext?.Items[ExpectedStampKey] as string
                 ?? throw new InvalidOperationException( "The Bluesky account binding was not verified before storing credentials." );
             command.Parameters.Add( "@stamp", SqliteType.Text ).Value = expectedStamp;
-        } else {
-            command.Parameters.Add( "@now", SqliteType.Integer ).Value = DateTime.UtcNow.Ticks;
+            BrowserSessionExpectation? previous = httpContextAccessor.HttpContext?.Items[ExpectedBrowserSessionKey]
+                as BrowserSessionExpectation;
+            command.Parameters.Add( "@previousSession", SqliteType.Text ).Value = (object?)previous?.SessionId ?? DBNull.Value;
+            command.Parameters.Add( "@previousDid", SqliteType.Text ).Value = (object?)previous?.Did ?? DBNull.Value;
         }
         int written = await command.ExecuteNonQueryAsync( cancellationToken );
         if (add && written == 0) {
             throw new InvalidOperationException( "The Bluesky account changed while sign-in was completing." );
+        }
+        if (written > 0) { await SweepExpiredAsync( connection ); }
+    }
+
+    private async Task SweepExpiredAsync( SqliteConnection connection ) {
+        long now = DateTime.UtcNow.Ticks;
+        long previous = Interlocked.Read( ref _lastSweepTicks );
+        if (now - previous < s_sweepInterval.Ticks ||
+            Interlocked.CompareExchange( ref _lastSweepTicks, now, previous ) != previous) { return; }
+        try {
+            await using SqliteCommand sweep = connection.CreateCommand( );
+            sweep.CommandText = """
+                                DELETE FROM "idunno_bluesky_identities" WHERE "ExpiresAtUtcTicks" <= @now;
+                                DELETE FROM "idunno_bluesky_refresh_locks" WHERE "ExpiresAtUtcTicks" <= @now;
+                                DELETE FROM "bridgebeats_bluesky_sessions" WHERE "ExpiresAtUtcTicks" <= @now;
+                                """;
+            sweep.Parameters.Add( "@now", SqliteType.Integer ).Value = now;
+            _ = await sweep.ExecuteNonQueryAsync( );
+        } catch (Exception ex) {
+            _logger.LogWarning( ex, "Expired Bluesky identity cleanup failed." );
         }
     }
 
@@ -107,6 +138,120 @@ internal sealed class BridgeBeatsIdentityStore(
 
     internal Task RemoveCurrentAsync( Did did, CancellationToken cancellationToken = default ) =>
         RemoveSessionAsync( did, expectedProof: null, requireMatch: false, cancellationToken );
+
+    internal async Task RegisterBrowserSessionAsync( Did did, string sessionId, DateTimeOffset expires,
+        CancellationToken cancellationToken = default ) {
+        await using SqliteConnection connection = new( connectionString );
+        await connection.OpenAsync( cancellationToken );
+        await using SqliteCommand register = connection.CreateCommand( );
+        register.CommandText = """
+                               INSERT INTO "bridgebeats_bluesky_sessions" ("SessionId", "Did", "ExpiresAtUtcTicks")
+                               SELECT @session, @did, @expires
+                               WHERE EXISTS (SELECT 1 FROM AspNetUsers WHERE AtProtoDid = @did AND SecurityStamp = @stamp)
+                                 AND EXISTS (SELECT 1 FROM "idunno_bluesky_identities" WHERE "Did" = @did)
+                                 AND (@previousSession IS NULL OR EXISTS (
+                                     SELECT 1 FROM "bridgebeats_bluesky_sessions"
+                                     WHERE "SessionId" = @previousSession AND "Did" = @previousDid AND "ExpiresAtUtcTicks" > @now));
+                               """;
+        register.Parameters.Add( "@session", SqliteType.Text ).Value = sessionId;
+        register.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
+        register.Parameters.Add( "@expires", SqliteType.Integer ).Value = expires.UtcTicks;
+        register.Parameters.Add( "@stamp", SqliteType.Text ).Value =
+            httpContextAccessor.HttpContext?.Items[ExpectedStampKey] as string
+            ?? throw new InvalidOperationException( "The Bluesky account binding was not verified before registering the browser." );
+        BrowserSessionExpectation? previous = httpContextAccessor.HttpContext?.Items[ExpectedBrowserSessionKey]
+            as BrowserSessionExpectation;
+        register.Parameters.Add( "@previousSession", SqliteType.Text ).Value = (object?)previous?.SessionId ?? DBNull.Value;
+        register.Parameters.Add( "@previousDid", SqliteType.Text ).Value = (object?)previous?.Did ?? DBNull.Value;
+        register.Parameters.Add( "@now", SqliteType.Integer ).Value = DateTime.UtcNow.Ticks;
+        if (await register.ExecuteNonQueryAsync( cancellationToken ) == 0) {
+            throw new InvalidOperationException( "The Bluesky account changed while sign-in was completing." );
+        }
+    }
+
+    internal async Task<bool> IsBrowserSessionCurrentAsync( Did did, string sessionId,
+        CancellationToken cancellationToken = default ) {
+        await using SqliteConnection connection = new( connectionString );
+        await connection.OpenAsync( cancellationToken );
+        await using SqliteCommand command = connection.CreateCommand( );
+        command.CommandText = """
+                              SELECT 1 FROM "bridgebeats_bluesky_sessions"
+                              WHERE "SessionId" = @session AND "Did" = @did AND "ExpiresAtUtcTicks" > @now;
+                              """;
+        command.Parameters.Add( "@session", SqliteType.Text ).Value = sessionId;
+        command.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
+        command.Parameters.Add( "@now", SqliteType.Integer ).Value = DateTime.UtcNow.Ticks;
+        return await command.ExecuteScalarAsync( cancellationToken ) is not null;
+    }
+
+    internal async Task<bool> ExtendBrowserSessionAsync( Did did, string sessionId, DateTimeOffset expires,
+        CancellationToken cancellationToken = default ) {
+        await using SqliteConnection connection = new( connectionString );
+        await connection.OpenAsync( cancellationToken );
+        await using SqliteTransaction transaction = (SqliteTransaction)await connection.BeginTransactionAsync( cancellationToken );
+        await using SqliteCommand command = connection.CreateCommand( );
+        command.Transaction = transaction;
+        command.CommandText = """
+                              UPDATE "bridgebeats_bluesky_sessions" SET "ExpiresAtUtcTicks" = @expires
+                              WHERE "SessionId" = @session AND "Did" = @did AND "ExpiresAtUtcTicks" > @now;
+                              """;
+        command.Parameters.Add( "@session", SqliteType.Text ).Value = sessionId;
+        command.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
+        command.Parameters.Add( "@expires", SqliteType.Integer ).Value = expires.UtcTicks;
+        command.Parameters.Add( "@now", SqliteType.Integer ).Value = DateTime.UtcNow.Ticks;
+        if (await command.ExecuteNonQueryAsync( cancellationToken ) == 0) {
+            await transaction.CommitAsync( cancellationToken );
+            return false;
+        }
+        await using SqliteCommand extendIdentity = connection.CreateCommand( );
+        extendIdentity.Transaction = transaction;
+        extendIdentity.CommandText = """
+                                     UPDATE "idunno_bluesky_identities" SET "ExpiresAtUtcTicks" = MAX("ExpiresAtUtcTicks", @expires)
+                                     WHERE "Did" = @did AND "ExpiresAtUtcTicks" > @now;
+                                     """;
+        extendIdentity.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
+        extendIdentity.Parameters.Add( "@expires", SqliteType.Integer ).Value = expires.UtcTicks;
+        extendIdentity.Parameters.Add( "@now", SqliteType.Integer ).Value = DateTime.UtcNow.Ticks;
+        bool extended = await extendIdentity.ExecuteNonQueryAsync( cancellationToken ) > 0;
+        await transaction.CommitAsync( cancellationToken );
+        return extended;
+    }
+
+    /// <returns>Whether this was the final active browser and its shared credential was removed.</returns>
+    internal async Task<bool> RemoveBrowserSessionAsync( Did did, string sessionId,
+        CancellationToken cancellationToken = default ) {
+        await using SqliteConnection connection = new( connectionString );
+        await connection.OpenAsync( cancellationToken );
+        await using SqliteTransaction transaction = (SqliteTransaction)await connection.BeginTransactionAsync( cancellationToken );
+        await using SqliteCommand remove = connection.CreateCommand( );
+        remove.Transaction = transaction;
+        remove.CommandText = "DELETE FROM \"bridgebeats_bluesky_sessions\" WHERE \"SessionId\" = @session AND \"Did\" = @did;";
+        remove.Parameters.Add( "@session", SqliteType.Text ).Value = sessionId;
+        remove.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
+        if (await remove.ExecuteNonQueryAsync( cancellationToken ) == 0) {
+            await transaction.CommitAsync( cancellationToken );
+            return false;
+        }
+        await using SqliteCommand remaining = connection.CreateCommand( );
+        remaining.Transaction = transaction;
+        remaining.CommandText = """
+                                SELECT 1 FROM "bridgebeats_bluesky_sessions"
+                                WHERE "Did" = @did AND "ExpiresAtUtcTicks" > @now LIMIT 1;
+                                """;
+        remaining.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
+        remaining.Parameters.Add( "@now", SqliteType.Integer ).Value = DateTime.UtcNow.Ticks;
+        bool last = await remaining.ExecuteScalarAsync( cancellationToken ) is null;
+        if (last) {
+            await using SqliteCommand removeIdentity = connection.CreateCommand( );
+            removeIdentity.Transaction = transaction;
+            removeIdentity.CommandText = "DELETE FROM \"idunno_bluesky_identities\" WHERE \"Did\" = @did;";
+            removeIdentity.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
+            _ = await removeIdentity.ExecuteNonQueryAsync( cancellationToken );
+            await UpdateConcurrencyStampAsync( connection, transaction, did, cancellationToken );
+        }
+        await transaction.CommitAsync( cancellationToken );
+        return last;
+    }
 
     private async Task RemoveSessionAsync( Did did, string? expectedProof, bool requireMatch, CancellationToken cancellationToken ) {
         ArgumentNullException.ThrowIfNull( did );
@@ -123,16 +268,40 @@ internal sealed class BridgeBeatsIdentityStore(
         if (expectedProof is not null) { remove.Parameters.Add( "@proof", SqliteType.Text ).Value = expectedProof; }
         int removed = await remove.ExecuteNonQueryAsync( cancellationToken );
         if (!requireMatch || removed > 0) {
-            await using SqliteCommand rotate = connection.CreateCommand( );
-            rotate.Transaction = transaction;
-            // Reject Identity updates that loaded the account before this session ended.
-            rotate.CommandText = "UPDATE AspNetUsers SET SecurityStamp = @stamp, ConcurrencyStamp = @concurrencyStamp WHERE AtProtoDid = @did;";
-            rotate.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
-            rotate.Parameters.Add( "@stamp", SqliteType.Text ).Value = Guid.NewGuid( ).ToString( "N" );
-            rotate.Parameters.Add( "@concurrencyStamp", SqliteType.Text ).Value = Guid.NewGuid( ).ToString( "N" );
-            _ = await rotate.ExecuteNonQueryAsync( cancellationToken );
+            await using SqliteCommand removeBrowsers = connection.CreateCommand( );
+            removeBrowsers.Transaction = transaction;
+            removeBrowsers.CommandText = "DELETE FROM \"bridgebeats_bluesky_sessions\" WHERE \"Did\" = @did;";
+            removeBrowsers.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
+            _ = await removeBrowsers.ExecuteNonQueryAsync( cancellationToken );
+            if (requireMatch) {
+                await UpdateConcurrencyStampAsync( connection, transaction, did, cancellationToken );
+            } else {
+                await RotateStampAsync( connection, transaction, did, cancellationToken );
+            }
         }
         await transaction.CommitAsync( cancellationToken );
+    }
+
+    private static async Task RotateStampAsync( SqliteConnection connection, SqliteTransaction transaction, Did did,
+        CancellationToken cancellationToken ) {
+        await using SqliteCommand rotate = connection.CreateCommand( );
+        rotate.Transaction = transaction;
+        // Global invalidation rejects tickets and Identity updates loaded before account revocation.
+        rotate.CommandText = "UPDATE AspNetUsers SET SecurityStamp = @stamp, ConcurrencyStamp = @concurrencyStamp WHERE AtProtoDid = @did;";
+        rotate.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
+        rotate.Parameters.Add( "@stamp", SqliteType.Text ).Value = Guid.NewGuid( ).ToString( "N" );
+        rotate.Parameters.Add( "@concurrencyStamp", SqliteType.Text ).Value = Guid.NewGuid( ).ToString( "N" );
+        _ = await rotate.ExecuteNonQueryAsync( cancellationToken );
+    }
+
+    private static async Task UpdateConcurrencyStampAsync( SqliteConnection connection, SqliteTransaction transaction,
+        Did did, CancellationToken cancellationToken ) {
+        await using SqliteCommand update = connection.CreateCommand( );
+        update.Transaction = transaction;
+        update.CommandText = "UPDATE AspNetUsers SET ConcurrencyStamp = @stamp WHERE AtProtoDid = @did;";
+        update.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
+        update.Parameters.Add( "@stamp", SqliteType.Text ).Value = Guid.NewGuid( ).ToString( "N" );
+        _ = await update.ExecuteNonQueryAsync( cancellationToken );
     }
 
     public Task<string?> StartRefresh( Did did, CancellationToken cancellationToken = default ) =>

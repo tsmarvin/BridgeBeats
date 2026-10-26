@@ -120,9 +120,9 @@ namespace BridgeBeats.Web.Configuration {
         }
 
         /// <summary>
-        /// Filesystem path to the JWK or PEM file holding the ATProto OAuth client signing key. When the
-        /// file is absent, empty, or <c>{}</c>, client-assertion signing is not configured and the ATProto
-        /// OAuth client operates as a public client.
+        /// Filesystem path to the JWK or PEM file holding the ATProto OAuth client signing key.
+        /// Required when <see cref="Domain"/> enables Bluesky sign-in; a missing, empty, or
+        /// placeholder file fails startup.
         /// </summary>
         public string ATProtoOAuthSigningKeyPath { get; set; } = string.Empty;
 

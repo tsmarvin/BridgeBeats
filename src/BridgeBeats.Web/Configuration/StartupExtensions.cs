@@ -14,6 +14,7 @@ using BridgeBeats.Web.Middleware;
 using BridgeBeats.Web.Services;
 using idunno.Bluesky.AspNet.Authentication;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.FileProviders;
@@ -270,9 +271,17 @@ namespace BridgeBeats.Web.Configuration {
                 await next( );
             } );
 
-            _ = app.UseStaticFiles( ); // Serve static files from wwwroot
+            _ = app.UseStaticFiles( new StaticFileOptions {
+                OnPrepareResponse = context => {
+                    // The asset tag helper changes this URL whenever file contents change.
+                    if (!string.IsNullOrEmpty( context.Context.Request.Query["v"] )) {
+                        context.Context.Response.Headers.CacheControl = "public, max-age=31536000, immutable";
+                    }
+                }
+            } );
             _ = app.UseRouting( );
             _ = app.UseCanonicalAuthenticationOrigin( AuthenticationOrigin.Parse( settings.Domain ) );
+            if (!string.IsNullOrWhiteSpace( settings.Domain )) { _ = app.UseRateLimiter( ); }
 
             // Restrict liveness endpoint access to internal requests only
             // NOTE: This middleware is intentionally placed before authentication because it uses IP-based authorization

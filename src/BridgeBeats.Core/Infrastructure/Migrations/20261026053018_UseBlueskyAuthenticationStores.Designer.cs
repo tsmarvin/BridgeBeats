@@ -11,7 +11,7 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace BridgeBeats.Core.Infrastructure.Migrations
 {
     [DbContext(typeof(ApplicationDbContext))]
-    [Migration("20261017042143_UseBlueskyAuthenticationStores")]
+    [Migration("20261026053018_UseBlueskyAuthenticationStores")]
     partial class UseBlueskyAuthenticationStores
     {
         /// <inheritdoc />

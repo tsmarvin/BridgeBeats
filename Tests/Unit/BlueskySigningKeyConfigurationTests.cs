@@ -22,13 +22,13 @@ public class BlueskySigningKeyConfigurationTests {
             File.WriteAllText( activePath, originalJwk );
             File.WriteAllText( previousPath, ATProtoSigningKeyProvider.GenerateNewSigningKeyJwk( ) );
             using JsonDocument source = JsonDocument.Parse( originalJwk );
-            OAuthClientSigningKey active = BlueskyAuthenticationConfiguration.LoadSigningKey( activePath, optional: false )!;
+            OAuthClientSigningKey active = BlueskyAuthenticationConfiguration.LoadSigningKey( activePath );
             Assert.AreEqual( source.RootElement.GetProperty( "kid" ).GetString( ), active.KeyId );
             OAuthOptions options = new( "https://bridgebeats.example/oauth-client-metadata.json",
                 new Uri( "https://bridgebeats.example/account/atproto-callback" ), ["atproto", "repo:link.bridgebeats.playlist"] ) {
                 ClientSigningKey = active
             };
-            options.AdditionalClientSigningKeys.Add( BlueskyAuthenticationConfiguration.LoadSigningKey( previousPath, optional: false )! );
+            options.AdditionalClientSigningKeys.Add( BlueskyAuthenticationConfiguration.LoadSigningKey( previousPath ) );
             string metadata = new BlueskyOAuthClientMetadataOptions( ).GenerateJson( options );
             using JsonDocument json = JsonDocument.Parse( metadata );
             Assert.AreEqual( "private_key_jwt", json.RootElement.GetProperty( "token_endpoint_auth_method" ).GetString( ) );
@@ -50,39 +50,47 @@ public class BlueskySigningKeyConfigurationTests {
         try {
             using ECDsa key = ECDsa.Create( ECCurve.NamedCurves.nistP256 );
             File.WriteAllText( path, key.ExportPkcs8PrivateKeyPem( ) );
-            Assert.IsNotNull( BlueskyAuthenticationConfiguration.LoadSigningKey( path, optional: false ) );
+            Assert.IsNotNull( BlueskyAuthenticationConfiguration.LoadSigningKey( path ) );
             File.Delete( path );
-            _ = Assert.ThrowsExactly<FileNotFoundException>( ( ) => BlueskyAuthenticationConfiguration.LoadSigningKey( path, optional: false ) );
-            _ = Assert.ThrowsExactly<FileNotFoundException>( ( ) => BlueskyAuthenticationConfiguration.LoadSigningKey( path, optional: true ) );
+            _ = Assert.ThrowsExactly<FileNotFoundException>( ( ) => BlueskyAuthenticationConfiguration.LoadSigningKey( path ) );
         } finally { File.Delete( path ); }
     }
 
     [TestMethod]
-    public void PublicClientRequiresUnsetPath_AndPlaceholderKeyFails( ) {
-        Assert.IsNull( BlueskyAuthenticationConfiguration.LoadSigningKey( string.Empty, optional: true ) );
+    public void MissingOrPlaceholderKey_FailsConfiguration( ) {
+        ServiceCollection services = new( );
+        AppSettings settings = new( ) { Domain = "bridgebeats.example" };
+        _ = Assert.ThrowsExactly<InvalidOperationException>( ( ) => services.AddBridgeBeatsBluesky( settings,
+            "https://bridgebeats.example/oauth-client-metadata.json", "https://bridgebeats.example" ) );
         string path = Path.GetTempFileName( );
         try {
             File.WriteAllText( path, "{}" );
-            _ = Assert.ThrowsExactly<InvalidDataException>( ( ) => BlueskyAuthenticationConfiguration.LoadSigningKey( path, optional: true ) );
+            _ = Assert.ThrowsExactly<InvalidDataException>( ( ) => BlueskyAuthenticationConfiguration.LoadSigningKey( path ) );
         } finally { File.Delete( path ); }
     }
 
     [TestMethod]
     public void ProductionBlueskyConfiguration_KeepsHttpsNonLoopbackTransportRestrictionsEnabled( ) {
-        ServiceCollection services = new( );
-        _ = services.AddLogging( );
-        AppSettings settings = new( ) {
-            Domain = "bridgebeats.example",
-            IdentityConnectionString = "Data Source=unused.db"
-        };
-        _ = services.AddBridgeBeatsBluesky( settings,
-            "https://bridgebeats.example/oauth-client-metadata.json", "https://bridgebeats.example" );
-        using ServiceProvider provider = services.BuildServiceProvider( );
+        string path = Path.GetTempFileName( );
+        try {
+            File.WriteAllText( path, ATProtoSigningKeyProvider.GenerateNewSigningKeyJwk( ) );
+            ServiceCollection services = new( );
+            _ = services.AddLogging( );
+            AppSettings settings = new( ) {
+                Domain = "bridgebeats.example",
+                IdentityConnectionString = "Data Source=unused.db",
+                ATProtoOAuthSigningKeyPath = path
+            };
+            _ = services.AddBridgeBeatsBluesky( settings,
+                "https://bridgebeats.example/oauth-client-metadata.json", "https://bridgebeats.example" );
+            using ServiceProvider provider = services.BuildServiceProvider( );
 
-        OAuthOptions oauth = provider.GetRequiredService<IOptionsMonitor<BlueskyAgentOptions>>( ).CurrentValue.OAuthOptions!;
-        Assert.AreEqual( "https://bridgebeats.example/account/atproto-callback", oauth.ReturnUri!.AbsoluteUri );
-        Assert.IsFalse( oauth.AllowInsecureProtocols );
-        Assert.IsFalse( oauth.AllowLoopback );
+            OAuthOptions oauth = provider.GetRequiredService<IOptionsMonitor<BlueskyAgentOptions>>( ).CurrentValue.OAuthOptions!;
+            Assert.AreEqual( "https://bridgebeats.example/account/atproto-callback", oauth.ReturnUri!.AbsoluteUri );
+            Assert.IsNotNull( oauth.ClientSigningKey );
+            Assert.IsFalse( oauth.AllowInsecureProtocols );
+            Assert.IsFalse( oauth.AllowLoopback );
+        } finally { File.Delete( path ); }
     }
 
 }

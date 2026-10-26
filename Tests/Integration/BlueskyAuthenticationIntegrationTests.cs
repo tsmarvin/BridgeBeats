@@ -261,6 +261,36 @@ public class BlueskyAuthenticationIntegrationTests {
     }
 
     [TestMethod]
+    public async Task SuccessfulCredentialWrite_CleansExpiredIdentitiesAndRefreshLocks( ) {
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        await using (SqliteConnection connection = new( connectionString )) {
+            await connection.OpenAsync( TestContext.CancellationToken );
+            await using SqliteCommand seed = connection.CreateCommand( );
+            seed.CommandText = """
+                               INSERT INTO "idunno_bluesky_identities" ("Did", "Identity", "ExpiresAtUtcTicks", "ProofKeyHash")
+                               VALUES (@did, X'00', @expired, 'old');
+                               INSERT INTO "idunno_bluesky_refresh_locks" ("Did", "LockToken", "ExpiresAtUtcTicks")
+                               VALUES (@did, 'old', @expired);
+                               """;
+            seed.Parameters.AddWithValue( "@did", OtherDidValue );
+            seed.Parameters.AddWithValue( "@expired", DateTime.UtcNow.AddMinutes( -1 ).Ticks );
+            _ = await seed.ExecuteNonQueryAsync( TestContext.CancellationToken );
+        }
+
+        _ = await SignInAsync( );
+
+        await using SqliteConnection check = new( connectionString );
+        await check.OpenAsync( TestContext.CancellationToken );
+        await using SqliteCommand count = check.CreateCommand( );
+        count.CommandText = """
+                            SELECT (SELECT COUNT(*) FROM "idunno_bluesky_identities" WHERE "Did" = @did) +
+                                   (SELECT COUNT(*) FROM "idunno_bluesky_refresh_locks" WHERE "Did" = @did);
+                            """;
+        count.Parameters.AddWithValue( "@did", OtherDidValue );
+        Assert.AreEqual( 0L, await count.ExecuteScalarAsync( TestContext.CancellationToken ) );
+    }
+
+    [TestMethod]
     public async Task Logout_RevokesAndRemovesStoredSession( ) {
         _ = await SignInAsync( );
         await AddAntiforgeryHeaderAsync( );
@@ -291,7 +321,7 @@ public class BlueskyAuthenticationIntegrationTests {
         await using (AsyncServiceScope check = _app.Services.CreateAsyncScope( )) {
             ApplicationUser persisted = await check.ServiceProvider.GetRequiredService<ApplicationDbContext>( ).Users
                 .SingleAsync( TestContext.CancellationToken );
-            Assert.AreNotEqual( originalSecurityStamp, persisted.SecurityStamp );
+            Assert.AreEqual( originalSecurityStamp, persisted.SecurityStamp );
             Assert.AreNotEqual( originalConcurrencyStamp, persisted.ConcurrencyStamp );
             Assert.AreNotEqual( staleUser.AtProtoHandle, persisted.AtProtoHandle );
         }
@@ -348,6 +378,7 @@ public class BlueskyAuthenticationIntegrationTests {
             _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
         }
 
+        if (!logoutFirst) { _ = _client.DefaultRequestHeaders.Remove( "Cookie" ); }
         using HttpResponseMessage replacementLogin = await SignInAsync( );
         string replacementCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
         Assert.AreEqual( userId, await LocalUserIdAsync( ) );
@@ -380,6 +411,46 @@ public class BlueskyAuthenticationIntegrationTests {
         JsonElement current = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
         Assert.IsTrue( current.GetProperty( "authenticated" ).GetBoolean( ) );
         Assert.AreEqual( userId, current.GetProperty( "userId" ).GetString( ) );
+    }
+
+    [TestMethod]
+    public async Task LogoutOnOneBrowser_KeepsOtherBrowserSignedIn( ) {
+        _ = await SignInAsync( );
+        string firstCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _ = await SignInAsync( );
+        await AddAntiforgeryHeaderAsync( );
+
+        using HttpResponseMessage logout = await _client.PostAsync( "/account/logout", null, TestContext.CancellationToken );
+
+        Assert.AreEqual( HttpStatusCode.OK, logout.StatusCode );
+        Assert.AreEqual( 0, _oauth.Revocations );
+        Assert.IsNotNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", firstCookie );
+        JsonElement firstBrowser = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( firstBrowser.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.IsTrue( firstBrowser.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+    }
+
+    [TestMethod]
+    public async Task StaleBrowserLogout_CannotRevokeNewLogin( ) {
+        _ = await SignInAsync( );
+        string oldCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        AuthenticationTicket oldTicket = Options( ).TicketDataFormat.Unprotect( oldCookie.Split( '=', 2 )[1] )!;
+        await AddAntiforgeryHeaderAsync( );
+        using HttpResponseMessage logout = await _client.PostAsync( "/account/logout", null, TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.OK, logout.StatusCode );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _ = await SignInAsync( );
+        int revocations = _oauth.Revocations;
+
+        await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
+        await scope.ServiceProvider.GetRequiredService<BlueskySessionService>( ).EndReplacedSessionAsync( oldTicket );
+
+        Assert.AreEqual( revocations, _oauth.Revocations );
+        JsonElement current = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( current.GetProperty( "authenticated" ).GetBoolean( ) );
     }
 
     [TestMethod]
@@ -466,6 +537,64 @@ public class BlueskyAuthenticationIntegrationTests {
     }
 
     [TestMethod]
+    public async Task PasswordLoginOnOneBrowser_KeepsOtherBlueskyBrowserSignedIn( ) {
+        await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
+            ApplicationUser user = new( ) { UserName = "password@example.com", Email = "password@example.com" };
+            Assert.IsTrue( (await scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>( )
+                .CreateAsync( user, "ValidPassword123!" )).Succeeded );
+        }
+        _ = await SignInAsync( );
+        string firstCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _ = await SignInAsync( );
+        await AddAntiforgeryHeaderAsync( );
+
+        using HttpResponseMessage login = await _client.PostAsJsonAsync( "/account/login",
+            new { email = "password@example.com", password = "ValidPassword123!" }, TestContext.CancellationToken );
+
+        Assert.AreEqual( HttpStatusCode.OK, login.StatusCode );
+        Assert.AreEqual( 0, _oauth.Revocations );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", firstCookie );
+        JsonElement firstBrowser = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( firstBrowser.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.IsTrue( firstBrowser.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+    }
+
+    [TestMethod]
+    public async Task LastBlueskyLogout_KeepsLinkedPasswordBrowserSignedIn( ) {
+        await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
+            ApplicationUser user = new( ) {
+                UserName = "linked@example.com", Email = "linked@example.com", AtProtoDid = DidValue
+            };
+            Assert.IsTrue( (await scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>( )
+                .CreateAsync( user, "ValidPassword123!" )).Succeeded );
+        }
+        _ = await SignInAsync( );
+        string blueskyCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        await AddAntiforgeryHeaderAsync( );
+        using HttpResponseMessage passwordLogin = await _client.PostAsJsonAsync( "/account/login",
+            new { email = "linked@example.com", password = "ValidPassword123!" }, TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.OK, passwordLogin.StatusCode );
+        string identityName = _app.Services.GetRequiredService<IOptionsMonitor<Microsoft.AspNetCore.Authentication.Cookies.CookieAuthenticationOptions>>( )
+            .Get( IdentityConstants.ApplicationScheme ).Cookie.Name!;
+        string passwordCookie = passwordLogin.Headers.GetValues( "Set-Cookie" )
+            .Last( value => value.StartsWith( identityName + "=", StringComparison.Ordinal ) ).Split( ';' )[0];
+
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", blueskyCookie );
+        await AddAntiforgeryHeaderAsync( );
+        using HttpResponseMessage blueskyLogout = await _client.PostAsync( "/account/logout", null, TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.OK, blueskyLogout.StatusCode );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", passwordCookie );
+        JsonElement passwordBrowser = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( passwordBrowser.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.IsFalse( passwordBrowser.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+    }
+
+    [TestMethod]
     public async Task PasswordLogin_ForLinkedAccount_UsesRotatedStampAndPersistsNewApiKey( ) {
         await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
             ApplicationUser user = new( ) {
@@ -515,20 +644,9 @@ public class BlueskyAuthenticationIntegrationTests {
     }
 
     [TestMethod]
-    [DataRow( false, true )]
-    [DataRow( true, true )]
-    [DataRow( false, false )]
-    public async Task LoginStartAndCallback_CompleteOAuthAndConsumeSqliteCorrelationState( bool existingAccount, bool confidentialClient ) {
-        if (!confidentialClient) {
-            _oauth.ExpectConfidentialClient = false;
-            foreach (BlueskyAgentOptions agentOptions in new[] {
-                _app.Services.GetRequiredService<IOptionsMonitor<BlueskyAgentOptions>>( ).CurrentValue,
-                _app.Services.GetRequiredService<IOptions<BlueskyAgentOptions>>( ).Value
-            }) {
-                agentOptions.OAuthOptions!.ClientSigningKey = null;
-                agentOptions.OAuthOptions.AdditionalClientSigningKeys.Clear( );
-            }
-        }
+    [DataRow( false )]
+    [DataRow( true )]
+    public async Task LoginStartAndCallback_CompleteOAuthAndConsumeSqliteCorrelationState( bool existingAccount ) {
         string? existingId = null;
         if (existingAccount) {
             await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
@@ -564,12 +682,8 @@ public class BlueskyAuthenticationIntegrationTests {
         Assert.AreEqual( 0L, await CorrelationStateCountAsync( ) );
         string cookie = result.Headers.GetValues( "Set-Cookie" )
             .Single( c => c.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=", StringComparison.Ordinal ) ).Split( ';' )[0];
-        if (confidentialClient) {
-            Assert.IsTrue( _oauth.ClientAssertionKeyIds.TryPeek( out string? firstKey ) );
-            Assert.AreEqual( _clientSigningKeyId, firstKey, "New sessions must use the active signing key." );
-        } else {
-            Assert.IsEmpty( _oauth.ClientAssertionKeyIds );
-        }
+        Assert.IsTrue( _oauth.ClientAssertionKeyIds.TryPeek( out string? firstKey ) );
+        Assert.AreEqual( _clientSigningKeyId, firstKey, "New sessions must use the active signing key." );
         string id = await LocalUserIdAsync( );
         if (existingAccount) {
             Assert.AreEqual( existingId, id );
@@ -670,6 +784,60 @@ public class BlueskyAuthenticationIntegrationTests {
     }
 
     [TestMethod]
+    public async Task RejectedDifferentDidCallback_PreservesCurrentBrowserSession( ) {
+        _ = await SignInAsync( );
+        string firstCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        _oauth.TokenSubjectDid = OtherDidValue;
+        _oauth.TokenFactory = ( ) => CreateCredentials( DateTime.UtcNow.AddHours( 1 ), did: OtherDidValue ).AccessJwt;
+        string callback = await PrepareOAuthCallbackAsync( );
+
+        using HttpResponseMessage rejected = await _client.GetAsync( callback, TestContext.CancellationToken );
+
+        Assert.AreEqual( "/account/login", new Uri( _client.BaseAddress!, rejected.Headers.Location! ).AbsolutePath );
+        Assert.AreEqual( 0, _oauth.Revocations );
+        Assert.IsNotNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", firstCookie );
+        JsonElement firstBrowser = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( firstBrowser.GetProperty( "authenticated" ).GetBoolean( ) );
+    }
+
+    [TestMethod]
+    public async Task SwitchingAccountsOnOneBrowser_KeepsOtherBrowsersSession( ) {
+        _ = await SignInAsync( );
+        string firstCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _ = await SignInAsync( );
+        string replacedCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        _oauth.OtherDidPds = _service;
+        _oauth.TokenSubjectDid = OtherDidValue;
+        _oauth.TokenFactory = ( ) => CreateCredentials( DateTime.UtcNow.AddHours( 1 ), did: OtherDidValue ).AccessJwt;
+        string callback = await PrepareOAuthCallbackAsync( );
+
+        using HttpResponseMessage switched = await _client.GetAsync( callback, TestContext.CancellationToken );
+
+        Assert.AreEqual( HttpStatusCode.Redirect, switched.StatusCode );
+        Assert.AreEqual( "/", new Uri( _client.BaseAddress!, switched.Headers.Location! ).AbsolutePath );
+        string newCookie = switched.Headers.GetValues( "Set-Cookie" )
+            .Single( cookie => cookie.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=", StringComparison.Ordinal ) ).Split( ';' )[0];
+        Assert.AreEqual( 0, _oauth.Revocations );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", firstCookie );
+        JsonElement firstBrowser = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( firstBrowser.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.AreEqual( DidValue, firstBrowser.GetProperty( "did" ).GetString( ) );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", replacedCookie );
+        JsonElement replacedBrowser = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsFalse( replacedBrowser.GetProperty( "authenticated" ).GetBoolean( ) );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", newCookie );
+        JsonElement newBrowser = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( newBrowser.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.AreEqual( OtherDidValue, newBrowser.GetProperty( "did" ).GetString( ) );
+    }
+
+    [TestMethod]
     public async Task LogoutBetweenCallbackBindingAndStoreWrite_RejectsInFlightLogin( ) {
         _ = await SignInAsync( );
         string oldCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
@@ -687,6 +855,32 @@ public class BlueskyAuthenticationIntegrationTests {
         _client.DefaultRequestHeaders.Add( "Cookie", oldCookie );
         JsonElement who = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
         Assert.IsFalse( who.GetProperty( "authenticated" ).GetBoolean( ) );
+    }
+
+    [TestMethod]
+    public async Task BrowserLogoutDuringCallback_RejectsStaleReplacementWithoutRotatingAccountStamp( ) {
+        _ = await SignInAsync( );
+        string oldCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        AuthenticationTicket oldTicket = Options( ).TicketDataFormat.Unprotect( oldCookie.Split( '=', 2 )[1] )!;
+        string originalStamp;
+        await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
+            originalStamp = (await scope.ServiceProvider.GetRequiredService<ApplicationDbContext>( ).Users
+                .SingleAsync( TestContext.CancellationToken )).SecurityStamp!;
+        }
+        string callback = await PrepareOAuthCallbackAsync( );
+        Options( ).IdentityStore!.Events.OnStoring = async _ => {
+            await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
+            await scope.ServiceProvider.GetRequiredService<BlueskySessionService>( ).EndReplacedSessionAsync( oldTicket );
+        };
+
+        using HttpResponseMessage response = await _client.GetAsync( callback, TestContext.CancellationToken );
+
+        Assert.AreEqual( "/account/login", new Uri( _client.BaseAddress!, response.Headers.Location! ).AbsolutePath );
+        await using AsyncServiceScope check = _app.Services.CreateAsyncScope( );
+        ApplicationUser user = await check.ServiceProvider.GetRequiredService<ApplicationDbContext>( ).Users
+            .SingleAsync( TestContext.CancellationToken );
+        Assert.AreEqual( originalStamp, user.SecurityStamp );
+        Assert.IsNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
     }
 
     [TestMethod]
@@ -1304,6 +1498,8 @@ public class BlueskyAuthenticationIntegrationTests {
         } );
         _ = await db.SaveChangesAsync( TestContext.CancellationToken );
         _ = await db.Database.ExecuteSqlRawAsync( "UPDATE AspNetUsers SET AtProtoRefreshToken = 'legacy-refresh-token'", TestContext.CancellationToken );
+        string[] pending = [.. await db.Database.GetPendingMigrationsAsync( TestContext.CancellationToken )];
+        CollectionAssert.AreEqual( new[] { "20261026053018_UseBlueskyAuthenticationStores" }, pending );
         await db.Database.MigrateAsync( TestContext.CancellationToken );
         db.ChangeTracker.Clear( );
         ApplicationUser saved = await db.Users.SingleAsync( TestContext.CancellationToken );
@@ -1315,6 +1511,12 @@ public class BlueskyAuthenticationIntegrationTests {
         using System.Data.Common.DbCommand command = db.Database.GetDbConnection( ).CreateCommand( );
         command.CommandText = "SELECT count(*) FROM pragma_table_info('AspNetUsers') WHERE name = 'AtProtoRefreshToken'";
         Assert.AreEqual( 0L, await command.ExecuteScalarAsync( TestContext.CancellationToken ) );
+        command.CommandText = """
+                              SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN
+                              ('idunno_bluesky_identities', 'idunno_bluesky_refresh_locks',
+                               'idunno_bluesky_correlation_states', 'bridgebeats_bluesky_sessions')
+                              """;
+        Assert.AreEqual( 4L, await command.ExecuteScalarAsync( TestContext.CancellationToken ) );
     }
 
     [TestMethod]
@@ -1508,6 +1710,10 @@ public class BlueskyAuthenticationIntegrationTests {
             .Get( IdentityConstants.ApplicationScheme ).Cookie.Name!;
         Assert.AreEqual( BlueskyAuthenticationConfiguration.LegacyIdentityCookieName, cookieName );
         string cookie = result.Headers.GetValues( "Set-Cookie" ).Last( c => c.StartsWith( cookieName + "=", StringComparison.Ordinal ) ).Split( ';' )[0];
+        var cookieOptions = _app.Services.GetRequiredService<IOptionsMonitor<Microsoft.AspNetCore.Authentication.Cookies.CookieAuthenticationOptions>>( )
+            .Get( IdentityConstants.ApplicationScheme );
+        AuthenticationTicket issuedTicket = cookieOptions.TicketDataFormat.Unprotect( cookie.Split( '=', 2 )[1] )!;
+        Assert.AreEqual( "1", issuedTicket.Properties.GetString( "BridgeBeats.ValidatedPasswordCookie" ) );
         _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
         _client.DefaultRequestHeaders.Add( "Cookie", cookie );
         using HttpResponseMessage firstRequest = await _client.GetAsync( "/test/who", TestContext.CancellationToken );
@@ -1515,14 +1721,8 @@ public class BlueskyAuthenticationIntegrationTests {
         Assert.IsTrue( who.GetProperty( "authenticated" ).GetBoolean( ) );
         Assert.AreEqual( await LocalUserIdAsync( ), who.GetProperty( "userId" ).GetString( ) );
         Assert.IsFalse( who.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
-        string renewed = firstRequest.Headers.GetValues( "Set-Cookie" )
-            .Last( value => value.StartsWith( cookieName + "=", StringComparison.Ordinal ) ).Split( ';' )[0];
-        var cookieOptions = _app.Services.GetRequiredService<IOptionsMonitor<Microsoft.AspNetCore.Authentication.Cookies.CookieAuthenticationOptions>>( )
-            .Get( IdentityConstants.ApplicationScheme );
-        AuthenticationTicket renewedTicket = cookieOptions.TicketDataFormat.Unprotect( renewed.Split( '=', 2 )[1] )!;
-        Assert.AreEqual( "1", renewedTicket.Properties.GetString( "BridgeBeats.ValidatedPasswordCookie" ) );
-        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
-        _client.DefaultRequestHeaders.Add( "Cookie", renewed );
+        Assert.IsFalse( firstRequest.Headers.TryGetValues( "Set-Cookie", out IEnumerable<string>? firstUpdates ) &&
+                        firstUpdates.Any( value => value.StartsWith( cookieName + "=", StringComparison.Ordinal ) ) );
         using HttpResponseMessage nextRequest = await _client.GetAsync( "/test/who", TestContext.CancellationToken );
         Assert.IsFalse( nextRequest.Headers.TryGetValues( "Set-Cookie", out IEnumerable<string>? updates ) &&
                         updates.Any( value => value.StartsWith( cookieName + "=", StringComparison.Ordinal ) ) );
@@ -1763,6 +1963,7 @@ public class BlueskyAuthenticationIntegrationTests {
         private int _codeExchanges;
         public string Service { get; set; } = null!;
         public string? AuthoritativeServer { get; set; }
+        public string? OtherDidPds { get; set; }
         public Func<string> TokenFactory { get; set; } = null!;
         public string TokenSubjectDid { get; set; } = DidValue;
         public int Refreshes => _refreshes;
@@ -1772,7 +1973,6 @@ public class BlueskyAuthenticationIntegrationTests {
         public string? LoginHint { get; set; }
         public bool RevocationFails { get; set; }
         public bool ProtectedResourceDiscoveryFails { get; set; }
-        public bool ExpectConfidentialClient { get; set; } = true;
         public Func<CancellationToken, Task<JsonElement>> MetadataRetriever { get; set; } = null!;
         public ConcurrentQueue<string> ClientAssertionKeyIds { get; } = new( );
         public string? LastAssertionValidationFailure { get; set; }
@@ -1786,7 +1986,7 @@ public class BlueskyAuthenticationIntegrationTests {
                 body = new {
                     id = did,
                     alsoKnownAs = new[] { "at://first.example" },
-                    service = new[] { new { id = "#atproto_pds", type = "AtprotoPersonalDataServer", serviceEndpoint = did == DidValue ? Service : "https://other-pds.example" } }
+                    service = new[] { new { id = "#atproto_pds", type = "AtprotoPersonalDataServer", serviceEndpoint = did == DidValue ? Service : OtherDidPds ?? "https://other-pds.example" } }
                 };
             } else if (path == "/par") {
                 Dictionary<string, string> parameters = ParseParameters( await request.Content!.ReadAsStringAsync( cancellationToken ) );
@@ -1867,10 +2067,6 @@ public class BlueskyAuthenticationIntegrationTests {
         }
 
         private async Task ValidateClientAssertionAsync( Dictionary<string, string> parameters, CancellationToken cancellationToken ) {
-            if (!ExpectConfidentialClient) {
-                Assert.IsFalse( parameters.ContainsKey( "client_assertion" ) );
-                return;
-            }
             Assert.IsTrue( parameters.TryGetValue( "client_assertion_type", out string? assertionType ) );
             Assert.AreEqual( "urn:ietf:params:oauth:client-assertion-type:jwt-bearer", assertionType );
             Assert.IsTrue( parameters.TryGetValue( "client_assertion", out string? assertion ) );

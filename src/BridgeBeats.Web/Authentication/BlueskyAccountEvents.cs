@@ -3,6 +3,7 @@ using BridgeBeats.Core.Infrastructure.Identity;
 using idunno.AtProto;
 using idunno.AtProto.Authentication;
 using idunno.Bluesky;
+using idunno.Bluesky.AspNet.Authentication;
 using idunno.Bluesky.AspNet.Authentication.Events;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Identity;
@@ -21,6 +22,7 @@ public sealed partial class BlueskyAccountEvents(
     IUserClaimsPrincipalFactory<ApplicationUser> principalFactory,
     IDidHandleResolver handleResolver,
     IOptionsMonitor<BlueskyAgentOptions> agentOptions,
+    IOptionsMonitor<BlueskyAuthenticationOptions> authenticationOptions,
     IHttpClientFactory httpClients,
     IMemoryCache principalCache,
     BlueskySessionService sessions,
@@ -28,7 +30,9 @@ public sealed partial class BlueskyAccountEvents(
 ) : BlueskyAuthenticationEvents {
     internal const string UserIdProperty = "BridgeBeats.UserId";
     internal const string SecurityStampProperty = "BridgeBeats.SecurityStamp";
+    internal const string BrowserSessionProperty = "BridgeBeats.BrowserSession";
     private static readonly object s_verifiedUser = new( );
+    private static readonly object s_verifiedTicket = new( );
 
     /// <inheritdoc/>
     public override async Task SigningIn( BlueskySigningInContext context ) {
@@ -83,12 +87,18 @@ public sealed partial class BlueskyAccountEvents(
             user.AtProtoHandle = verifiedHandle;
             EnsureSucceeded( await users.UpdateAsync( user ) );
         }
-        // The shared DID identity lets existing browsers keep working after a login elsewhere.
-        // Removing that identity rotates the stamp, so logout still invalidates every old ticket.
+        // The DID identity is shared, while this protected reference identifies one browser.
         context.Properties.SetString( UserIdProperty, user.Id );
         string stamp = await users.GetSecurityStampAsync( user );
         context.Properties.SetString( SecurityStampProperty, stamp );
+        context.Properties.SetString( BrowserSessionProperty, Guid.NewGuid( ).ToString( "N" ) );
         context.HttpContext.Items[BridgeBeatsIdentityStore.ExpectedStampKey] = stamp;
+        if (GetVerifiedTicket( context.HttpContext ) is { } previous &&
+            previous.Principal.FindFirstValue( AtProtoClaims.Did ) is { } previousDid &&
+            previous.Properties.GetString( BrowserSessionProperty ) is { } previousSessionId) {
+            context.HttpContext.Items[BridgeBeatsIdentityStore.ExpectedBrowserSessionKey] =
+                new BridgeBeatsIdentityStore.BrowserSessionExpectation( previousDid, previousSessionId );
+        }
         context.Properties.IsPersistent = false;
         await context.HttpContext.SignOutAsync( IdentityConstants.ApplicationScheme );
         if (created) { LogAccountCreated( logger, user.Id ); }
@@ -96,10 +106,33 @@ public sealed partial class BlueskyAccountEvents(
     }
 
     /// <inheritdoc/>
+    public override async Task SignedIn( BlueskySignedInContext context ) {
+        string did = context.Principal?.FindFirstValue( AtProtoClaims.Did )
+            ?? throw new InvalidOperationException( "The Bluesky identity has no DID." );
+        string sessionId = context.Properties.GetString( BrowserSessionProperty )
+            ?? throw new InvalidOperationException( "The Bluesky browser session is missing." );
+        DateTimeOffset expires = context.Properties.ExpiresUtc
+            ?? throw new InvalidOperationException( "The Bluesky browser session has no expiry." );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)authenticationOptions
+            .Get( BlueskyAuthenticationDefaults.AuthenticationScheme ).IdentityStore!;
+        await store.RegisterBrowserSessionAsync( new Did( did ), sessionId, expires, context.HttpContext.RequestAborted );
+        if (GetVerifiedTicket( context.HttpContext ) is { } replaced) {
+            await sessions.EndReplacedSessionAsync( replaced );
+        }
+    }
+
+    /// <inheritdoc/>
     public override async Task CheckSlidingExpiration( BlueskySlidingExpirationContext context ) {
         if (context.ShouldRenew) {
             ApplicationUser? user = await FindUserAsync( context.Principal, context.HttpContext );
             context.ShouldRenew = user is not null && await HasCurrentAccountBindingAsync( user, context.Properties );
+            if (context.ShouldRenew && user?.AtProtoDid is { } did &&
+                context.Properties.GetString( BrowserSessionProperty ) is { } sessionId) {
+                BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)authenticationOptions
+                    .Get( BlueskyAuthenticationDefaults.AuthenticationScheme ).IdentityStore!;
+                context.ShouldRenew = await store.ExtendBrowserSessionAsync( new Did( did ), sessionId,
+                    DateTimeOffset.UtcNow.Add( context.Options.ExpireTimeSpan ), context.HttpContext.RequestAborted );
+            }
         }
     }
 
@@ -154,17 +187,23 @@ public sealed partial class BlueskyAccountEvents(
             return false;
         }
         context.Items[s_verifiedUser] = user;
+        context.Items[s_verifiedTicket] = ticket;
         return true;
     }
 
-    internal static string? GetVerifiedDid( HttpContext context ) =>
-        context.Items.TryGetValue( s_verifiedUser, out object? user ) && user is ApplicationUser verified
-            ? verified.AtProtoDid : null;
+    internal static AuthenticationTicket? GetVerifiedTicket( HttpContext context ) =>
+        context.Items.TryGetValue( s_verifiedTicket, out object? ticket ) ? ticket as AuthenticationTicket : null;
 
-    private async Task<bool> HasCurrentAccountBindingAsync( ApplicationUser user, AuthenticationProperties properties ) =>
-        properties.GetString( UserIdProperty ) == user.Id &&
-        properties.GetString( SecurityStampProperty ) is { Length: > 0 } stamp &&
-        stamp == await users.GetSecurityStampAsync( user );
+    private async Task<bool> HasCurrentAccountBindingAsync( ApplicationUser user, AuthenticationProperties properties ) {
+        if (properties.GetString( UserIdProperty ) != user.Id ||
+            properties.GetString( SecurityStampProperty ) is not { Length: > 0 } stamp ||
+            stamp != await users.GetSecurityStampAsync( user ) ||
+            properties.GetString( BrowserSessionProperty ) is not { Length: > 0 } sessionId ||
+            user.AtProtoDid is null) { return false; }
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)authenticationOptions
+            .Get( BlueskyAuthenticationDefaults.AuthenticationScheme ).IdentityStore!;
+        return await store.IsBrowserSessionCurrentAsync( new Did( user.AtProtoDid ), sessionId );
+    }
 
     private static void EnsureSucceeded( IdentityResult result ) {
         if (!result.Succeeded) {

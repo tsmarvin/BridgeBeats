@@ -8,7 +8,9 @@ namespace BridgeBeats.Core.Infrastructure.Migrations {
     public partial class UseBlueskyAuthenticationStores : Migration {
         /// <inheritdoc />
         protected override void Up( MigrationBuilder migrationBuilder ) {
-            // SDK v8.0.0 SQLite schema. The SDK owns these tables; EF owns their deployment lifecycle.
+            // Based on SDK v8.0.0 SQLite schema, with BridgeBeats' ProofKeyHash column
+            // and a browser-session table. Keep this SQL and BridgeBeatsIdentityStore in sync
+            // when updating the SDK.
             _ = migrationBuilder.Sql(
                 """
                 CREATE TABLE IF NOT EXISTS "idunno_bluesky_identities"
@@ -22,6 +24,17 @@ namespace BridgeBeats.Core.Infrastructure.Migrations {
 
                 CREATE INDEX IF NOT EXISTS "IX_idunno_bluesky_identities_ExpiresAtUtcTicks"
                     ON "idunno_bluesky_identities" ("ExpiresAtUtcTicks");
+
+                CREATE TABLE IF NOT EXISTS "bridgebeats_bluesky_sessions"
+                (
+                    "SessionId" TEXT NOT NULL COLLATE BINARY,
+                    "Did" TEXT NOT NULL COLLATE BINARY,
+                    "ExpiresAtUtcTicks" INTEGER NOT NULL,
+                    PRIMARY KEY ("SessionId")
+                ) WITHOUT ROWID;
+
+                CREATE INDEX IF NOT EXISTS "IX_bridgebeats_bluesky_sessions_Did"
+                    ON "bridgebeats_bluesky_sessions" ("Did");
 
                 CREATE TABLE IF NOT EXISTS "idunno_bluesky_refresh_locks"
                 (
@@ -62,7 +75,7 @@ namespace BridgeBeats.Core.Infrastructure.Migrations {
 
         /// <inheritdoc />
         protected override void Down( MigrationBuilder migrationBuilder ) {
-            _ = migrationBuilder.Sql( "DROP TABLE idunno_bluesky_correlation_states; DROP TABLE idunno_bluesky_refresh_locks; DROP TABLE idunno_bluesky_identities;" );
+            _ = migrationBuilder.Sql( "DROP TABLE bridgebeats_bluesky_sessions; DROP TABLE idunno_bluesky_correlation_states; DROP TABLE idunno_bluesky_refresh_locks; DROP TABLE idunno_bluesky_identities;" );
 
             _ = migrationBuilder.AddColumn<string>(
                 name: "AtProtoAccessToken",

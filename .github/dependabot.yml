@@ -10,6 +10,9 @@ updates:
     schedule:
       interval: "weekly"
     groups:
+      aspire:
+        patterns:
+          - "Aspire.*"
       # The authentication handler hooks SDK v8 cookie reads; review these packages together.
       bluesky-oauth-sdk:
         patterns:
@@ -19,8 +22,15 @@ updates:
         patterns:
           - "Microsoft.EntityFrameworkCore*"
           - "Microsoft.AspNetCore.Identity.EntityFrameworkCore"
+      opentelemetry:
+        patterns:
+          - "OpenTelemetry.*"
   - package-ecosystem: "docker"
     directory: "/containers" # Location of Dockerfiles
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "docker-compose"
+    directory: "/containers"
     schedule:
       interval: "weekly"
   - package-ecosystem: "github-actions"

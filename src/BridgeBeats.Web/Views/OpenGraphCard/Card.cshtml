@@ -43,6 +43,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>@title</title>
+    <link rel="icon" href="~/favicon.ico" asp-append-version="true" />
 
     @* OpenGraph meta tags *@
     @if (metadata != null) {
@@ -365,7 +366,7 @@
                 @* Share button positioned inline with type and external ID *@
                 <div class="share-dropdown">
                     <button class="share-button" type="button" aria-expanded="false" aria-haspopup="true" title="Share">
-                        <img src="/public/Share_arrow.png" alt="Share" class="share-arrow-icon" />
+                        <img src="~/public/Share_arrow.png" asp-append-version="true" alt="Share" class="share-arrow-icon" />
                     </button>
                     <ul class="dropdown-menu dropdown-menu-end">
                         <li>
@@ -399,7 +400,7 @@
 
                         <a href="@(ViewSecurityHelpers.IsHttpOrHttps(providerUrl) ? providerUrl : "#")" class="provider-link" target="_blank" rel="noopener noreferrer">
                             <span class="provider-icon">
-                                @provider.Key.GetProviderLogo( )
+                                @provider.Key.GetProviderLogo(path => FileVersionProvider.AddFileVersionToPath(Context.Request.PathBase, Url.Content("~" + path)))
                             </span>
                             <span class="visually-hidden">@providerName</span>
                         </a>
@@ -413,16 +414,16 @@
                 Powered By<br/>
                 @if (!string.IsNullOrWhiteSpace(domain)) {
                     <a href="https://@domain" target="_blank" rel="noopener noreferrer" class="footer-link">
-                        <img id="brandLogo" alt="BridgeBeats" height="50" width="125" src="/public/Icons/BridgeBeats_FullColor.svg" />
+                        <img id="brandLogo" alt="BridgeBeats" height="50" width="125" src="~/public/Icons/BridgeBeats_FullColor.svg" asp-append-version="true" />
                     </a>
                 } else {
-                    <img id="brandLogo" alt="BridgeBeats" height="50" width="125" src="/public/Icons/BridgeBeats_FullColor.svg" />
+                    <img id="brandLogo" alt="BridgeBeats" height="50" width="125" src="~/public/Icons/BridgeBeats_FullColor.svg" asp-append-version="true" />
                 }
             </span>
         </div>
     </div>
 
-    <script src="/public/share-buttons.js"></script>
+    <script src="~/public/share-buttons.js" asp-append-version="true"></script>
     <script nonce="@cspNonce">
         // Initialize share buttons when DOM is ready
         if (document.readyState === 'loading') {

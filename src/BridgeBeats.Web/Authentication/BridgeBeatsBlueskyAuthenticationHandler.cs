@@ -54,6 +54,10 @@ internal sealed class BridgeBeatsBlueskyAuthenticationHandler(
     protected override Task HandleSignOutAsync( AuthenticationProperties? properties ) =>
         sessions.EndSessionAsync( Context, null );
 
+    protected override Task FinishResponseAsync( ) =>
+        Context.Items.ContainsKey( BlueskySessionService.SessionEndedKey )
+            ? Task.CompletedTask : base.FinishResponseAsync( );
+
     internal sealed class GuardedCookieManager( ICookieManager inner ) : ICookieManager {
         public string? GetRequestCookie( HttpContext context, string key ) =>
             context.Items.TryGetValue( s_rejectedCookie, out object? rejected ) && key == rejected as string

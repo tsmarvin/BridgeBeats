@@ -17,6 +17,7 @@ using idunno.AtProto.Authentication;
 using idunno.Bluesky;
 using idunno.Bluesky.AspNet.Authentication;
 using idunno.Bluesky.AspNet.Authentication.Events;
+using idunno.Bluesky.AspNet.Authentication.SQLite;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -431,6 +432,50 @@ public class BlueskyAuthenticationIntegrationTests {
         JsonElement firstBrowser = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
         Assert.IsTrue( firstBrowser.GetProperty( "authenticated" ).GetBoolean( ) );
         Assert.IsTrue( firstBrowser.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+    }
+
+    [TestMethod]
+    public async Task NewOAuthProofKey_RevokesReplacedGrantAndKeepsOtherBrowserSignedIn( ) {
+        using HttpResponseMessage first = await SignInAsync( );
+        string firstCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _proofKey = ATProtoSigningKeyProvider.GenerateNewSigningKeyJwk( );
+
+        using HttpResponseMessage second = await SignInAsync( );
+
+        Assert.IsGreaterThan( 0, _oauth.Revocations );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", firstCookie );
+        JsonElement firstBrowser = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( firstBrowser.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.IsTrue( firstBrowser.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+    }
+
+    [TestMethod]
+    public async Task CredentialWrite_WithoutPreparedBrowserSession_RollsBackReplacement( ) {
+        using HttpResponseMessage signedIn = await SignInAsync( );
+        IIdentityStore store = Options( ).IdentityStore!;
+        ClaimsIdentity original = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!;
+        _proofKey = ATProtoSigningKeyProvider.GenerateNewSigningKeyJwk( );
+        ClaimsIdentity replacement = IIdentityStore.BuildClaimsIdentity( CreateCredentials( DateTime.UtcNow.AddHours( 1 ) ) );
+        await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
+        ApplicationUser user = await scope.ServiceProvider.GetRequiredService<ApplicationDbContext>( ).Users
+            .SingleAsync( TestContext.CancellationToken );
+        IHttpContextAccessor accessor = scope.ServiceProvider.GetRequiredService<IHttpContextAccessor>( );
+        HttpContext? previousContext = accessor.HttpContext;
+        DefaultHttpContext request = new( ) { RequestServices = scope.ServiceProvider };
+        request.Items[BridgeBeatsIdentityStore.ExpectedStampKey] = user.SecurityStamp!;
+        accessor.HttpContext = request;
+        try {
+            _ = await Assert.ThrowsExactlyAsync<InvalidOperationException>( ( ) =>
+                store.Add( replacement, TestContext.CancellationToken ) );
+        } finally {
+            accessor.HttpContext = previousContext;
+        }
+
+        ClaimsIdentity saved = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!;
+        Assert.AreEqual( original.FindFirst( AtProtoClaims.DPoPProof )?.Value,
+            saved.FindFirst( AtProtoClaims.DPoPProof )?.Value );
     }
 
     [TestMethod]
@@ -901,6 +946,7 @@ public class BlueskyAuthenticationIntegrationTests {
                         cookies.Any( cookie => cookie.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=", StringComparison.Ordinal ) ) );
         await using AsyncServiceScope check = _app.Services.CreateAsyncScope( );
         Assert.AreEqual( 1, await check.ServiceProvider.GetRequiredService<ApplicationDbContext>( ).Users.CountAsync( TestContext.CancellationToken ) );
+        Assert.IsGreaterThan( 0, _oauth.Revocations, "A rejected grant must be revoked after a trusted authority check." );
     }
 
     [TestMethod]
@@ -1475,6 +1521,29 @@ public class BlueskyAuthenticationIntegrationTests {
     }
 
     [TestMethod]
+    public async Task Logout_WhenCookieIsDueForRenewal_DoesNotRestoreEndedSession( ) {
+        using HttpResponseMessage signedIn = await SignInAsync( );
+        string cookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        AuthenticationTicket ticket = Options( ).TicketDataFormat.Unprotect( cookie.Split( '=', 2 )[1] )!;
+        ticket.Properties.IssuedUtc = DateTimeOffset.UtcNow.AddDays( -5 );
+        ticket.Properties.ExpiresUtc = DateTimeOffset.UtcNow.AddDays( 2 );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket ) );
+        await AddAntiforgeryHeaderAsync( );
+
+        using HttpResponseMessage logout = await _client.PostAsync( "/account/logout", null, TestContext.CancellationToken );
+
+        Assert.AreEqual( HttpStatusCode.OK, logout.StatusCode );
+        string[] blueskyCookies = [.. logout.Headers.GetValues( "Set-Cookie" )
+            .Where( value => value.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=", StringComparison.Ordinal ) )];
+        Assert.IsNotEmpty( blueskyCookies );
+        Assert.IsTrue( blueskyCookies.All( value => value.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=;", StringComparison.Ordinal ) ),
+            "No renewed Bluesky cookie may follow the deletion." );
+        JsonElement who = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsFalse( who.GetProperty( "authenticated" ).GetBoolean( ) );
+    }
+
+    [TestMethod]
     public async Task Upgrade_PreservesExistingUserKeysAndPlaylists_AndRemovesLegacyTokens( ) {
         DbContextOptions<ApplicationDbContext> options = new DbContextOptionsBuilder<ApplicationDbContext>( )
             .UseSqlite( $"Data Source={Path.Combine( _directory, "upgrade.db" )}" ).Options;
@@ -1517,6 +1586,47 @@ public class BlueskyAuthenticationIntegrationTests {
                                'idunno_bluesky_correlation_states', 'bridgebeats_bluesky_sessions')
                               """;
         Assert.AreEqual( 4L, await command.ExecuteScalarAsync( TestContext.CancellationToken ) );
+    }
+
+    [TestMethod]
+    public async Task Migration_SdkTablesMatchPinnedPackageSchema( ) {
+        Assert.AreEqual( new Version( 8, 0, 0, 0 ), typeof( SqliteIdentityStore ).Assembly.GetName( ).Version,
+            "A new SDK version needs an explicit schema and credential-store review." );
+        string sdkSchema = await File.ReadAllTextAsync( Path.Combine( AppContext.BaseDirectory, "bluesky-sdk-schema.sql" ),
+            TestContext.CancellationToken );
+        await using SqliteConnection expected = new( "Data Source=:memory:" );
+        await expected.OpenAsync( TestContext.CancellationToken );
+        await using (SqliteCommand create = expected.CreateCommand( )) {
+            create.CommandText = sdkSchema;
+            _ = await create.ExecuteNonQueryAsync( TestContext.CancellationToken );
+        }
+        await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
+        ApplicationDbContext db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>( );
+        await db.Database.OpenConnectionAsync( TestContext.CancellationToken );
+        SqliteConnection actual = (SqliteConnection)db.Database.GetDbConnection( );
+
+        async Task<Dictionary<string, string>> ReadSdkObjectsAsync( SqliteConnection connection ) {
+            Dictionary<string, string> objects = new( StringComparer.Ordinal );
+            await using SqliteCommand command = connection.CreateCommand( );
+            command.CommandText = "SELECT name, sql FROM sqlite_master WHERE name LIKE 'idunno_bluesky_%' AND sql IS NOT NULL";
+            await using SqliteDataReader reader = await command.ExecuteReaderAsync( TestContext.CancellationToken );
+            while (await reader.ReadAsync( TestContext.CancellationToken )) {
+                string sql = string.Join( ' ', reader.GetString( 1 ).Split( (char[]?)null, StringSplitOptions.RemoveEmptyEntries ) );
+                objects.Add( reader.GetString( 0 ), sql );
+            }
+            return objects;
+        }
+
+        Dictionary<string, string> packageObjects = await ReadSdkObjectsAsync( expected );
+        Dictionary<string, string> migrationObjects = await ReadSdkObjectsAsync( actual );
+        Assert.HasCount( packageObjects.Count, migrationObjects );
+        foreach ((string name, string packageSql) in packageObjects) {
+            Assert.IsTrue( migrationObjects.TryGetValue( name, out string? migrationSql ), $"Missing SDK object: {name}" );
+            if (name == "idunno_bluesky_identities") {
+                migrationSql = migrationSql!.Replace( "\"ProofKeyHash\" TEXT COLLATE BINARY, ", string.Empty, StringComparison.Ordinal );
+            }
+            Assert.AreEqual( packageSql, migrationSql, $"The migration diverged from the SDK schema for {name}." );
+        }
     }
 
     [TestMethod]

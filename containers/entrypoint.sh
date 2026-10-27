@@ -100,7 +100,7 @@ if [ -z "$INTERNAL_SERVICE_KEY" ]; then
     exit 1
 fi
 RATE_LIMIT_REQUESTS_PER_HOUR="${RATE_LIMIT_REQUESTS_PER_HOUR:-20}"
-OAUTH_TRUSTED_PROXY_HOST="${OAUTH_TRUSTED_PROXY_HOST:-bridgebeats-caddy}"
+OAUTH_TRUSTED_PROXY_HOST="${OAUTH_TRUSTED_PROXY_HOST-bridgebeats-caddy}"
 
 # Logging configuration
 LOG_DIR_PATH="${LOG_DIR_PATH:-/app/data/logs}"

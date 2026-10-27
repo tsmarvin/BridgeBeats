@@ -37,6 +37,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <None Include="$(NuGetPackageRoot)idunno.bluesky.aspnet.authentication.sqlite/8.0.0/contentFiles/any/any/schema.sql"
+          Link="bluesky-sdk-schema.sql" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\src\BridgeBeats.AppHost\BridgeBeats.AppHost.csproj">
       <!--
         Only used for Aspire distributed testing. ExcludeAssets prevents conflicts

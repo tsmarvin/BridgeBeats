@@ -81,6 +81,7 @@ public sealed partial class BlueskyAccountEvents(
             }
         }
         if (users.SupportsUserLockout && await users.IsLockedOutAsync( user )) {
+            await sessions.RevokeCredentialsAsync( IIdentityStore.BuildClaimsIdentity( credentials ), did );
             throw new InvalidOperationException( "The BridgeBeats account is locked." );
         }
         if (verifiedHandle is not null && user.AtProtoHandle != verifiedHandle) {
@@ -91,8 +92,13 @@ public sealed partial class BlueskyAccountEvents(
         context.Properties.SetString( UserIdProperty, user.Id );
         string stamp = await users.GetSecurityStampAsync( user );
         context.Properties.SetString( SecurityStampProperty, stamp );
-        context.Properties.SetString( BrowserSessionProperty, Guid.NewGuid( ).ToString( "N" ) );
+        string sessionId = Guid.NewGuid( ).ToString( "N" );
+        context.Properties.SetString( BrowserSessionProperty, sessionId );
         context.HttpContext.Items[BridgeBeatsIdentityStore.ExpectedStampKey] = stamp;
+        DateTimeOffset expires = context.Properties.ExpiresUtc
+            ?? throw new InvalidOperationException( "The Bluesky browser session has no expiry." );
+        context.HttpContext.Items[BridgeBeatsIdentityStore.PendingBrowserSessionKey] =
+            new BridgeBeatsIdentityStore.PendingBrowserSession( did, sessionId, expires );
         if (GetVerifiedTicket( context.HttpContext ) is { } previous &&
             previous.Principal.FindFirstValue( AtProtoClaims.Did ) is { } previousDid &&
             previous.Properties.GetString( BrowserSessionProperty ) is { } previousSessionId) {
@@ -107,15 +113,10 @@ public sealed partial class BlueskyAccountEvents(
 
     /// <inheritdoc/>
     public override async Task SignedIn( BlueskySignedInContext context ) {
-        string did = context.Principal?.FindFirstValue( AtProtoClaims.Did )
-            ?? throw new InvalidOperationException( "The Bluesky identity has no DID." );
-        string sessionId = context.Properties.GetString( BrowserSessionProperty )
-            ?? throw new InvalidOperationException( "The Bluesky browser session is missing." );
-        DateTimeOffset expires = context.Properties.ExpiresUtc
-            ?? throw new InvalidOperationException( "The Bluesky browser session has no expiry." );
-        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)authenticationOptions
-            .Get( BlueskyAuthenticationDefaults.AuthenticationScheme ).IdentityStore!;
-        await store.RegisterBrowserSessionAsync( new Did( did ), sessionId, expires, context.HttpContext.RequestAborted );
+        if (context.HttpContext.Items[BridgeBeatsIdentityStore.ReplacedIdentityKey] is ClaimsIdentity replacedIdentity &&
+            replacedIdentity.FindFirst( AtProtoClaims.Did )?.Value is { } replacedDid) {
+            await sessions.RevokeCredentialsAsync( replacedIdentity, replacedDid );
+        }
         if (GetVerifiedTicket( context.HttpContext ) is { } replaced) {
             await sessions.EndReplacedSessionAsync( replaced );
         }

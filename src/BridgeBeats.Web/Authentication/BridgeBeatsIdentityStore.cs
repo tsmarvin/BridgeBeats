@@ -21,7 +21,10 @@ internal sealed class BridgeBeatsIdentityStore(
 ) : IIdentityStore {
     internal static readonly object ExpectedStampKey = new( );
     internal static readonly object ExpectedBrowserSessionKey = new( );
+    internal static readonly object PendingBrowserSessionKey = new( );
+    internal static readonly object ReplacedIdentityKey = new( );
     internal sealed record BrowserSessionExpectation( string Did, string SessionId );
+    internal sealed record PendingBrowserSession( string Did, string SessionId, DateTimeOffset Expires );
     private static readonly object s_observedSessions = new( );
     private static readonly TimeSpan s_entryLifetime = TimeSpan.FromDays( 7 );
     private static readonly TimeSpan s_sweepInterval = TimeSpan.FromMinutes( 5 );
@@ -68,7 +71,19 @@ internal sealed class BridgeBeatsIdentityStore(
 
         await using SqliteConnection connection = new( connectionString );
         await connection.OpenAsync( cancellationToken );
+        await using SqliteTransaction? transaction = add
+            ? (SqliteTransaction)await connection.BeginTransactionAsync( cancellationToken ) : null;
+        byte[]? replacedIdentity = null;
+        if (add) {
+            await using SqliteCommand previous = connection.CreateCommand( );
+            previous.Transaction = transaction;
+            previous.CommandText = "SELECT \"Identity\" FROM \"idunno_bluesky_identities\" WHERE \"Did\" = @did AND \"ProofKeyHash\" != @proof;";
+            previous.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
+            previous.Parameters.Add( "@proof", SqliteType.Text ).Value = proofKeyHash;
+            replacedIdentity = await previous.ExecuteScalarAsync( cancellationToken ) as byte[];
+        }
         await using SqliteCommand command = connection.CreateCommand( );
+        command.Transaction = transaction;
         command.CommandText = add
             ? """
               INSERT INTO "idunno_bluesky_identities" ("Did", "Identity", "ExpiresAtUtcTicks", "ProofKeyHash")
@@ -105,6 +120,34 @@ internal sealed class BridgeBeatsIdentityStore(
         if (add && written == 0) {
             throw new InvalidOperationException( "The Bluesky account changed while sign-in was completing." );
         }
+        if (add) {
+            HttpContext context = httpContextAccessor.HttpContext
+                ?? throw new InvalidOperationException( "The Bluesky browser context is missing." );
+            PendingBrowserSession pending = context.Items[PendingBrowserSessionKey] as PendingBrowserSession
+                ?? throw new InvalidOperationException( "The Bluesky browser session was not prepared before storing credentials." );
+            if (pending.Did != did.ToString( )) {
+                throw new InvalidOperationException( "The Bluesky browser session belongs to another DID." );
+            }
+            await using SqliteCommand register = connection.CreateCommand( );
+            register.Transaction = transaction;
+            register.CommandText = "INSERT INTO \"bridgebeats_bluesky_sessions\" (\"SessionId\", \"Did\", \"ExpiresAtUtcTicks\") VALUES (@session, @did, @expires);";
+            register.Parameters.Add( "@session", SqliteType.Text ).Value = pending.SessionId;
+            register.Parameters.Add( "@did", SqliteType.Text ).Value = pending.Did;
+            register.Parameters.Add( "@expires", SqliteType.Integer ).Value = pending.Expires.UtcTicks;
+            _ = await register.ExecuteNonQueryAsync( cancellationToken );
+            await transaction!.CommitAsync( cancellationToken );
+            if (replacedIdentity is not null) {
+                try {
+                    IdentityStoreRetrievedContext retrieved = new( replacedIdentity );
+                    await Events.PostRetrieval( retrieved );
+                    using MemoryStream previousStream = new( retrieved.Identity.ToArray( ) );
+                    using BinaryReader reader = new( previousStream, Encoding.UTF8 );
+                    context.Items[ReplacedIdentityKey] = new ClaimsIdentity( reader );
+                } catch (Exception ex) {
+                    _logger.LogWarning( ex, "Replaced Bluesky credentials could not be read for revocation." );
+                }
+            }
+        }
         if (written > 0) { await SweepExpiredAsync( connection ); }
     }
 
@@ -138,36 +181,6 @@ internal sealed class BridgeBeatsIdentityStore(
 
     internal Task RemoveCurrentAsync( Did did, CancellationToken cancellationToken = default ) =>
         RemoveSessionAsync( did, expectedProof: null, requireMatch: false, cancellationToken );
-
-    internal async Task RegisterBrowserSessionAsync( Did did, string sessionId, DateTimeOffset expires,
-        CancellationToken cancellationToken = default ) {
-        await using SqliteConnection connection = new( connectionString );
-        await connection.OpenAsync( cancellationToken );
-        await using SqliteCommand register = connection.CreateCommand( );
-        register.CommandText = """
-                               INSERT INTO "bridgebeats_bluesky_sessions" ("SessionId", "Did", "ExpiresAtUtcTicks")
-                               SELECT @session, @did, @expires
-                               WHERE EXISTS (SELECT 1 FROM AspNetUsers WHERE AtProtoDid = @did AND SecurityStamp = @stamp)
-                                 AND EXISTS (SELECT 1 FROM "idunno_bluesky_identities" WHERE "Did" = @did)
-                                 AND (@previousSession IS NULL OR EXISTS (
-                                     SELECT 1 FROM "bridgebeats_bluesky_sessions"
-                                     WHERE "SessionId" = @previousSession AND "Did" = @previousDid AND "ExpiresAtUtcTicks" > @now));
-                               """;
-        register.Parameters.Add( "@session", SqliteType.Text ).Value = sessionId;
-        register.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
-        register.Parameters.Add( "@expires", SqliteType.Integer ).Value = expires.UtcTicks;
-        register.Parameters.Add( "@stamp", SqliteType.Text ).Value =
-            httpContextAccessor.HttpContext?.Items[ExpectedStampKey] as string
-            ?? throw new InvalidOperationException( "The Bluesky account binding was not verified before registering the browser." );
-        BrowserSessionExpectation? previous = httpContextAccessor.HttpContext?.Items[ExpectedBrowserSessionKey]
-            as BrowserSessionExpectation;
-        register.Parameters.Add( "@previousSession", SqliteType.Text ).Value = (object?)previous?.SessionId ?? DBNull.Value;
-        register.Parameters.Add( "@previousDid", SqliteType.Text ).Value = (object?)previous?.Did ?? DBNull.Value;
-        register.Parameters.Add( "@now", SqliteType.Integer ).Value = DateTime.UtcNow.Ticks;
-        if (await register.ExecuteNonQueryAsync( cancellationToken ) == 0) {
-            throw new InvalidOperationException( "The Bluesky account changed while sign-in was completing." );
-        }
-    }
 
     internal async Task<bool> IsBrowserSessionCurrentAsync( Did did, string sessionId,
         CancellationToken cancellationToken = default ) {

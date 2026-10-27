@@ -163,6 +163,57 @@ public class ConfigurationValidationTests {
         Assert.IsNotNull( mediaService, "IMediaLinkService should be registered with Spotify credentials" );
     }
 
+    /// <summary>Local development leaves Bluesky disabled when no signing key is configured.</summary>
+    [TestMethod]
+    public void AddBridgeBeatsServices_WithLocalDomainAndNoSigningKey_SkipsBluesky( ) {
+        IConfiguration config = new ConfigurationBuilder( ).AddInMemoryCollection( new Dictionary<string, string?> {
+            ["BridgeBeats:Domain"] = "localhost",
+            ["BridgeBeats:SpotifyClientId"] = "spotify_client_id",
+            ["BridgeBeats:SpotifyClientSecret"] = "spotify_secret",
+            ["BridgeBeats:IdentityConnectionString"] = "Data Source=Identity;Mode=Memory",
+            ["BridgeBeats:ApiKeySalt"] = "api_key_salt"
+        } ).Build( );
+        IServiceCollection services = new ServiceCollection( );
+        _ = services.AddSingleton( new Mock<IGenreCacheService>( ).Object );
+
+        _ = services.AddBridgeBeatsServices( config );
+
+        using ServiceProvider provider = services.BuildServiceProvider( );
+        Assert.IsFalse( provider.GetRequiredService<AuthenticationFeatureState>( ).BlueskyEnabled );
+    }
+
+    /// <summary>Production requires a signing key for a configured Bluesky origin.</summary>
+    [TestMethod]
+    public void AddBridgeBeatsServices_InProductionWithDomainAndNoSigningKey_FailsFast( ) {
+        IConfiguration config = new ConfigurationBuilder( ).AddInMemoryCollection( new Dictionary<string, string?> {
+            ["BridgeBeats:Domain"] = "bridgebeats.example"
+        } ).Build( );
+
+        InvalidOperationException error = Assert.ThrowsExactly<InvalidOperationException>( ( ) =>
+            new ServiceCollection( ).AddBridgeBeatsServices( config, isProduction: true ) );
+        Assert.Contains( "ATProtoOAuthSigningKeyPath", error.Message );
+    }
+
+    /// <summary>An invalid OAuth origin does not prevent local password login setup.</summary>
+    [TestMethod]
+    public void AddBridgeBeatsServices_InDevelopmentWithInvalidDomain_SkipsBluesky( ) {
+        IConfiguration config = new ConfigurationBuilder( ).AddInMemoryCollection( new Dictionary<string, string?> {
+            ["BridgeBeats:Domain"] = "http://invalid.example/path",
+            ["BridgeBeats:SpotifyClientId"] = "spotify_client_id",
+            ["BridgeBeats:SpotifyClientSecret"] = "spotify_secret",
+            ["BridgeBeats:IdentityConnectionString"] = "Data Source=Identity;Mode=Memory",
+            ["BridgeBeats:ApiKeySalt"] = "api_key_salt",
+            ["BridgeBeats:ATProtoOAuthSigningKeyPath"] = "/not/a/real/key"
+        } ).Build( );
+        IServiceCollection services = new ServiceCollection( );
+        _ = services.AddSingleton( new Mock<IGenreCacheService>( ).Object );
+
+        _ = services.AddBridgeBeatsServices( config );
+
+        using ServiceProvider provider = services.BuildServiceProvider( );
+        Assert.IsFalse( provider.GetRequiredService<AuthenticationFeatureState>( ).BlueskyEnabled );
+    }
+
     /// <summary>
     /// Verifies that a <c>CardCacheExpirationHours</c> of zero throws
     /// <see cref="InvalidOperationException"/> requiring the value to be greater than zero.

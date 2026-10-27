@@ -383,7 +383,7 @@ public partial class AccountController(
         }
 
         // Revoke the linked OAuth session even when deletion is authenticated with an API key.
-        BlueskySessionService? sessions = HttpContext.RequestServices.GetService<BlueskySessionService>( );
+        BlueskySessionService? sessions = GetBlueskySessions( );
         if (sessions is not null) {
             await sessions.EndSessionAsync( HttpContext, user.AtProtoDid );
             await ReloadLinkedAccountAsync( user );
@@ -410,10 +410,8 @@ public partial class AccountController(
     [ValidateAntiForgeryToken]
     [EnableRateLimiting( BlueskyAuthenticationConfiguration.LoginStartRateLimitPolicy )]
     [Route( "account/login-atproto" )]
-    public async Task<IActionResult> LoginWithAtProto(
-        [FromBody] AtProtoLoginRequest request,
-        [FromServices] BlueskySignInManager? blueskySignInManager
-    ) {
+    public async Task<IActionResult> LoginWithAtProto( [FromBody] AtProtoLoginRequest request ) {
+        BlueskySignInManager? blueskySignInManager = HttpContext.RequestServices.GetService<BlueskySignInManager>( );
         if (blueskySignInManager is null) {
             return BadRequest( new { message = "ATProto OAuth is not configured on this server." } );
         }
@@ -459,11 +457,14 @@ public partial class AccountController(
     }
 
     private async Task SignOutBlueskyAsync( ) {
-        BlueskySessionService? sessions = HttpContext.RequestServices?.GetService<BlueskySessionService>( );
+        BlueskySessionService? sessions = GetBlueskySessions( );
         if (sessions is not null) {
             await sessions.EndSessionAsync( HttpContext, null );
         }
     }
+
+    private BlueskySessionService? GetBlueskySessions( ) =>
+        HttpContext?.RequestServices?.GetService<BlueskySessionService>( );
 
     /// <summary>Refreshes tracked account stamps after session removal updates them directly in SQLite.</summary>
     private async Task ReloadLinkedAccountAsync( ApplicationUser user ) {

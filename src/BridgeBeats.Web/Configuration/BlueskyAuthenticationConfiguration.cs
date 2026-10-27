@@ -29,7 +29,8 @@ internal static class BlueskyAuthenticationConfiguration {
     internal static readonly object PasswordSignInKey = new( );
 
     internal static IServiceCollection AddBridgeBeatsBluesky(
-        this IServiceCollection services, AppSettings settings, string clientId, string domain
+        this IServiceCollection services, AppSettings settings, string clientId, string domain,
+        AuthenticationOrigin? origin = null
     ) {
         if (string.IsNullOrWhiteSpace( settings.ATProtoOAuthSigningKeyPath )) {
             throw new InvalidOperationException( "BridgeBeats:ATProtoOAuthSigningKeyPath is required when Bluesky sign-in is enabled." );
@@ -59,7 +60,7 @@ internal static class BlueskyAuthenticationConfiguration {
         services.TryAddSingleton<IDidHandleResolver>( _ => new DidHandleCache( ) );
         _ = services.AddAuthentication( ).AddBluesky( options => {
             options.Cookie.Name = CookieName;
-            options.Cookie.Domain = AuthenticationOrigin.Parse( domain )?.CookieDomain;
+            options.Cookie.Domain = (origin ?? AuthenticationOrigin.Parse( domain ))?.CookieDomain;
             options.Cookie.Path = "/";
             options.Cookie.HttpOnly = true;
             options.Cookie.SecurePolicy = CookieSecurePolicy.Always;

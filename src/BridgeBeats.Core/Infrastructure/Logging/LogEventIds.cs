@@ -217,17 +217,17 @@ public static class LogEventIds {
             public const int RedisATProtoSessionManagerAuthenticated = 1110;
 
             /// <summary>
-            /// EventId for <see cref="RedisATProtoSessionManager.LogAgentAuthenticated"/>.
+            /// Reserved event ID for the retired agent-authenticated callback.
             /// </summary>
             public const int RedisATProtoSessionManagerAgentAuthenticated = 1111;
 
             /// <summary>
-            /// EventId for <see cref="RedisATProtoSessionManager.LogPersistAfterAuthFailed"/>.
+            /// Reserved event ID for the retired asynchronous login-persistence callback.
             /// </summary>
             public const int RedisATProtoSessionManagerPersistAfterAuthFailed = 1112;
 
             /// <summary>
-            /// EventId for <see cref="RedisATProtoSessionManager.LogCredentialsUpdated"/>.
+            /// Reserved event ID for the retired credentials-updated event callback.
             /// </summary>
             public const int RedisATProtoSessionManagerCredentialsUpdated = 1113;
 

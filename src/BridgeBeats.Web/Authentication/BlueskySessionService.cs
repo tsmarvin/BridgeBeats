@@ -15,6 +15,8 @@ public sealed partial class BlueskySessionService(
     IHttpClientFactory httpClients,
     ILogger<BlueskySessionService> logger
 ) {
+    internal static readonly object SessionEndedKey = new( );
+
     /// <summary>Ends this browser when <paramref name="did"/> is null; an explicit DID ends all its sessions.</summary>
     public async Task EndSessionAsync( HttpContext? context, string? did ) {
         BlueskyAuthenticationOptions options = authenticationOptions.Get( BlueskyAuthenticationDefaults.AuthenticationScheme );
@@ -32,6 +34,9 @@ public sealed partial class BlueskySessionService(
             if (ticket is not null) { await EndBrowserSessionAsync( options, ticket ); }
         } finally {
             if (context is not null) {
+                // The SDK may have queued a sliding renewal during authentication. Its response
+                // hook must not write the old reference cookie after this deletion.
+                context.Items[SessionEndedKey] = true;
                 options.CookieManager.DeleteCookie( context, options.Cookie.Name!, options.Cookie.Build( context ) );
             }
         }
@@ -39,6 +44,8 @@ public sealed partial class BlueskySessionService(
 
     internal Task EndReplacedSessionAsync( AuthenticationTicket ticket ) =>
         EndBrowserSessionAsync( authenticationOptions.Get( BlueskyAuthenticationDefaults.AuthenticationScheme ), ticket );
+
+    internal Task RevokeCredentialsAsync( ClaimsIdentity identity, string did ) => RevokeAsync( identity, did );
 
     private async Task EndBrowserSessionAsync( BlueskyAuthenticationOptions options, AuthenticationTicket ticket ) {
         string? did = ticket.Principal.FindFirst( AtProtoClaims.Did )?.Value;

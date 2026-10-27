@@ -423,7 +423,12 @@ public sealed partial class RedisATProtoSessionManager : IATProtoSessionManager,
             await _agentLock.WaitAsync( cancellationToken );
             try {
                 if (ReferenceEquals( agent, _agent )) {
-                    await PersistCredentialsAsync( args.AccessCredentials );
+                    try {
+                        await PersistCredentialsAsync( args.AccessCredentials );
+                    } catch (Exception ex) {
+                        LogPersistUpdateFailed( ex, _identifier );
+                        throw;
+                    }
                 }
             } finally {
                 _ = _agentLock.Release( );

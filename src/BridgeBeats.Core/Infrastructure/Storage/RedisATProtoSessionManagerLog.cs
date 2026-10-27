@@ -112,31 +112,6 @@ public sealed partial class RedisATProtoSessionManager {
         Message = "Successfully authenticated to PDS for {Identifier}" )]
     private partial void LogAuthenticated( string identifier );
 
-    /// <summary>Logs receipt of the agent's authenticated event.</summary>
-    /// <param name="identifier">The service-account identifier.</param>
-    [LoggerMessage(
-        EventId = LogEventIds.Infrastructure.Storage.RedisATProtoSessionManagerAgentAuthenticated,
-        Level = LogLevel.Debug,
-        Message = "Agent authenticated event for {Identifier}" )]
-    private partial void LogAgentAuthenticated( string identifier );
-
-    /// <summary>Logs a failure to persist credentials following the authenticated event.</summary>
-    /// <param name="ex">The exception that occurred.</param>
-    /// <param name="identifier">The service-account identifier.</param>
-    [LoggerMessage(
-        EventId = LogEventIds.Infrastructure.Storage.RedisATProtoSessionManagerPersistAfterAuthFailed,
-        Level = LogLevel.Error,
-        Message = "Failed to persist credentials after authentication for {Identifier}" )]
-    private partial void LogPersistAfterAuthFailed( Exception ex, string identifier );
-
-    /// <summary>Logs receipt of the agent's credentials-updated event.</summary>
-    /// <param name="identifier">The service-account identifier.</param>
-    [LoggerMessage(
-        EventId = LogEventIds.Infrastructure.Storage.RedisATProtoSessionManagerCredentialsUpdated,
-        Level = LogLevel.Debug,
-        Message = "Agent credentials updated event for {Identifier}" )]
-    private partial void LogCredentialsUpdated( string identifier );
-
     /// <summary>Logs a failure to persist credentials following the credentials-updated event.</summary>
     /// <param name="ex">The exception that occurred.</param>
     /// <param name="identifier">The service-account identifier.</param>

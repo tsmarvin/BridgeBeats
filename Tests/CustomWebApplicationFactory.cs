@@ -30,8 +30,31 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Web.Program> {
     private readonly Dictionary<string, string?> _configData;
     /// <summary>Filesystem path of this instance's isolated SQLite identity database.</summary>
     private readonly string _identityDbPath;
-    /// <summary>ATProto environment variables overridden for this factory, with their prior process values, restored on dispose to prevent cross-test contamination.</summary>
-    private readonly List<(string Name, string? PriorValue)> _atProtoEnvRestore;
+    /// <summary>Environment variables overridden for this factory, with their prior process values, restored on dispose to prevent cross-test contamination.</summary>
+    private readonly List<(string Name, string? PriorValue)> _envRestore;
+
+    /// <summary>
+    /// Environment variables forced empty for the lifetime of every factory instance.
+    /// </summary>
+    /// <remarks>
+    /// The host binds <c>BridgeBeats</c> settings and registers the music providers during eager
+    /// service registration, which happens before this factory's in-memory configuration is applied.
+    /// Any credential a developer keeps in their local user secrets therefore reaches provider
+    /// startup here, so these must be neutralized at the environment level to keep the suite
+    /// independent of the machine it runs on. Each entry is restored in <see cref="Dispose(bool)"/>.
+    /// </remarks>
+    private static readonly string[] s_hostBootCredentialKeys = [
+        // ATProto: a developer's credentials would trip DID validation during registration.
+        "BridgeBeats__ATProtoIdentifier",
+        "BridgeBeats__ATProtoPassword",
+        "BridgeBeats__ATProtoUserDID",
+        "BridgeBeats__ATProtoOAuthSigningKeyPath",
+        // Apple Music: a developer's AppleKeyPath points at a local .p8 file, and provider
+        // registration throws FileNotFoundException when that file is absent from the machine.
+        "BridgeBeats__AppleTeamId",
+        "BridgeBeats__AppleKeyId",
+        "BridgeBeats__AppleKeyPath",
+    ];
 
     /// <summary>
     /// Creates a factory with the default test configuration and no overrides.
@@ -71,21 +94,14 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Web.Program> {
             ["Aspire:StackExchange:Redis:ConnectionString"] = redisConnectionString,
         };
 
-        // Force the three ATProto settings empty so the host does not pick up a developer's
-        // local user-secret credentials (which would trip DID validation during service
-        // registration). These must be environment variables: the host binds AppSettings and
-        // runs ATProto validation during eager service registration, before this factory's
-        // in-memory configuration is applied, so the in-memory overlay would land too late.
+        // Force the host-boot credentials empty so the host does not pick up a developer's
+        // local user-secret credentials. See s_hostBootCredentialKeys for why environment
+        // variables rather than the in-memory overlay are required.
         // Prior values are captured and restored in Dispose to keep the override scoped to
         // this factory's lifetime.
-        string[] atProtoKeys = [
-            "BridgeBeats__ATProtoIdentifier",
-            "BridgeBeats__ATProtoPassword",
-            "BridgeBeats__ATProtoUserDID",
-        ];
-        _atProtoEnvRestore = [];
-        foreach (string key in atProtoKeys) {
-            _atProtoEnvRestore.Add( (key, Environment.GetEnvironmentVariable( key )) );
+        _envRestore = [];
+        foreach (string key in s_hostBootCredentialKeys) {
+            _envRestore.Add( (key, Environment.GetEnvironmentVariable( key )) );
             Environment.SetEnvironmentVariable( key, "" );
         }
 
@@ -271,17 +287,17 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Web.Program> {
     }
 
     /// <summary>
-    /// Disposes the test host, restores ATProto environment variables to their pre-construction
-    /// values, and deletes this instance's SQLite identity database file.
+    /// Disposes the test host, restores the environment variables this factory forced empty to their
+    /// pre-construction values, and deletes this instance's SQLite identity database file.
     /// </summary>
     /// <param name="disposing"><c>true</c> when called from <c>Dispose</c> rather than a finalizer.</param>
     protected override void Dispose( bool disposing ) {
         base.Dispose( disposing );
 
         if (disposing) {
-            // Restore the ATProto env vars captured in the constructor so this factory does
-            // not leak empty ATProto settings into other tests in the same process.
-            foreach ((string name, string? priorValue) in _atProtoEnvRestore) {
+            // Restore the env vars captured in the constructor so this factory does
+            // not leak empty credentials settings into other tests in the same process.
+            foreach ((string name, string? priorValue) in _envRestore) {
                 Environment.SetEnvironmentVariable( name, priorValue );
             }
 

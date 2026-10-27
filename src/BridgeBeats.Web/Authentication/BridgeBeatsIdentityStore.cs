@@ -1,3 +1,4 @@
+using System.Data.Common;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
@@ -7,6 +8,7 @@ using idunno.Bluesky.AspNet.Authentication;
 using idunno.Bluesky.AspNet.Authentication.Events;
 using idunno.Bluesky.AspNet.Authentication.SQLite;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
 
 namespace BridgeBeats.Web.Authentication;
 
@@ -14,7 +16,7 @@ namespace BridgeBeats.Web.Authentication;
 /// Keeps SDK credential writes tied to their OAuth session. SQLite serializes each write with
 /// removal, so a refresh from a removed or replaced session cannot recreate its identity.
 /// </summary>
-internal sealed class BridgeBeatsIdentityStore(
+internal sealed partial class BridgeBeatsIdentityStore(
     string connectionString,
     IHttpContextAccessor httpContextAccessor,
     ILoggerFactory loggerFactory
@@ -25,9 +27,11 @@ internal sealed class BridgeBeatsIdentityStore(
     internal static readonly object ReplacedIdentityKey = new( );
     internal sealed record BrowserSessionExpectation( string Did, string SessionId );
     internal sealed record PendingBrowserSession( string Did, string SessionId, DateTimeOffset Expires );
+    private sealed record StoredCredentialRow( byte[] Identity, string? ProofKeyHash, long ExpiresAtUtcTicks );
     private static readonly object s_observedSessions = new( );
     private static readonly TimeSpan s_entryLifetime = TimeSpan.FromDays( 7 );
     private static readonly TimeSpan s_sweepInterval = TimeSpan.FromMinutes( 5 );
+    private const int WriteAttempts = 8;
     private readonly SqliteIdentityStore _sdkStore = new( connectionString, loggerFactory: loggerFactory );
     private readonly ILogger _logger = loggerFactory.CreateLogger<BridgeBeatsIdentityStore>( );
     private long _lastSweepTicks;
@@ -57,6 +61,107 @@ internal sealed class BridgeBeatsIdentityStore(
 
     public Task Update( ClaimsIdentity identity, CancellationToken cancellationToken ) =>
         WriteAsync( identity, add: false, cancellationToken );
+
+    /// <summary>
+    /// Writes <paramref name="credentials"/> unless the stored row is no longer the row those credentials
+    /// came from, or already carries a later expiry. The guard is evaluated by the write statement itself,
+    /// so a refresh or a replacement landing in between leaves the guard unmatched instead of overwriting
+    /// the newer row.
+    /// </summary>
+    /// <remarks>
+    /// The row the caller's credentials came from is identified by its proof-key hash, so credentials
+    /// lifted from a grant that has since been replaced cannot reinstate it. AT Proto refresh tokens are
+    /// single use, and a replacement grant is already stored, so writing the superseded pair back would
+    /// reinstate a spent refresh token and sign the user out at the next refresh. A row that has expired,
+    /// or that was removed, is likewise left alone: only an active row is updated, never recreated.
+    /// </remarks>
+    public async Task<bool> UpdateIfNewer( AccessCredentials credentials, CancellationToken cancellationToken = default ) {
+        ArgumentNullException.ThrowIfNull( credentials );
+        ClaimsIdentity identity = IIdentityStore.BuildClaimsIdentity( credentials );
+        Did did = IdentityDid( identity );
+        string didValue = did.ToString( );
+        string proofKeyHash = ProofKeyHash( identity );
+        IdentityStoreSettingContext setting = new( SerializeIdentity( identity ) );
+        await Events.PreStoring( setting );
+        byte[] serialized = setting.Identity.ToArray( );
+        for (int attempt = 0; attempt < WriteAttempts; attempt++) {
+            // The comparison runs before the writer's transaction is open. It can invoke the store's
+            // PostRetrieval handlers, which belong to the application rather than to this store, and no
+            // write is held open while they run. The guard below is what makes the decision safe: it
+            // names the row this comparison read, and the transaction is what evaluates it.
+            StoredCredentialRow? stored = await ReadCredentialRowAsync( didValue, cancellationToken );
+            if (stored is null ||
+                stored.ProofKeyHash != proofKeyHash ||
+                stored.ExpiresAtUtcTicks <= DateTime.UtcNow.Ticks ||
+                await StoredExpiryIsLaterAsync( stored.Identity, credentials )) {
+                return false;
+            }
+            await using SqliteConnection connection = new( connectionString );
+            await connection.OpenAsync( cancellationToken );
+            await using SqliteTransaction transaction = (SqliteTransaction)await connection.BeginTransactionAsync( cancellationToken );
+            await using SqliteCommand write = connection.CreateCommand( );
+            write.Transaction = transaction;
+            // The guard repeats the comparison this attempt already made, against the row as it stands
+            // inside the transaction, so a row replaced after that comparison leaves it unmatched.
+            write.CommandText = """
+                                UPDATE "idunno_bluesky_identities"
+                                SET "Identity" = @identity
+                                WHERE "Did" = @did AND "Identity" = @stored AND "ProofKeyHash" = @proof
+                                  AND "ExpiresAtUtcTicks" > @now;
+                                """;
+            write.Parameters.Add( "@did", SqliteType.Text ).Value = didValue;
+            write.Parameters.Add( "@identity", SqliteType.Blob ).Value = serialized;
+            write.Parameters.Add( "@stored", SqliteType.Blob ).Value = stored.Identity;
+            write.Parameters.Add( "@proof", SqliteType.Text ).Value = proofKeyHash;
+            write.Parameters.Add( "@now", SqliteType.Integer ).Value = DateTime.UtcNow.Ticks;
+            bool written = await write.ExecuteNonQueryAsync( cancellationToken ) > 0;
+            await transaction.CommitAsync( cancellationToken );
+            if (written) { return true; }
+        }
+        return false;
+    }
+
+    private static byte[] SerializeIdentity( ClaimsIdentity identity ) {
+        using MemoryStream stream = new( );
+        using (BinaryWriter writer = new( stream, Encoding.UTF8, leaveOpen: true )) {
+            identity.WriteTo( writer );
+        }
+        return stream.ToArray( );
+    }
+
+    private async Task<StoredCredentialRow?> ReadCredentialRowAsync( string did, CancellationToken cancellationToken ) {
+        await using SqliteConnection connection = new( connectionString );
+        await connection.OpenAsync( cancellationToken );
+        await using SqliteCommand read = connection.CreateCommand( );
+        read.CommandText = """
+                           SELECT "Identity", "ProofKeyHash", "ExpiresAtUtcTicks"
+                           FROM "idunno_bluesky_identities" WHERE "Did" = @did;
+                           """;
+        read.Parameters.Add( "@did", SqliteType.Text ).Value = did;
+        await using SqliteDataReader reader = await read.ExecuteReaderAsync( cancellationToken );
+        return await reader.ReadAsync( cancellationToken )
+            ? new StoredCredentialRow( reader.GetFieldValue<byte[]>( 0 ),
+                reader.IsDBNull( 1 ) ? null : reader.GetString( 1 ), reader.GetInt64( 2 ) )
+            : null;
+    }
+
+    private async Task<bool> StoredExpiryIsLaterAsync( byte[] stored, AccessCredentials candidate ) {
+        try {
+            IdentityStoreRetrievedContext retrieved = new( stored );
+            await Events.PostRetrieval( retrieved );
+            using MemoryStream stream = new( retrieved.Identity.ToArray( ) );
+            using BinaryReader reader = new( stream, Encoding.UTF8 );
+            ClaimsIdentity identity = new( reader );
+            return AtProtoCredential.TryCreate( identity, out DPoPAccessCredentials? storedCredentials ) &&
+                   storedCredentials is not null &&
+                   storedCredentials.ExpiresOn > candidate.ExpiresOn;
+        } catch (Exception ex) {
+            // A row this class cannot read cannot be compared. Let the write proceed rather than
+            // leaving unreadable credentials in place.
+            _logger.LogWarning( ex, "Stored Bluesky credentials could not be compared before a credential write." );
+            return false;
+        }
+    }
 
     private async Task WriteAsync( ClaimsIdentity identity, bool add, CancellationToken cancellationToken ) {
         ArgumentNullException.ThrowIfNull( identity );
@@ -170,17 +275,77 @@ internal sealed class BridgeBeatsIdentityStore(
         }
     }
 
-    public Task Remove( Did did, CancellationToken cancellationToken = default ) {
+    public async Task Remove( Did did, CancellationToken cancellationToken = default ) {
         string? observed = null;
         if (httpContextAccessor.HttpContext?.Items.TryGetValue( s_observedSessions, out object? value ) == true &&
             value is Dictionary<string, string> sessions) {
             _ = sessions.TryGetValue( did.ToString( ), out observed );
         }
-        return RemoveSessionAsync( did, observed, requireMatch: true, cancellationToken );
+        // The SDK revokes the credential itself before calling this, so the removed row is discarded here.
+        _ = await RemoveSessionAsync( did, observed, requireMatch: true, cancellationToken );
     }
 
-    internal Task RemoveCurrentAsync( Did did, CancellationToken cancellationToken = default ) =>
+    /// <returns>The stored credential row this call deleted, or <see langword="null"/> when no row was removed.</returns>
+    internal Task<byte[]?> RemoveCurrentAsync( Did did, CancellationToken cancellationToken = default ) =>
         RemoveSessionAsync( did, expectedProof: null, requireMatch: false, cancellationToken );
+
+    /// <summary>
+    /// Deletes the credential and browser rows for <paramref name="did"/> on the supplied connection and
+    /// transaction, so account deletion can commit the rows and the local user together. The caller owns
+    /// the transaction and must not treat the rows as removed until it commits.
+    /// </summary>
+    /// <returns>The stored credential row this call deleted, or <see langword="null"/> when the DID had none.</returns>
+    internal static async Task<byte[]?> RemoveAccountAsync( Did did, DbConnection connection, DbTransaction transaction,
+        CancellationToken cancellationToken = default ) {
+        ArgumentNullException.ThrowIfNull( did );
+        byte[]? removed;
+        await using (DbCommand removeIdentity = connection.CreateCommand( )) {
+            removeIdentity.Transaction = transaction;
+            removeIdentity.CommandText = "DELETE FROM \"idunno_bluesky_identities\" WHERE \"Did\" = @did RETURNING \"Identity\";";
+            _ = removeIdentity.Parameters.Add( CreateParameter( removeIdentity, "@did", did.ToString( ) ) );
+            removed = await removeIdentity.ExecuteScalarAsync( cancellationToken ) as byte[];
+        }
+        await using (DbCommand removeBrowsers = connection.CreateCommand( )) {
+            removeBrowsers.Transaction = transaction;
+            removeBrowsers.CommandText = """
+                                        DELETE FROM "bridgebeats_bluesky_sessions" WHERE "Did" = @did;
+                                        DELETE FROM "idunno_bluesky_refresh_locks" WHERE "Did" = @did;
+                                        """;
+            _ = removeBrowsers.Parameters.Add( CreateParameter( removeBrowsers, "@did", did.ToString( ) ) );
+            _ = await removeBrowsers.ExecuteNonQueryAsync( cancellationToken );
+        }
+        return removed;
+    }
+
+    private static DbParameter CreateParameter( DbCommand command, string name, object value ) {
+        DbParameter parameter = command.CreateParameter( );
+        parameter.ParameterName = name;
+        parameter.Value = value;
+        return parameter;
+    }
+
+    /// <summary>
+    /// Restores a stored row to the credential it holds. The row is protected by the configured store
+    /// events, so it is passed through <see cref="IdentityStoreEvents.PostRetrieval"/> before parsing.
+    /// Call this after the deleting transaction commits, so no user callback runs while the write is open.
+    /// </summary>
+    internal async Task<ClaimsIdentity?> ReadCredentialAsync( byte[]? stored, string did ) {
+        if (stored is null) { return null; }
+        try {
+            IdentityStoreRetrievedContext retrieved = new( stored );
+            await Events.PostRetrieval( retrieved );
+            using MemoryStream stream = new( retrieved.Identity.ToArray( ) );
+            using BinaryReader reader = new( stream, Encoding.UTF8 );
+            return new ClaimsIdentity( reader );
+        } catch (Exception ex) {
+            LogCredentialReadFailed( _logger, ex, did );
+            return null;
+        }
+    }
+
+    [LoggerMessage( EventId = Logging.LogEventIds.Authentication.BlueskyIdentityReadFailed, Level = LogLevel.Warning,
+        Message = "Stored Bluesky credentials for {Did} could not be read for remote revocation." )]
+    private static partial void LogCredentialReadFailed( ILogger logger, Exception exception, string did );
 
     internal async Task<bool> IsBrowserSessionCurrentAsync( Did did, string sessionId,
         CancellationToken cancellationToken = default ) {
@@ -230,8 +395,11 @@ internal sealed class BridgeBeatsIdentityStore(
         return extended;
     }
 
-    /// <returns>Whether this was the final active browser and its shared credential was removed.</returns>
-    internal async Task<bool> RemoveBrowserSessionAsync( Did did, string sessionId,
+    /// <returns>
+    /// The stored credential row deleted when this was the final active browser, or <see langword="null"/>
+    /// when the session row was already gone or another browser still holds the shared credential.
+    /// </returns>
+    internal async Task<byte[]?> RemoveBrowserSessionAsync( Did did, string sessionId,
         CancellationToken cancellationToken = default ) {
         await using SqliteConnection connection = new( connectionString );
         await connection.OpenAsync( cancellationToken );
@@ -243,7 +411,7 @@ internal sealed class BridgeBeatsIdentityStore(
         remove.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
         if (await remove.ExecuteNonQueryAsync( cancellationToken ) == 0) {
             await transaction.CommitAsync( cancellationToken );
-            return false;
+            return null;
         }
         await using SqliteCommand remaining = connection.CreateCommand( );
         remaining.Transaction = transaction;
@@ -253,34 +421,34 @@ internal sealed class BridgeBeatsIdentityStore(
                                 """;
         remaining.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
         remaining.Parameters.Add( "@now", SqliteType.Integer ).Value = DateTime.UtcNow.Ticks;
-        bool last = await remaining.ExecuteScalarAsync( cancellationToken ) is null;
-        if (last) {
-            await using SqliteCommand removeIdentity = connection.CreateCommand( );
-            removeIdentity.Transaction = transaction;
-            removeIdentity.CommandText = "DELETE FROM \"idunno_bluesky_identities\" WHERE \"Did\" = @did;";
-            removeIdentity.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
-            _ = await removeIdentity.ExecuteNonQueryAsync( cancellationToken );
-            await UpdateConcurrencyStampAsync( connection, transaction, did, cancellationToken );
+        if (await remaining.ExecuteScalarAsync( cancellationToken ) is not null) {
+            await transaction.CommitAsync( cancellationToken );
+            return null;
         }
+        byte[]? removed = await DeleteIdentityAsync( connection, transaction, did, cancellationToken );
+        await UpdateConcurrencyStampAsync( connection, transaction, did, cancellationToken );
         await transaction.CommitAsync( cancellationToken );
-        return last;
+        return removed;
     }
 
-    private async Task RemoveSessionAsync( Did did, string? expectedProof, bool requireMatch, CancellationToken cancellationToken ) {
+    private async Task<byte[]?> RemoveSessionAsync( Did did, string? expectedProof, bool requireMatch,
+        CancellationToken cancellationToken ) {
         ArgumentNullException.ThrowIfNull( did );
-        if (requireMatch && expectedProof is null) { return; }
+        if (requireMatch && expectedProof is null) { return null; }
         await using SqliteConnection connection = new( connectionString );
         await connection.OpenAsync( cancellationToken );
         await using SqliteTransaction transaction = (SqliteTransaction)await connection.BeginTransactionAsync( cancellationToken );
         await using SqliteCommand remove = connection.CreateCommand( );
         remove.Transaction = transaction;
+        // RETURNING yields the row this statement deleted, so the caller revokes the credential that
+        // actually left the store rather than whatever a later read happens to find under the DID.
         remove.CommandText = !requireMatch
-            ? "DELETE FROM \"idunno_bluesky_identities\" WHERE \"Did\" = @did;"
-            : "DELETE FROM \"idunno_bluesky_identities\" WHERE \"Did\" = @did AND \"ProofKeyHash\" = @proof;";
+            ? "DELETE FROM \"idunno_bluesky_identities\" WHERE \"Did\" = @did RETURNING \"Identity\";"
+            : "DELETE FROM \"idunno_bluesky_identities\" WHERE \"Did\" = @did AND \"ProofKeyHash\" = @proof RETURNING \"Identity\";";
         remove.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
         if (expectedProof is not null) { remove.Parameters.Add( "@proof", SqliteType.Text ).Value = expectedProof; }
-        int removed = await remove.ExecuteNonQueryAsync( cancellationToken );
-        if (!requireMatch || removed > 0) {
+        byte[]? removed = await remove.ExecuteScalarAsync( cancellationToken ) as byte[];
+        if (!requireMatch || removed is not null) {
             await using SqliteCommand removeBrowsers = connection.CreateCommand( );
             removeBrowsers.Transaction = transaction;
             removeBrowsers.CommandText = "DELETE FROM \"bridgebeats_bluesky_sessions\" WHERE \"Did\" = @did;";
@@ -293,6 +461,16 @@ internal sealed class BridgeBeatsIdentityStore(
             }
         }
         await transaction.CommitAsync( cancellationToken );
+        return removed;
+    }
+
+    private static async Task<byte[]?> DeleteIdentityAsync( SqliteConnection connection, SqliteTransaction transaction,
+        Did did, CancellationToken cancellationToken ) {
+        await using SqliteCommand removeIdentity = connection.CreateCommand( );
+        removeIdentity.Transaction = transaction;
+        removeIdentity.CommandText = "DELETE FROM \"idunno_bluesky_identities\" WHERE \"Did\" = @did RETURNING \"Identity\";";
+        removeIdentity.Parameters.Add( "@did", SqliteType.Text ).Value = did.ToString( );
+        return await removeIdentity.ExecuteScalarAsync( cancellationToken ) as byte[];
     }
 
     private static async Task RotateStampAsync( SqliteConnection connection, SqliteTransaction transaction, Did did,

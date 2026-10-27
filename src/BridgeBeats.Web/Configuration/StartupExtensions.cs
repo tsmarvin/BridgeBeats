@@ -64,11 +64,22 @@ namespace BridgeBeats.Web.Configuration {
             _ = builder.WebHost.ConfigureBridgeBeatsServices(
                 builder.Services,
                 builder.Configuration,
-                builder.Environment.IsProduction( )
+                RequiresStrictAuthConfiguration( builder.Environment )
             );
 
             return builder;
         }
+
+        /// <summary>
+        /// Reports whether the environment must fail fast on invalid authentication configuration.
+        /// Only Development and Testing may start with a relaxed authentication configuration; every
+        /// other deployed environment name, including Staging, fails fast so a deployment cannot
+        /// silently ship without Bluesky sign-in.
+        /// </summary>
+        /// <param name="environment">The host environment being configured.</param>
+        /// <returns><c>true</c> when invalid authentication configuration stops startup.</returns>
+        internal static bool RequiresStrictAuthConfiguration( IHostEnvironment environment ) =>
+            !environment.IsDevelopment( ) && environment.EnvironmentName != "Testing";
 
         /// <summary>
         /// Registers the BridgeBeats service graph against the supplied service collection from within a
@@ -78,15 +89,15 @@ namespace BridgeBeats.Web.Configuration {
         /// <param name="builder">The web host builder being configured.</param>
         /// <param name="services">The service collection to populate.</param>
         /// <param name="config">The configuration used to bind settings.</param>
-        /// <param name="isProduction">Whether production configuration rules apply.</param>
+        /// <param name="failFastOnInvalidAuthConfiguration">Whether invalid authentication configuration stops startup.</param>
         /// <returns>The same <paramref name="builder"/> instance, to allow call chaining.</returns>
         internal static TBuilder ConfigureBridgeBeatsServices<TBuilder>(
             this TBuilder builder,
             IServiceCollection services,
             IConfiguration config,
-            bool isProduction
+            bool failFastOnInvalidAuthConfiguration
         ) where TBuilder : IWebHostBuilder {
-            _ = AddBridgeBeatsServices( services, config, isProduction );
+            _ = AddBridgeBeatsServices( services, config, failFastOnInvalidAuthConfiguration );
             return builder;
         }
 
@@ -97,13 +108,13 @@ namespace BridgeBeats.Web.Configuration {
         /// </summary>
         /// <param name="services">The service collection to populate.</param>
         /// <param name="config">The configuration used to bind the <c>BridgeBeats</c> settings section.</param>
-        /// <param name="isProduction">Whether production configuration rules apply.</param>
+        /// <param name="failFastOnInvalidAuthConfiguration">Whether invalid authentication configuration stops startup.</param>
         /// <returns>The same <paramref name="services"/> instance, to allow call chaining.</returns>
         /// <exception cref="InvalidOperationException">Thrown when no music providers can be enabled from the configured settings.</exception>
         internal static IServiceCollection AddBridgeBeatsServices(
             this IServiceCollection services,
             IConfiguration config,
-            bool isProduction = false
+            bool failFastOnInvalidAuthConfiguration = false
         ) {
             // Add services to the container.
             _ = services
@@ -120,13 +131,13 @@ namespace BridgeBeats.Web.Configuration {
             string? disabledReason = null;
             try {
                 origin = AuthenticationOrigin.Parse( settings.Domain );
-            } catch (InvalidOperationException ex) when (!isProduction) {
+            } catch (InvalidOperationException ex) when (!failFastOnInvalidAuthConfiguration) {
                 origin = null;
                 disabledReason = ex.Message;
             }
             bool blueskyEnabled = origin is not null &&
                                   !string.IsNullOrWhiteSpace( settings.ATProtoOAuthSigningKeyPath );
-            if (isProduction && origin is not null && !blueskyEnabled) {
+            if (failFastOnInvalidAuthConfiguration && origin is not null && !blueskyEnabled) {
                 throw new InvalidOperationException(
                     "BridgeBeats:ATProtoOAuthSigningKeyPath is required when Bluesky sign-in is enabled in production." );
             }
@@ -518,7 +529,13 @@ namespace BridgeBeats.Web.Configuration {
         /// <param name="settings">The settings supplying the API-key salt and internal-service key.</param>
         /// <exception cref="InvalidOperationException">Thrown when the API-key salt is missing.</exception>
         internal static void ConfigureApiKeyAuth( IServiceCollection services, AppSettings settings ) =>
-            ConfigureApiKeyAuth( services, settings, AuthenticationOrigin.Parse( settings.Domain ) is not null );
+            ConfigureApiKeyAuth(
+                services,
+                settings,
+                // Must match the enablement the host computes, including the signing key: a domain alone
+                // does not enable Bluesky, so the helper cannot drift from production behavior.
+                AuthenticationOrigin.Parse( settings.Domain ) is not null &&
+                !string.IsNullOrWhiteSpace( settings.ATProtoOAuthSigningKeyPath ) );
 
         private static void ConfigureApiKeyAuth( IServiceCollection services, AppSettings settings, bool blueskyEnabled ) {
 

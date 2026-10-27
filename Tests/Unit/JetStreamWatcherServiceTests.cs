@@ -303,7 +303,7 @@ public class JetStreamWatcherServiceTests {
         bool includeRecord,
         int expectedEnqueues
     ) {
-        const string post = """
+        const string PostJson = """
             {
               "$type": "app.bsky.feed.post",
               "text": "music",
@@ -327,7 +327,7 @@ public class JetStreamWatcherServiceTests {
                 "operation": "{{operation}}",
                 "collection": "app.bsky.feed.post",
                 "rkey": "3lqro2x5vfs2b",
-                "record": {{(includeRecord ? post : "null")}}
+                "record": {{(includeRecord ? PostJson : "null")}}
               }
             }
             """;

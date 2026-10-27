@@ -69,6 +69,34 @@ public class BlueskySigningKeyConfigurationTests {
         } finally { File.Delete( path ); }
     }
 
+    /// <summary>
+    /// The installers regenerate the signing key for exactly these shapes rather than accepting
+    /// them. If the loader ever starts accepting one, the installers are discarding a key the
+    /// application would have used.
+    /// </summary>
+    [TestMethod]
+    public void UnusableSigningKeyShapes_AreRejectedByTheLoader( ) {
+        string path = Path.GetTempFileName( );
+        try {
+            foreach (string unusable in new[] { "", "   \n\t\n", "{}", "{ }", "your_atproto_oauth_key_here" }) {
+                File.WriteAllText( path, unusable );
+                bool rejected = false;
+                try {
+                    _ = BlueskyAuthenticationConfiguration.LoadSigningKey( path );
+                } catch (Exception) {
+                    rejected = true;
+                }
+                Assert.IsTrue( rejected, $"Signing key content '{unusable.Replace( "\n", "\\n" )}' loaded successfully, "
+                    + "but the installers treat it as unusable and replace it." );
+
+                // Positive control: the same loop must accept a usable key, so the assertions above
+                // cannot pass merely because every load attempt throws.
+                File.WriteAllText( path, ATProtoSigningKeyProvider.GenerateNewSigningKeyJwk( ) );
+                Assert.IsNotNull( BlueskyAuthenticationConfiguration.LoadSigningKey( path ) );
+            }
+        } finally { File.Delete( path ); }
+    }
+
     [TestMethod]
     public void ProductionBlueskyConfiguration_KeepsHttpsNonLoopbackTransportRestrictionsEnabled( ) {
         string path = Path.GetTempFileName( );

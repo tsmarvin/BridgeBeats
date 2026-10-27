@@ -13,6 +13,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 
 namespace BridgeBeats.Web.Controllers;
 
@@ -364,8 +365,10 @@ public partial class AccountController(
     }
 
     /// <summary>
-    /// Permanently deletes the authenticated user's account. The user is signed out first, then the
-    /// account and its associated identity data are removed.
+    /// Permanently deletes the authenticated user's account. The stored OAuth credential and browser
+    /// rows are deleted in the same transaction as the user row, so a sign-in callback running
+    /// concurrently with the deletion cannot leave credentials behind for a deleted account. The
+    /// credential is revoked after that transaction commits, and the user is signed out.
     /// </summary>
     /// <returns>
     /// HTTP POST <c>account/delete</c>. <c>200 OK</c> with a confirmation message on success;
@@ -382,20 +385,48 @@ public partial class AccountController(
             return Unauthorized( );
         }
 
-        // Revoke the linked OAuth session even when deletion is authenticated with an API key.
-        BlueskySessionService? sessions = GetBlueskySessions( );
-        if (sessions is not null) {
-            await sessions.EndSessionAsync( HttpContext, user.AtProtoDid );
-            await ReloadLinkedAccountAsync( user );
+        // The stored OAuth rows and the local user row go together: a callback that recreates a row
+        // after the user row is gone would otherwise leave credentials behind with no account to
+        // reach them from, and a failed deletion would revoke credentials that are still in use.
+        byte[]? removedCredentials = null;
+        IdentityResult result;
+        await using (ApplicationDbContext db = HttpContext.RequestServices.GetRequiredService<ApplicationDbContext>( )) {
+            await db.Database.OpenConnectionAsync( HttpContext.RequestAborted );
+            await using IDbContextTransaction transaction = await db.Database.BeginTransactionAsync( HttpContext.RequestAborted );
+            // Account deletion must not report success while leaving credentials behind, so a missing
+            // transaction handle fails the request rather than silently skipping the row removal.
+            System.Data.Common.DbTransaction transactionHandle = transaction.GetDbTransaction( )
+                ?? throw new InvalidOperationException( "The account deletion transaction is not available on its connection." );
+            try {
+                // The credential rows go with the user row whether or not the OAuth service is registered
+                // in this host. A linked DID can hold stored credentials from an earlier deployment that
+                // enabled OAuth, and the store's tables exist regardless, so removing the rows cannot be
+                // conditional on the service being resolvable here. Remote revocation stays conditional:
+                // it needs the service, and it runs after the commit.
+                if (user.AtProtoDid is { Length: > 0 } linkedDid) {
+                    removedCredentials = await BridgeBeatsIdentityStore.RemoveAccountAsync( new Did( linkedDid ),
+                        db.Database.GetDbConnection( ), transactionHandle, HttpContext.RequestAborted );
+                }
+                result = await userManager.DeleteAsync( user );
+                if (!result.Succeeded) {
+                    await transaction.RollbackAsync( HttpContext.RequestAborted );
+                    LogDeleteFailed( user.Id );
+                    return BadRequest( new { message = "Failed to delete account. Please try again." } );
+                }
+                await transaction.CommitAsync( HttpContext.RequestAborted );
+            } catch {
+                await transaction.RollbackAsync( HttpContext.RequestAborted );
+                throw;
+            }
         }
+
         await signInManager.SignOutAsync( );
-
-        // Delete the user
-        IdentityResult result = await userManager.DeleteAsync( user );
-
-        if (!result.Succeeded) {
-            LogDeleteFailed( user.Id );
-            return BadRequest( new { message = "Failed to delete account. Please try again." } );
+        BlueskySessionService? ended = GetBlueskySessions( );
+        if (ended is not null) {
+            ended.ClearBrowserCookie( HttpContext );
+            // Revoke the credential the committed deletion removed, so a callback cannot leave a grant
+            // behind and a rolled-back deletion never revokes credentials still in use.
+            await ended.RevokeRemovedAccountAsync( removedCredentials, user.AtProtoDid );
         }
 
         LogAccountDeleted( user.Id );

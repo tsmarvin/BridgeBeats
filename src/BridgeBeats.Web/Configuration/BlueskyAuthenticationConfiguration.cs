@@ -1,3 +1,4 @@
+using System.Threading.RateLimiting;
 using BridgeBeats.Core.Infrastructure.Identity;
 using BridgeBeats.Web.Authentication;
 using idunno.AtProto;
@@ -13,7 +14,6 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Http;
 using Microsoft.Extensions.Http.Resilience;
 using OpenTelemetry.Metrics;
-using System.Threading.RateLimiting;
 
 namespace BridgeBeats.Web.Configuration;
 
@@ -82,11 +82,12 @@ internal static class BlueskyAuthenticationConfiguration {
         // PostConfigure runs after its registration, so this bound wins.
         _ = services.PostConfigure<HttpClientFactoryOptions>( "idunno.atproto", options =>
             options.HttpClientActions.Add( client => client.Timeout = TimeSpan.FromSeconds( 30 ) ) );
-        _ = services.AddSingleton( new OAuthLoginClientAddressResolver( settings.OAuthTrustedProxyHost ) );
+        _ = services.AddSingleton( provider => new OAuthLoginClientAddressResolver(
+            settings.OAuthTrustedProxyHost, loggerFactory: provider.GetRequiredService<ILoggerFactory>( ) ) );
         _ = services.AddHostedService( provider => provider.GetRequiredService<OAuthLoginClientAddressResolver>( ) );
         _ = services.AddRateLimiter( options => {
             options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
-            options.AddPolicy( LoginStartRateLimitPolicy, context =>
+            _ = options.AddPolicy( LoginStartRateLimitPolicy, context =>
                 RateLimitPartition.GetFixedWindowLimiter( context.RequestServices.GetRequiredService<OAuthLoginClientAddressResolver>( ).GetPartitionKey( context ),
                     _ => new FixedWindowRateLimiterOptions {
                         PermitLimit = 60,

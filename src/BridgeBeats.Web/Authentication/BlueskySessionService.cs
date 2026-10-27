@@ -33,13 +33,36 @@ public sealed partial class BlueskySessionService(
             }
             if (ticket is not null) { await EndBrowserSessionAsync( options, ticket ); }
         } finally {
-            if (context is not null) {
-                // The SDK may have queued a sliding renewal during authentication. Its response
-                // hook must not write the old reference cookie after this deletion.
-                context.Items[SessionEndedKey] = true;
-                options.CookieManager.DeleteCookie( context, options.Cookie.Name!, options.Cookie.Build( context ) );
-            }
+            if (context is not null) { ClearBrowserCookie( options, context ); }
         }
+    }
+
+    /// <summary>
+    /// Clears the Bluesky reference cookie for this response without touching stored rows. Account
+    /// deletion uses this because it removes the rows itself, in the same transaction as the user row.
+    /// </summary>
+    internal void ClearBrowserCookie( HttpContext context ) => ClearBrowserCookie(
+        authenticationOptions.Get( BlueskyAuthenticationDefaults.AuthenticationScheme ), context );
+
+    private static void ClearBrowserCookie( BlueskyAuthenticationOptions options, HttpContext context ) {
+        // The SDK may have queued a sliding renewal during authentication. Its response
+        // hook must not write the old reference cookie after this deletion.
+        context.Items[SessionEndedKey] = true;
+        options.CookieManager.DeleteCookie( context, options.Cookie.Name!, options.Cookie.Build( context ) );
+    }
+
+    /// <summary>
+    /// Revokes a credential row returned by <see cref="BridgeBeatsIdentityStore.RemoveAccountAsync"/> after
+    /// its transaction committed, so a failed account deletion never revokes credentials that are still in
+    /// use. Account deletion calls this only when the OAuth service is registered, because revoking a grant
+    /// requires it.
+    /// </summary>
+    internal async Task RevokeRemovedAccountAsync( byte[]? removed, string? did ) {
+        if (removed is null || string.IsNullOrWhiteSpace( did )) { return; }
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)authenticationOptions
+            .Get( BlueskyAuthenticationDefaults.AuthenticationScheme ).IdentityStore!;
+        ClaimsIdentity? identity = await store.ReadCredentialAsync( removed, did );
+        if (identity is not null) { await RevokeAsync( identity, did ); }
     }
 
     internal Task EndReplacedSessionAsync( AuthenticationTicket ticket ) =>
@@ -53,26 +76,23 @@ public sealed partial class BlueskySessionService(
         if (did is null || sessionId is null) { return; }
         Did identifier = new( did );
         BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)options.IdentityStore!;
-        ClaimsIdentity? identity = await ReadIdentityAsync( store, identifier, did );
-        if (await store.RemoveBrowserSessionAsync( identifier, sessionId ) && identity is not null) {
-            await RevokeAsync( identity, did );
-        }
+        byte[]? removed = await store.RemoveBrowserSessionAsync( identifier, sessionId );
+        await RevokeRemovedAsync( store, removed, did );
     }
 
     private async Task EndAllSessionsAsync( BlueskyAuthenticationOptions options, Did did ) {
         BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)options.IdentityStore!;
-        ClaimsIdentity? identity = await ReadIdentityAsync( store, did, did.ToString( ) );
-        await store.RemoveCurrentAsync( did );
-        if (identity is not null) { await RevokeAsync( identity, did.ToString( ) ); }
+        byte[]? removed = await store.RemoveCurrentAsync( did );
+        await RevokeRemovedAsync( store, removed, did.ToString( ) );
     }
 
-    private async Task<ClaimsIdentity?> ReadIdentityAsync( BridgeBeatsIdentityStore store, Did did, string didValue ) {
-        try {
-            return await store.GetIdentity( did );
-        } catch (Exception ex) {
-            LogIdentityReadFailed( logger, ex, didValue );
-            return null;
-        }
+    /// <summary>
+    /// Revokes the credential row a removal returned. The row came out of the store in the same write
+    /// that deleted it, so this cannot revoke a grant that a concurrent sign-in stored afterwards.
+    /// </summary>
+    private async Task RevokeRemovedAsync( BridgeBeatsIdentityStore store, byte[]? removed, string did ) {
+        ClaimsIdentity? identity = await store.ReadCredentialAsync( removed, did );
+        if (identity is not null) { await RevokeAsync( identity, did ); }
     }
 
     private async Task RevokeAsync( ClaimsIdentity identity, string did ) {
@@ -87,8 +107,4 @@ public sealed partial class BlueskySessionService(
     [LoggerMessage( EventId = Logging.LogEventIds.Authentication.BlueskyRevocationFailed, Level = LogLevel.Warning,
         Message = "Bluesky credentials for {Did} could not be revoked; removing the local session." )]
     private static partial void LogRevocationFailed( ILogger logger, Exception exception, string did );
-
-    [LoggerMessage( EventId = Logging.LogEventIds.Authentication.BlueskyIdentityReadFailed, Level = LogLevel.Warning,
-        Message = "Bluesky credentials for {Did} could not be read before local session removal." )]
-    private static partial void LogIdentityReadFailed( ILogger logger, Exception exception, string did );
 }

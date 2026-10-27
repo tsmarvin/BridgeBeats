@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.IdentityModel.Tokens.Jwt;
 using System.Net;
 using System.Net.Http.Json;
@@ -58,6 +59,7 @@ public class BlueskyAuthenticationIntegrationTests {
     private readonly OAuthHandler _oauth = new( );
     private readonly ActionExceptionObserver _actionExceptionObserver = new( );
     private CancellationTokenSource? _serverRequestAborted;
+    private bool _blueskyEnabled = true;
     public TestContext TestContext { get; set; } = null!;
 
     [TestInitialize]
@@ -138,12 +140,14 @@ public class BlueskyAuthenticationIntegrationTests {
         _ = _handles.Setup( h => h.ResolveHandleAsync( It.IsAny<Did>( ), It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( new Handle( "first.example" ) );
         _ = builder.Services.AddSingleton( _handles.Object );
-        _ = builder.Services.AddBridgeBeatsBluesky( settings,
-            "https://bridgebeats.example" + BlueskyAuthenticationConfiguration.ClientMetadataPath, "https://bridgebeats.example" );
-        _ = builder.Services.PostConfigure<BlueskyAgentOptions>( options => {
-            options.OAuthOptions!.AllowInsecureProtocols = true;
-            options.OAuthOptions.AllowLoopback = true;
-        } );
+        if (_blueskyEnabled) {
+            _ = builder.Services.AddBridgeBeatsBluesky( settings,
+                "https://bridgebeats.example" + BlueskyAuthenticationConfiguration.ClientMetadataPath, "https://bridgebeats.example" );
+            _ = builder.Services.PostConfigure<BlueskyAgentOptions>( options => {
+                options.OAuthOptions!.AllowInsecureProtocols = true;
+                options.OAuthOptions.AllowLoopback = true;
+            } );
+        }
         // The OAuth transport is deterministic; all application middleware, stores, DP, events and Identity run normally.
         _ = builder.Services.RemoveAll<IHttpClientFactory>( );
         _ = builder.Services.AddSingleton<IHttpClientFactory>( new TestHttpClientFactory( _oauth ) );
@@ -156,25 +160,34 @@ public class BlueskyAuthenticationIntegrationTests {
         } );
         _ = _app.UseRouting( );
         _ = _app.UseCanonicalAuthenticationOrigin( AuthenticationOrigin.Parse( settings.Domain ) );
-        _ = _app.UseBlueskyOAuthClientMetadata( );
+        if (_blueskyEnabled) {
+            // The login-start limiter is only mounted when OAuth is enabled, matching the production pipeline.
+            // Without it the policy registered by AddBridgeBeatsBluesky is never applied to a request.
+            _ = _app.UseRateLimiter( );
+            _ = _app.UseBlueskyOAuthClientMetadata( );
+        }
         _ = _app.UseStaticFiles( );
-        // Metadata is generated from the production URLs above. The SDK's discovery development mode
-        // additionally requires an HTTP callback when talking to the local HTTP authorization server.
-        _app.Services.GetRequiredService<IOptionsMonitor<BlueskyAgentOptions>>( ).CurrentValue.OAuthOptions!.ReturnUri = new Uri( _service + "/account/atproto-callback" );
-        _app.Services.GetRequiredService<IOptions<BlueskyAgentOptions>>( ).Value.OAuthOptions!.ReturnUri = new Uri( _service + "/account/atproto-callback" );
+        if (_blueskyEnabled) {
+            // Metadata is generated from the production URLs above. The SDK's discovery development mode
+            // additionally requires an HTTP callback when talking to the local HTTP authorization server.
+            _app.Services.GetRequiredService<IOptionsMonitor<BlueskyAgentOptions>>( ).CurrentValue.OAuthOptions!.ReturnUri = new Uri( _service + "/account/atproto-callback" );
+            _app.Services.GetRequiredService<IOptions<BlueskyAgentOptions>>( ).Value.OAuthOptions!.ReturnUri = new Uri( _service + "/account/atproto-callback" );
+        }
         _ = _app.UseAuthentication( );
         _ = _app.UseAuthorization( );
-        _ = _app.MapPost( "/test/signin", async ( HttpContext context ) => {
-            ClaimsIdentity identity = IIdentityStore.BuildClaimsIdentity( CreateCredentials( DateTime.UtcNow.AddHours( 1 ) ) );
-            await context.SignInAsync( s_scheme, new ClaimsPrincipal( identity ) );
-            await context.Response.WriteAsync( "signed in", TestContext.CancellationToken );
-        } );
-        _ = _app.MapGet( "/test/who", ( HttpContext context, BlueskyAgent agent ) => Results.Json( new {
-            authenticated = context.User.Identity?.IsAuthenticated == true,
-            userId = context.User.FindFirstValue( System.Security.Claims.ClaimTypes.NameIdentifier ),
-            did = context.User.FindFirstValue( AtProtoClaims.Did ),
-            agentAuthenticated = agent.IsAuthenticated
-        } ) );
+        if (_blueskyEnabled) {
+            _ = _app.MapPost( "/test/signin", async ( HttpContext context ) => {
+                ClaimsIdentity identity = IIdentityStore.BuildClaimsIdentity( CreateCredentials( DateTime.UtcNow.AddHours( 1 ) ) );
+                await context.SignInAsync( s_scheme, new ClaimsPrincipal( identity ) );
+                await context.Response.WriteAsync( "signed in", TestContext.CancellationToken );
+            } );
+            _ = _app.MapGet( "/test/who", ( HttpContext context, BlueskyAgent agent ) => Results.Json( new {
+                authenticated = context.User.Identity?.IsAuthenticated == true,
+                userId = context.User.FindFirstValue( System.Security.Claims.ClaimTypes.NameIdentifier ),
+                did = context.User.FindFirstValue( AtProtoClaims.Did ),
+                agentAuthenticated = agent.IsAuthenticated
+            } ) );
+        }
         _ = _app.MapControllers( );
         _ = _app.MapDefaultControllerRoute( );
         await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
@@ -184,8 +197,10 @@ public class BlueskyAuthenticationIntegrationTests {
         await _app.StartAsync( TestContext.CancellationToken );
         _client = _app.GetTestClient( );
         _client.BaseAddress = new Uri( "https://bridgebeats.example" );
-        _oauth.MetadataRetriever = async cancellationToken =>
-            await _client.GetFromJsonAsync<JsonElement>( "/oauth-client-metadata.json", cancellationToken );
+        if (_blueskyEnabled) {
+            _oauth.MetadataRetriever = async cancellationToken =>
+                await _client.GetFromJsonAsync<JsonElement>( "/oauth-client-metadata.json", cancellationToken );
+        }
     }
 
     [TestCleanup]
@@ -273,8 +288,8 @@ public class BlueskyAuthenticationIntegrationTests {
                                INSERT INTO "idunno_bluesky_refresh_locks" ("Did", "LockToken", "ExpiresAtUtcTicks")
                                VALUES (@did, 'old', @expired);
                                """;
-            seed.Parameters.AddWithValue( "@did", OtherDidValue );
-            seed.Parameters.AddWithValue( "@expired", DateTime.UtcNow.AddMinutes( -1 ).Ticks );
+            _ = seed.Parameters.AddWithValue( "@did", OtherDidValue );
+            _ = seed.Parameters.AddWithValue( "@expired", DateTime.UtcNow.AddMinutes( -1 ).Ticks );
             _ = await seed.ExecuteNonQueryAsync( TestContext.CancellationToken );
         }
 
@@ -287,7 +302,7 @@ public class BlueskyAuthenticationIntegrationTests {
                             SELECT (SELECT COUNT(*) FROM "idunno_bluesky_identities" WHERE "Did" = @did) +
                                    (SELECT COUNT(*) FROM "idunno_bluesky_refresh_locks" WHERE "Did" = @did);
                             """;
-        count.Parameters.AddWithValue( "@did", OtherDidValue );
+        _ = count.Parameters.AddWithValue( "@did", OtherDidValue );
         Assert.AreEqual( 0L, await count.ExecuteScalarAsync( TestContext.CancellationToken ) );
     }
 
@@ -610,7 +625,9 @@ public class BlueskyAuthenticationIntegrationTests {
     public async Task LastBlueskyLogout_KeepsLinkedPasswordBrowserSignedIn( ) {
         await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
             ApplicationUser user = new( ) {
-                UserName = "linked@example.com", Email = "linked@example.com", AtProtoDid = DidValue
+                UserName = "linked@example.com",
+                Email = "linked@example.com",
+                AtProtoDid = DidValue
             };
             Assert.IsTrue( (await scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>( )
                 .CreateAsync( user, "ValidPassword123!" )).Succeeded );
@@ -928,6 +945,99 @@ public class BlueskyAuthenticationIntegrationTests {
         Assert.IsNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
     }
 
+    /// <summary>
+    /// A callback that has bound its accounts but not yet written its credential must not survive a deletion
+    /// that commits first. The credential write is conditioned on the local user row, so once the deletion has
+    /// removed that row the callback's write cannot match and is rejected rather than recreating credentials
+    /// for an account that no longer exists.
+    ///
+    /// The ordering is forced, not raced. A sign-in leaves one stored credential; the callback is then run and
+    /// parked inside its credential write — the barrier sits on <see cref="IdentityStoreEvents.OnStoring"/>,
+    /// which the store raises after the account binding is verified and before the row is written. The deletion
+    /// runs to completion while the callback is parked, and only then is the callback released. Without the
+    /// barrier the callback would usually win and this would assert nothing about the ordering.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 60000, CooperativeCancellation = true )]
+    public async Task DeletionCommittedWhileCallbackIsBinding_RevokesItsGrantAndBlocksTheCallback( ) {
+        _ = await SignInAsync( );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        string storedGrant = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!
+            .FindFirst( AtProtoClaims.RefreshToken )!.Value;
+        string callback = await PrepareOAuthCallbackAsync( );
+        TaskCompletionSource callbackStoring = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        TaskCompletionSource releaseCallback = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        Func<IdentityStoreSettingContext, Task>? previousOnStoring = store.Events.OnStoring;
+        store.Events.OnStoring = setting => {
+            _ = callbackStoring.TrySetResult( );
+            return releaseCallback.Task.WaitAsync( TimeSpan.FromSeconds( 20 ), TestContext.CancellationToken );
+        };
+        try {
+            // The callback reaches its credential write and parks there, holding the account it bound.
+            Task<HttpResponseMessage> inFlight = _client.GetAsync( callback, TestContext.CancellationToken );
+            await callbackStoring.Task.WaitAsync( TimeSpan.FromSeconds( 10 ), TestContext.CancellationToken );
+            // The deletion runs to completion while the callback is parked.
+            using HttpResponseMessage deleted = await _client.PostAsync( "/account/delete", null, TestContext.CancellationToken );
+            Assert.AreEqual( HttpStatusCode.OK, deleted.StatusCode,
+                await deleted.Content.ReadAsStringAsync( TestContext.CancellationToken ) );
+            releaseCallback.SetResult( );
+            using HttpResponseMessage callbackResponse = await inFlight.WaitAsync( TimeSpan.FromSeconds( 20 ), TestContext.CancellationToken );
+            Assert.AreEqual( HttpStatusCode.Redirect, callbackResponse.StatusCode,
+                "A callback whose account was deleted underneath it must be rejected." );
+            Assert.AreEqual( "/account/login", new Uri( _client.BaseAddress!, callbackResponse.Headers.Location! ).AbsolutePath );
+        } finally {
+            _ = releaseCallback.TrySetResult( );
+            store.Events.OnStoring = previousOnStoring;
+        }
+
+        Assert.IsNull( await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ),
+            "The rejected callback must not recreate a credential row for the deleted account." );
+        Assert.AreEqual( 0, await BlueskyRowCountAsync( ), "No OAuth row may remain for the deleted DID." );
+        // The deletion committed while the callback held a grant it had not stored, so the only grant there
+        // was to revoke is the one the deletion removed.
+        Assert.Contains( storedGrant, _oauth.RevokedRefreshTokens,
+            "The deletion must revoke the exact grant whose row it removed." );
+        await using AsyncServiceScope check = _app.Services.CreateAsyncScope( );
+        Assert.AreEqual( 0, await check.ServiceProvider.GetRequiredService<ApplicationDbContext>( )
+            .Users.CountAsync( TestContext.CancellationToken ) );
+    }
+
+    /// <summary>
+    /// The reverse order: a callback that commits its credential before the deletion must not shield the
+    /// credential from it. The deletion removes the row the callback stored, revokes that exact grant, and
+    /// leaves no row in any of the three OAuth tables.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 60000, CooperativeCancellation = true )]
+    public async Task DeletionAfterCallbackCommitted_RevokesTheStoredGrantAndLeavesNoRows( ) {
+        string callback = await PrepareOAuthCallbackAsync( );
+        using HttpResponseMessage callbackResponse = await _client.GetAsync( callback, TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.Redirect, callbackResponse.StatusCode );
+        string blueskyCookie = callbackResponse.Headers.GetValues( "Set-Cookie" )
+            .Single( c => c.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=", StringComparison.Ordinal ) ).Split( ';' )[0];
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        string committedGrant = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!
+            .FindFirst( AtProtoClaims.RefreshToken )!.Value;
+        // The identity the callback established is a different one from the before-sign-in state, so a fresh
+        // anti-forgery token is needed for the deletion and only the callback's cookie is carried into it.
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", blueskyCookie );
+        await AddAntiforgeryHeaderAsync( );
+
+        using HttpResponseMessage deleted = await _client.PostAsync( "/account/delete", null, TestContext.CancellationToken );
+
+        Assert.AreEqual( HttpStatusCode.OK, deleted.StatusCode,
+            await deleted.Content.ReadAsStringAsync( TestContext.CancellationToken ) );
+        Assert.Contains( committedGrant, _oauth.RevokedRefreshTokens,
+            "The deletion must revoke the exact grant the committed callback stored." );
+        Assert.IsNull( await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+        Assert.AreEqual( 0, await BlueskyRowCountAsync( ),
+            "Account deletion must remove every OAuth row, including the one the callback stored." );
+        await using AsyncServiceScope check = _app.Services.CreateAsyncScope( );
+        Assert.AreEqual( 0, await check.ServiceProvider.GetRequiredService<ApplicationDbContext>( )
+            .Users.CountAsync( TestContext.CancellationToken ) );
+    }
+
     [TestMethod]
     public async Task Callback_RejectsLockedOutLocalAccount( ) {
         await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
@@ -1205,6 +1315,31 @@ public class BlueskyAuthenticationIntegrationTests {
         JsonElement who = await whoResponse.Content.ReadFromJsonAsync<JsonElement>( TestContext.CancellationToken );
         Assert.IsTrue( who.GetProperty( "authenticated" ).GetBoolean( ) );
         Assert.IsTrue( who.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+    }
+
+    /// <summary>
+    /// Login start is rate limited to 60 requests per address per minute, so the 61st request from the same
+    /// address is rejected with 429. The boundary is asserted between the two requests rather than by sending a
+    /// burst: the limit is exact, and a test that only checks "some request eventually gets a 429" passes even
+    /// when the limiter is set far from its configured value.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 60000, CooperativeCancellation = true )]
+    public async Task LoginStart_IsRateLimitedToSixtyRequestsPerMinute( ) {
+        await AddAntiforgeryHeaderAsync( );
+        for (int request = 1; request <= 60; request++) {
+            using HttpResponseMessage allowed = await _client.PostAsJsonAsync( "/account/login-atproto",
+                new { handle = "first.example" }, TestContext.CancellationToken );
+            Assert.AreEqual( HttpStatusCode.OK, allowed.StatusCode,
+                $"Request {request} is within the 60-per-minute allowance and must succeed, not be rejected " +
+                $"for any other reason: {await allowed.Content.ReadAsStringAsync( TestContext.CancellationToken )}" );
+        }
+
+        using HttpResponseMessage limited = await _client.PostAsJsonAsync( "/account/login-atproto",
+            new { handle = "first.example" }, TestContext.CancellationToken );
+
+        Assert.AreEqual( HttpStatusCode.TooManyRequests, limited.StatusCode,
+            "The 61st login start from one address within the window must be rejected by the rate limiter." );
     }
 
     [TestMethod]
@@ -1651,6 +1786,600 @@ public class BlueskyAuthenticationIntegrationTests {
         Assert.IsGreaterThan( 0, _oauth.Revocations );
     }
 
+    /// <summary>
+    /// The grant presented for revocation must be the one whose row the removal deleted, not a value an
+    /// earlier read of the DID happened to return. A credential stored between such a read and the delete
+    /// would otherwise keep working while an already-replaced grant was revoked in its place.
+    ///
+    /// The removal performs no separate read to race against: it deletes the row with one statement and
+    /// reports what that statement removed, so there is no read-then-delete window for a writer to slip into.
+    /// The replacement here is stored in full before the removal runs, so the two do not overlap, and what
+    /// this establishes is that the removal reports the row standing when it ran rather than a value captured
+    /// before the replacement — the earlier value is what a read-then-delete shape would have reported, and
+    /// the assertion below rejects it if so. A removal forced to overlap the storing of a replacement is
+    /// covered by <see cref="EndAllSessions_KeepsAReplacementStoredWhileTheRemovalWasInFlight"/>, and the
+    /// revocation the reported row drives is checked exactly in
+    /// <see cref="RemoveLinkedSession_RevokesTheDeletedRowExactlyAndNotTheReplacedGrant"/>.
+    /// </summary>
+    [TestMethod]
+    public async Task RemoveCurrentAsync_ReportsTheCredentialRowItDeleted( ) {
+        _ = await SignInAsync( );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        string replacedGrant = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!
+            .FindFirst( AtProtoClaims.RefreshToken )!.Value;
+        // The row the DID holds when the removal runs, which is not the row any earlier read would have seen.
+        ClaimsIdentity replacement = IIdentityStore.BuildClaimsIdentity(
+            CreateCredentials( DateTime.UtcNow.AddHours( 2 ), "replacement-grant" ) );
+        await store.Update( replacement, TestContext.CancellationToken );
+
+        ClaimsIdentity? removed = await store.ReadCredentialAsync(
+            await store.RemoveCurrentAsync( new Did( DidValue ), TestContext.CancellationToken ), DidValue );
+
+        Assert.IsNotNull( removed, "Removal must report the row it deleted." );
+        Assert.AreEqual( "replacement-grant", removed.FindFirst( AtProtoClaims.RefreshToken )!.Value,
+            "Removal must report the row it deleted, not an earlier read of the same DID." );
+        Assert.AreNotEqual( replacedGrant, removed.FindFirst( AtProtoClaims.RefreshToken )!.Value );
+        Assert.IsNull( await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+    }
+
+    /// <summary>
+    /// Ending the session for a DID whose credential row was replaced must revoke the replacement grant and
+    /// only that one. The replacement is stored in full before the session ends, so this fixes which grant is
+    /// current when the removal runs without overlapping the two. It is the negative control for the
+    /// reported-row assertions above: it checks the tokens that actually reached the revocation endpoint, so a
+    /// removal that reported the right row but revoked a different grant — or revoked both — is caught here
+    /// even though the reported bytes looked correct. A replacement stored while the removal is in flight is
+    /// covered by <see cref="EndAllSessions_KeepsAReplacementStoredWhileTheRemovalWasInFlight"/>.
+    /// </summary>
+    [TestMethod]
+    public async Task RemoveLinkedSession_RevokesTheDeletedRowExactlyAndNotTheReplacedGrant( ) {
+        _ = await SignInAsync( );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        string replacedGrant = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!
+            .FindFirst( AtProtoClaims.RefreshToken )!.Value;
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        await AddReplacementCredentialsAsync( store, DateTime.UtcNow.AddHours( 2 ), "replacement-grant" );
+
+        await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
+        await scope.ServiceProvider.GetRequiredService<BlueskySessionService>( ).EndSessionAsync( null, DidValue );
+
+        Assert.Contains( "replacement-grant", _oauth.RevokedRefreshTokens,
+            "Revocation must present the grant of the row the removal deleted." );
+        Assert.DoesNotContain( replacedGrant, _oauth.RevokedRefreshTokens,
+            "Revocation must not present the grant the removal replaced." );
+        Assert.HasCount( 1, _oauth.RevokedRefreshTokens,
+            "The removal deleted one row, so exactly one grant may be revoked for it." );
+    }
+
+    /// <summary>
+    /// A replacement credential stored while the global session removal is in flight must survive both that
+    /// removal and the revocation the removal drives. The row the removal deletes belongs to the grant that
+    /// was stored when it ran; a grant stored after that is a later, still-valid session, and deleting or
+    /// revoking it signs its browser out for nothing.
+    ///
+    /// The ordering is forced, not raced. The removal is parked inside the restore of the row it deleted —
+    /// the barrier is a one-shot gate on <see cref="IdentityStoreEvents.OnRetrieved"/>, which the store raises
+    /// when it turns the returned bytes back into a credential, after the deleting statement has committed —
+    /// the replacement is then stored in full with its own browser session, and only then is the removal
+    /// released to revoke. A removal that read the DID before deleting it instead deletes the row this test
+    /// stores as the replacement, which the row assertions below reject.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task EndAllSessions_KeepsAReplacementStoredWhileTheRemovalWasInFlight( ) {
+        _ = await SignInAsync( );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
+        string deletedGrant = await StoreReplacementWhileRemovalIsInFlightAsync( store, ( ) =>
+            scope.ServiceProvider.GetRequiredService<BlueskySessionService>( ).EndSessionAsync( null, DidValue ) );
+
+        AssertRevocationTargetedOnlyTheDeletedRow( deletedGrant );
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            "The replacement credential row must remain stored after the removal completed." );
+        ClaimsIdentity? persisted = await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken );
+        Assert.IsNotNull( persisted, "The replacement stored while the removal was in flight must remain stored." );
+        Assert.AreEqual( "replacement-grant", persisted.FindFirst( AtProtoClaims.RefreshToken )!.Value,
+            "The credential left stored must be the replacement, not the row the removal deleted." );
+    }
+
+    /// <summary>
+    /// The same interleaving through the path a browser takes. Ending the last browser's session removes its
+    /// session row and, with no other active browser left, the credential row shared by the DID. This is a
+    /// separate removal from the global one — the session row it deletes is chosen by session, and the
+    /// credential row goes only when no active browser remains — so it is forced through the same barrier.
+    /// The replacement's browser session is asserted to be in place afterwards, because the row and the
+    /// session are what leave the storing browser usable.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task EndBrowserSession_KeepsAReplacementStoredWhileTheRemovalWasInFlight( ) {
+        using HttpResponseMessage signedIn = await SignInAsync( );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        AuthenticationTicket ticket = Options( ).TicketDataFormat.Unprotect(
+            _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( ).Split( '=', 2 )[1] )!;
+        await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
+        string deletedGrant = await StoreReplacementWhileRemovalIsInFlightAsync( store, ( ) =>
+            scope.ServiceProvider.GetRequiredService<BlueskySessionService>( ).EndReplacedSessionAsync( ticket ) );
+
+        AssertRevocationTargetedOnlyTheDeletedRow( deletedGrant );
+        string? sessionId = await StoredBrowserSessionIdAsync( );
+        Assert.IsNotNull( sessionId, "The browser session that stored the replacement must remain stored." );
+        Assert.IsTrue( await store.IsBrowserSessionCurrentAsync( new Did( DidValue ), sessionId, TestContext.CancellationToken ),
+            "The browser that stored the replacement must still hold a current session." );
+        ClaimsIdentity? persisted = await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken );
+        Assert.IsNotNull( persisted, "The replacement stored while the removal was in flight must remain stored." );
+        Assert.AreEqual( "replacement-grant", persisted.FindFirst( AtProtoClaims.RefreshToken )!.Value,
+            "The credential left stored must be the replacement, not the row the removal deleted." );
+    }
+
+    [TestMethod]
+    public async Task RemoveBrowserSessionAsync_ReportsTheCredentialRowItDeleted( ) {
+        using HttpResponseMessage signedIn = await SignInAsync( );
+        AuthenticationTicket ticket = Options( ).TicketDataFormat.Unprotect(
+            _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( ).Split( '=', 2 )[1] )!;
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        string storedGrant = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!
+            .FindFirst( AtProtoClaims.RefreshToken )!.Value;
+
+        ClaimsIdentity? removed = await store.ReadCredentialAsync(
+            await store.RemoveBrowserSessionAsync( new Did( DidValue ),
+                ticket.Properties.GetString( BlueskyAccountEvents.BrowserSessionProperty )!, TestContext.CancellationToken ),
+            DidValue );
+
+        Assert.IsNotNull( removed, "Ending the last browser must report the shared credential it deleted." );
+        Assert.AreEqual( storedGrant, removed.FindFirst( AtProtoClaims.RefreshToken )!.Value );
+        Assert.IsNull( await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+    }
+
+    /// <summary>Ending one browser session must not report the shared credential as removed.</summary>
+    [TestMethod]
+    public async Task RemoveBrowserSessionAsync_ReportsNothingWhileAnotherBrowserRemains( ) {
+        _ = await SignInAsync( );
+        string firstSession = Options( ).TicketDataFormat.Unprotect(
+            _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( ).Split( '=', 2 )[1] )!
+            .Properties.GetString( BlueskyAccountEvents.BrowserSessionProperty )!;
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _ = await SignInAsync( );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+
+        byte[]? removed = await store.RemoveBrowserSessionAsync( new Did( DidValue ), firstSession, TestContext.CancellationToken );
+
+        Assert.IsNull( removed, "A browser that still shares the credential must not trigger revocation." );
+        Assert.IsNotNull( await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+    }
+
+    /// <summary>
+    /// Logout must present the refresh token of the stored row, so the test asserts the exact grant rather
+    /// than that some revocation occurred.
+    /// </summary>
+    [TestMethod]
+    public async Task Logout_RevokesTheStoredGrantExactly( ) {
+        _ = await SignInAsync( );
+        string storedGrant = (await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!
+            .FindFirst( AtProtoClaims.RefreshToken )!.Value;
+        await AddAntiforgeryHeaderAsync( );
+
+        using HttpResponseMessage logout = await _client.PostAsync( "/account/logout", null, TestContext.CancellationToken );
+
+        Assert.AreEqual( HttpStatusCode.OK, logout.StatusCode );
+        Assert.Contains( storedGrant, _oauth.RevokedRefreshTokens,
+            "Logout must revoke the grant held for the removed row." );
+    }
+
+    /// <summary>
+    /// A caller holding older tokens must not overwrite newer stored credentials. AT Proto refresh tokens
+    /// are single use, so restoring the older pair would reinstate a spent refresh token and sign the user
+    /// out at the next refresh.
+    /// </summary>
+    [TestMethod]
+    public async Task UpdateIfNewer_DoesNotReplaceNewerStoredCredentials( ) {
+        _ = await SignInAsync( );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        Assert.IsTrue( await store.UpdateIfNewer(
+            CreateCredentials( DateTime.UtcNow.AddHours( 2 ), "newer-grant" ), TestContext.CancellationToken ) );
+
+        bool written = await store.UpdateIfNewer(
+            CreateCredentials( DateTime.UtcNow.AddHours( 1 ), "stale-grant" ), TestContext.CancellationToken );
+
+        Assert.IsFalse( written, "A write carrying older credentials must report that nothing was written." );
+        ClaimsIdentity persisted = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!;
+        Assert.AreEqual( "newer-grant", persisted.FindFirst( AtProtoClaims.RefreshToken )!.Value );
+    }
+
+    /// <summary>
+    /// Credentials written through the store's own update path are refused when the stored row belongs to
+    /// a different OAuth grant. A caller holding tokens from before a replacement grant was stored carries
+    /// the same DID, and a long enough expiry it can read from the store, so neither the DID nor the expiry
+    /// distinguishes it from the current row. Without the proof-key comparison such a write returns true
+    /// while reinstating credentials whose refresh token the service has already spent.
+    /// </summary>
+    [TestMethod]
+    public async Task UpdateIfNewer_RefusesCredentialsFromAReplacedGrant( ) {
+        _ = await SignInAsync( );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        string replacedGrant = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!
+            .FindFirst( AtProtoClaims.RefreshToken )!.Value;
+        string replacedProofKey = _proofKey;
+        _proofKey = ATProtoSigningKeyProvider.GenerateNewSigningKeyJwk( );
+        await AddReplacementCredentialsAsync( store, DateTime.UtcNow.AddHours( 3 ), "replacement-grant" );
+        // The superseded grant's tokens, presented late but carrying an expiry the stored row has not passed,
+        // so the proof-key comparison is the only rule that can refuse this write.
+        DPoPAccessCredentials stale = CreateCredentials(
+            DateTime.UtcNow.AddHours( 9 ), replacedGrant, proofKey: replacedProofKey );
+
+        bool written = await store.UpdateIfNewer( stale, TestContext.CancellationToken );
+
+        Assert.IsFalse( written, "Credentials from a replaced grant must not be written." );
+        ClaimsIdentity persisted = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!;
+        Assert.AreEqual( "replacement-grant", persisted.FindFirst( AtProtoClaims.RefreshToken )!.Value,
+            "The replacement grant must survive a late write from the grant it replaced." );
+    }
+
+    /// <summary>
+    /// The agent raises credential updates through the interface member rather than the store method, so a
+    /// write from a replaced grant must be refused there too. This exercises the path the SDK calls.
+    /// </summary>
+    [TestMethod]
+    public async Task OnCredentialsUpdated_RefusesCredentialsFromAReplacedGrant( ) {
+        _ = await SignInAsync( );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        string replacedGrant = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!
+            .FindFirst( AtProtoClaims.RefreshToken )!.Value;
+        string replacedProofKey = _proofKey;
+        _proofKey = ATProtoSigningKeyProvider.GenerateNewSigningKeyJwk( );
+        await AddReplacementCredentialsAsync( store, DateTime.UtcNow.AddHours( 3 ), "replacement-grant" );
+        IIdentityStore sdkStore = store;
+        DPoPAccessCredentials stale = CreateCredentials(
+            DateTime.UtcNow.AddHours( 9 ), replacedGrant, proofKey: replacedProofKey );
+
+        await sdkStore.OnCredentialsUpdated(
+            new idunno.AtProto.Events.CredentialsUpdatedEventArgs( new Did( DidValue ), new Uri( _service ), stale ),
+            TestContext.CancellationToken );
+
+        ClaimsIdentity persisted = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!;
+        Assert.AreEqual( "replacement-grant", persisted.FindFirst( AtProtoClaims.RefreshToken )!.Value,
+            "The credential-update path the agent calls must not reinstate a replaced grant." );
+    }
+
+    /// <summary>
+    /// The SDK delivers credential updates through <see cref="IIdentityStore.OnCredentialsUpdated"/>, so a
+    /// stale update must be refused on that path too. This exercises the interface member the agent calls
+    /// rather than the store method directly.
+    /// </summary>
+    [TestMethod]
+    public async Task OnCredentialsUpdated_DoesNotReplaceNewerStoredCredentials( ) {
+        _ = await SignInAsync( );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        Assert.IsTrue( await store.UpdateIfNewer(
+            CreateCredentials( DateTime.UtcNow.AddHours( 2 ), "newer-grant" ), TestContext.CancellationToken ) );
+        IIdentityStore sdkStore = store;
+        DPoPAccessCredentials stale = CreateCredentials( DateTime.UtcNow.AddHours( 1 ), "stale-grant" );
+
+        await sdkStore.OnCredentialsUpdated(
+            new idunno.AtProto.Events.CredentialsUpdatedEventArgs( new Did( DidValue ), new Uri( _service ), stale ),
+            TestContext.CancellationToken );
+
+        ClaimsIdentity persisted = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!;
+        Assert.AreEqual( "newer-grant", persisted.FindFirst( AtProtoClaims.RefreshToken )!.Value,
+            "The credential-update path the agent calls must not reinstate older tokens." );
+    }
+
+    /// <summary>
+    /// The SDK raises a credential update for a rotated DPoP nonce as well as for a token refresh, and each
+    /// such update carries an expiry the stored row has already reached. One carrying an expiry equal to the
+    /// stored row's must still be stored, so the comparison that refuses a stale write cannot refuse on
+    /// "not later than" alone. This writes a distinct grant at the stored row's exact expiry, which is the
+    /// expiry relation a nonce rotation presents; the rotation itself is covered through the credential-update
+    /// path the agent calls by
+    /// <see cref="OnCredentialsUpdated_WritesNonceOnlyRotationCarryingTheSameExpiry"/>.
+    /// </summary>
+    [TestMethod]
+    public async Task UpdateIfNewer_WritesCredentialsCarryingTheSameExpiry( ) {
+        _ = await SignInAsync( );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        ClaimsIdentity stored = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!;
+        Assert.IsTrue( AtProtoCredential.TryCreate( stored, out DPoPAccessCredentials? current ) );
+        DPoPAccessCredentials sameExpiry = CreateCredentials(
+            current!.ExpiresOn.UtcDateTime, "same-expiry-grant" );
+
+        bool written = await store.UpdateIfNewer( sameExpiry, TestContext.CancellationToken );
+
+        Assert.IsTrue( written, "An update carrying the same expiry must still be stored." );
+        ClaimsIdentity persisted = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!;
+        Assert.AreEqual( "same-expiry-grant", persisted.FindFirst( AtProtoClaims.RefreshToken )!.Value );
+    }
+
+    /// <summary>
+    /// A nonce-only rotation arrives through the same store member as a token refresh, carrying the very same
+    /// access token and expiry and differing only in the DPoP nonce. The other tests call the store's
+    /// <c>UpdateIfNewer</c> directly, but the agent raises these updates through
+    /// <see cref="IIdentityStore.OnCredentialsUpdated"/>, so this covers the path the SDK actually calls and
+    /// asserts the rotated nonce reaches the stored row rather than being dropped.
+    /// </summary>
+    [TestMethod]
+    public async Task OnCredentialsUpdated_WritesNonceOnlyRotationCarryingTheSameExpiry( ) {
+        _ = await SignInAsync( );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        Assert.IsTrue( AtProtoCredential.TryCreate(
+            (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!,
+            out DPoPAccessCredentials? current ) );
+        DPoPAccessCredentials rotatedNonce = new(
+            current!.Service, current.AccessJwt, current.RefreshToken, current.DPoPProofKey, "rotated-nonce" );
+        IIdentityStore sdkStore = store;
+
+        await sdkStore.OnCredentialsUpdated(
+            new idunno.AtProto.Events.CredentialsUpdatedEventArgs( new Did( DidValue ), new Uri( _service ), rotatedNonce ),
+            TestContext.CancellationToken );
+
+        // The persisted nonce proves the update reached the stored row: it differs from the nonce the row started
+        // from, so the row has to be re-read to observe the change at all. The unchanged refresh token proves the
+        // nonce-only rotation preserved the grant it was issued for rather than replacing it.
+        ClaimsIdentity persisted = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!;
+        Assert.IsTrue( AtProtoCredential.TryCreate( persisted, out DPoPAccessCredentials? saved ) );
+        Assert.AreEqual( "rotated-nonce", saved!.DPoPNonce,
+            "A nonce-only rotation delivered through the credential-update path must reach the stored row." );
+        Assert.AreEqual( current.RefreshToken, saved.RefreshToken,
+            "A nonce-only rotation must not replace the grant it was issued for." );
+        Assert.AreEqual( current.ExpiresOn, saved.ExpiresOn,
+            "A nonce-only rotation carries the same expiry." );
+    }
+
+    /// <summary>
+    /// A writer that read the stored row and then had a newer credential committed under it must not put its
+    /// own row back. The two writers here share a proof key, so the proof-key comparison cannot separate them
+    /// and the decision rests entirely on the store's compare-and-set: the write names the row it compared, and
+    /// the transaction is what evaluates that name.
+    ///
+    /// The interleaving is forced rather than waited for. The older writer is parked inside its comparison —
+    /// the barrier sits on <see cref="IdentityStoreEvents.OnRetrieved"/>, which the store raises after it has
+    /// read the row, with the row bytes already in hand — the newer credential is committed in full, and only
+    /// then is the older writer released to attempt its write against the row it no longer matches. Without the
+    /// barrier the older writer would usually finish first and overwrite, and the assertion below would be
+    /// measuring the race rather than the guard.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task UpdateIfNewer_CannotReplaceARowThatChangedAfterItWasRead( ) {
+        _ = await SignInAsync( );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        TaskCompletionSource comparedOldRow = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        TaskCompletionSource releaseOlderWriter = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        // Set only while the older writer is the sole writer in flight, and cleared by the gate itself on the
+        // first call, so the newer writer's comparison is never held by this barrier.
+        bool olderWriterIsComparing = false;
+        // Both writers carry an expiry later than the stored row's, so the stored-expiry comparison cannot
+        // refuse either of them and the row-identity guard is the only rule left that can. The older writer
+        // holds the row it compared; the newer one commits over it.
+        DPoPAccessCredentials older = CreateCredentials( DateTime.UtcNow.AddHours( 9 ), "stale-same-proof-grant" );
+        DPoPAccessCredentials newer = CreateCredentials( DateTime.UtcNow.AddHours( 10 ), "newer-same-proof-grant" );
+        Func<IdentityStoreRetrievedContext, Task>? previousOnRetrieved = store.Events.OnRetrieved;
+        store.Events.OnRetrieved = _ => {
+            if (!olderWriterIsComparing) { return Task.CompletedTask; }
+            olderWriterIsComparing = false;
+            comparedOldRow.SetResult( );
+            return releaseOlderWriter.Task.WaitAsync( TimeSpan.FromSeconds( 10 ), TestContext.CancellationToken );
+        };
+        try {
+            olderWriterIsComparing = true;
+            Task<bool> olderWrite = store.UpdateIfNewer( older, TestContext.CancellationToken );
+            await comparedOldRow.Task.WaitAsync( TimeSpan.FromSeconds( 10 ), TestContext.CancellationToken );
+
+            // The newer credential commits while the older writer holds the row it compared above.
+            Assert.IsTrue( await store.UpdateIfNewer( newer, TestContext.CancellationToken ),
+                "The newer credential must be stored while the older writer is parked." );
+            releaseOlderWriter.SetResult( );
+
+            Assert.IsFalse( await olderWrite.WaitAsync( TimeSpan.FromSeconds( 10 ), TestContext.CancellationToken ),
+                "A write whose comparison row was replaced mid-flight must report that nothing was written." );
+        } finally {
+            store.Events.OnRetrieved = previousOnRetrieved;
+        }
+
+        ClaimsIdentity persisted = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!;
+        Assert.AreEqual( "newer-same-proof-grant", persisted.FindFirst( AtProtoClaims.RefreshToken )!.Value,
+            "The credential committed after the older writer's comparison must survive it." );
+        Assert.IsTrue( AtProtoCredential.TryCreate( persisted, out DPoPAccessCredentials? saved ) );
+        Assert.AreEqual( newer.ExpiresOn, saved!.ExpiresOn,
+            "The exact credential stored must be the newer one, not the older writer's pair." );
+    }
+
+    /// <summary>
+    /// Two credential writes that overlap must leave the later expiry stored. The barrier here sits on
+    /// <see cref="IdentityStoreEvents.OnStoring"/>, which the store raises before it reads the stored row, so
+    /// this overlaps the two writers without fixing which of them reads its comparison row first. The
+    /// interleaving that actually needs forcing — an older writer that has already read the row it intends to
+    /// replace, with a newer writer committing in between — is covered by
+    /// <see cref="UpdateIfNewer_CannotReplaceARowThatChangedAfterItWasRead"/>.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ConcurrentCredentialWrites_LeaveTheLaterExpiryStored( ) {
+        _ = await SignInAsync( );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        TaskCompletionSource bothReading = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        int reached = 0;
+        Options( ).IdentityStore!.Events.OnStoring = async _ => {
+            if (Interlocked.Increment( ref reached ) == 2) { bothReading.SetResult( ); }
+            await bothReading.Task.WaitAsync( TimeSpan.FromSeconds( 10 ), TestContext.CancellationToken );
+        };
+
+        Task<bool> newer = store.UpdateIfNewer( CreateCredentials( DateTime.UtcNow.AddHours( 3 ), "newer-grant" ), TestContext.CancellationToken );
+        Task<bool> stale = store.UpdateIfNewer( CreateCredentials( DateTime.UtcNow.AddHours( 1 ), "stale-grant" ), TestContext.CancellationToken );
+        _ = await Task.WhenAll( newer, stale ).WaitAsync( TimeSpan.FromSeconds( 15 ), TestContext.CancellationToken );
+
+        ClaimsIdentity persisted = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!;
+        Assert.AreEqual( "newer-grant", persisted.FindFirst( AtProtoClaims.RefreshToken )!.Value,
+            "The later expiry must win whichever write reached the store first." );
+    }
+
+    /// <summary>
+    /// A failed account deletion must leave the stored credential in place and must not revoke it. The
+    /// credential rows and the user row commit or roll back together, and revocation follows the commit.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task DeleteAccount_WhenUserRowDeletionFails_RollsBackCredentialsAndSkipsRevocation( ) {
+        _ = await SignInAsync( );
+        await AddAntiforgeryHeaderAsync( );
+        await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
+            ApplicationDbContext db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>( );
+            _ = await db.Database.ExecuteSqlRawAsync(
+                """
+                CREATE TRIGGER reject_user_deletion BEFORE DELETE ON AspNetUsers
+                BEGIN SELECT RAISE(ABORT, 'injected user deletion failure'); END;
+                """, TestContext.CancellationToken );
+        }
+
+        try {
+            using HttpResponseMessage response = await _client.PostAsync( "/account/delete", null, TestContext.CancellationToken );
+            Assert.AreNotEqual( HttpStatusCode.OK, response.StatusCode,
+                "A deletion whose user row could not be removed must not report success." );
+        } catch (Exception exception) when (ContainsInjectedDeletionFailure( exception )) {
+            // TestServer can surface the application exception directly. EF reports the aborted
+            // DELETE as a DbUpdateException wrapping the SQLite error.
+        }
+
+        // "Not OK" alone does not show the trigger was reached: a request rejected before the action runs also
+        // reports "not OK". The recorded failure message is what proves the DELETE was attempted and aborted.
+        Assert.Contains( ContainsInjectedDeletionFailure, _actionExceptionObserver.Exceptions,
+            "The deletion request must reach the injected trigger; otherwise this test asserts nothing about " +
+            "the rollback." );
+
+        Assert.IsNotNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ),
+            "A failed deletion must leave the stored credential in place." );
+        Assert.AreEqual( 0, _oauth.Revocations,
+            "A failed deletion must not revoke a credential that is still in use." );
+        await using AsyncServiceScope check = _app.Services.CreateAsyncScope( );
+        Assert.AreEqual( 1, await check.ServiceProvider.GetRequiredService<ApplicationDbContext>( )
+            .Users.CountAsync( TestContext.CancellationToken ) );
+    }
+
+    /// <summary>
+    /// After a successful deletion the DID must have no credential row, and no further credential can be
+    /// stored for it because the store conditions the write on the local user row.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task DeleteAccount_LeavesNoCredentialRowAndBlocksLaterStoresForTheDid( ) {
+        _ = await SignInAsync( );
+        await AddAntiforgeryHeaderAsync( );
+        using HttpResponseMessage deletion = await _client.PostAsync( "/account/delete", null, TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.OK, deletion.StatusCode );
+
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
+        IHttpContextAccessor accessor = scope.ServiceProvider.GetRequiredService<IHttpContextAccessor>( );
+        HttpContext? previousContext = accessor.HttpContext;
+        DefaultHttpContext request = new( ) { RequestServices = scope.ServiceProvider };
+        request.Items[BridgeBeatsIdentityStore.ExpectedStampKey] = "stamp-for-a-deleted-account";
+        request.Items[BridgeBeatsIdentityStore.PendingBrowserSessionKey] =
+            new BridgeBeatsIdentityStore.PendingBrowserSession( DidValue, "late-callback-session", DateTimeOffset.UtcNow.AddDays( 7 ) );
+        accessor.HttpContext = request;
+        try {
+            _ = await Assert.ThrowsExactlyAsync<InvalidOperationException>( ( ) => store.Add(
+                IIdentityStore.BuildClaimsIdentity( CreateCredentials( DateTime.UtcNow.AddHours( 1 ) ) ), TestContext.CancellationToken ) );
+        } finally {
+            accessor.HttpContext = previousContext;
+        }
+
+        Assert.IsNull( await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ),
+            "A callback arriving after deletion must not leave a credential row behind." );
+    }
+
+    /// <summary>
+    /// A host with Bluesky sign-in disabled still deletes the stored OAuth rows for a linked DID. The rows
+    /// can predate disabling the feature, and the resolver for the OAuth service returns nothing here, so a
+    /// deletion path that only removes rows when that service is registered leaves live credentials behind
+    /// for an account that no longer exists.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 60000, CooperativeCancellation = true )]
+    public async Task DeleteAccount_WithoutOAuthService_RemovesEveryRowForTheLinkedDid( ) {
+        await StartApplicationWithoutOAuthAsync( );
+        await AddAntiforgeryHeaderAsync( );
+        using HttpResponseMessage registration = await _client.PostAsJsonAsync( "/account/register",
+            new { email = "linked@example.com", password = "ValidPassword123!" }, TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.OK, registration.StatusCode );
+        SetIdentityCookie( registration );
+        // The token issued before sign-in is bound to the anonymous request, so a fresh one is requested
+        // once the registration cookie is in place.
+        await AddAntiforgeryHeaderAsync( );
+        await SeedLinkedBlueskyRowsAsync( );
+
+        using HttpResponseMessage deletion = await _client.PostAsync( "/account/delete", null, TestContext.CancellationToken );
+
+        Assert.AreEqual( HttpStatusCode.OK, deletion.StatusCode,
+            await deletion.Content.ReadAsStringAsync( TestContext.CancellationToken ) );
+        Assert.AreEqual( 0, await BlueskyRowCountAsync( ) );
+        await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
+        Assert.AreEqual( 0, await scope.ServiceProvider.GetRequiredService<ApplicationDbContext>( )
+            .Users.CountAsync( TestContext.CancellationToken ) );
+    }
+
+    /// <summary>
+    /// The same deletion with the user row refusing to be removed must leave every OAuth row in place, so a
+    /// failed deletion cannot strip credentials that are still in use.
+    ///
+    /// The failure has to be demonstrated rather than assumed. A deletion request whose anti-forgery token no
+    /// longer matches the signed-in identity is rejected with 400 before the action runs, and that 400 satisfies
+    /// a plain "not OK" assertion while the credential rows were never touched — the test would pass with the
+    /// rollback removed. So the anti-forgery token is reissued after the identity cookie is set, the injected
+    /// trigger is confirmed to abort the DELETE inside the transaction, and each of the three OAuth tables is
+    /// counted separately rather than as one total.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 60000, CooperativeCancellation = true )]
+    public async Task DeleteAccount_WithoutOAuthService_RollsBackRowsWhenUserDeletionFails( ) {
+        await StartApplicationWithoutOAuthAsync( );
+        await AddAntiforgeryHeaderAsync( );
+        using HttpResponseMessage registration = await _client.PostAsJsonAsync( "/account/register",
+            new { email = "linked@example.com", password = "ValidPassword123!" }, TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.OK, registration.StatusCode );
+        SetIdentityCookie( registration );
+        // SetIdentityCookie replaces the cookie collection with the identity cookie, which drops the
+        // anti-forgery cookie issued for the anonymous request. A token bound to that identity has to be
+        // issued now, or the deletion request is rejected with 400 before the action runs and the row
+        // assertions below never see the rollback they exist to check.
+        await AddAntiforgeryHeaderAsync( );
+        await SeedLinkedBlueskyRowsAsync( );
+        await AssertLinkedBlueskyRowsAsync( "before the deletion" );
+        await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
+            ApplicationDbContext db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>( );
+            _ = await db.Database.ExecuteSqlRawAsync(
+                """
+                CREATE TRIGGER reject_user_deletion BEFORE DELETE ON AspNetUsers
+                BEGIN SELECT RAISE(ABORT, 'injected user deletion failure'); END;
+                """, TestContext.CancellationToken );
+        }
+
+        HttpResponseMessage? deletion = null;
+        try {
+            deletion = await _client.PostAsync( "/account/delete", null, TestContext.CancellationToken );
+            Assert.AreNotEqual( HttpStatusCode.OK, deletion.StatusCode,
+                "A deletion whose user row could not be removed must not report success." );
+        } catch (Exception exception) when (ContainsInjectedDeletionFailure( exception )) {
+            // TestServer can surface the application exception from the request itself.
+        } finally {
+            deletion?.Dispose( );
+        }
+
+        // The trigger must actually have aborted the DELETE. A request rejected before the action runs — a
+        // 400 from anti-forgery validation, for instance — also reports "not OK" without ever opening the
+        // account-deletion transaction, so the failure message itself is the evidence that the rollback ran.
+        // The action filter records what the action threw; authorization filters run before it.
+        Assert.Contains( ContainsInjectedDeletionFailure, _actionExceptionObserver.Exceptions,
+            "The deletion request must reach the injected trigger. A request rejected before the action runs " +
+            "(for example by anti-forgery validation) leaves the rollback untested however 'not OK' it looks." );
+
+        // Each table is counted on its own: the credential row is what the rollback protects, and the browser
+        // session and refresh lock are the rows a partial removal would strand. A combined total could hide a
+        // credential row that came back while a session row was lost.
+        await AssertLinkedBlueskyRowsAsync( "after the rolled-back deletion" );
+        await using AsyncServiceScope check = _app.Services.CreateAsyncScope( );
+        Assert.AreEqual( 1, await check.ServiceProvider.GetRequiredService<ApplicationDbContext>( )
+            .Users.CountAsync( TestContext.CancellationToken ) );
+    }
+
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
     public async Task Register_WithMalformedEmail_Returns400( ) {
@@ -1862,8 +2591,7 @@ public class BlueskyAuthenticationIntegrationTests {
         using HttpResponseMessage logout = await _client.SendAsync( logoutRequest, TestContext.CancellationToken );
 
         Assert.AreEqual( HttpStatusCode.OK, logout.StatusCode );
-        string[] deletions = logout.Headers.GetValues( "Set-Cookie" )
-            .Where( value => value.StartsWith( name + "=;", StringComparison.Ordinal ) ).ToArray( );
+        string[] deletions = [.. logout.Headers.GetValues( "Set-Cookie" ).Where( value => value.StartsWith( name + "=;", StringComparison.Ordinal ) )];
         Assert.Contains( ( string value ) => value.Contains( "domain=", StringComparison.OrdinalIgnoreCase ), deletions );
         Assert.Contains( ( string value ) => !value.Contains( "domain=", StringComparison.OrdinalIgnoreCase ), deletions );
         AddResponseCookies( browser, _client.BaseAddress!, logout );
@@ -1890,8 +2618,7 @@ public class BlueskyAuthenticationIntegrationTests {
         using HttpResponseMessage switched = await _client.SendAsync( switchRequest, TestContext.CancellationToken );
 
         Assert.AreEqual( HttpStatusCode.OK, switched.StatusCode );
-        string[] deletions = switched.Headers.GetValues( "Set-Cookie" )
-            .Where( value => value.StartsWith( name + "=;", StringComparison.Ordinal ) ).ToArray( );
+        string[] deletions = [.. switched.Headers.GetValues( "Set-Cookie" ).Where( value => value.StartsWith( name + "=;", StringComparison.Ordinal ) )];
         Assert.Contains( ( string value ) => value.Contains( "domain=", StringComparison.OrdinalIgnoreCase ), deletions );
         Assert.Contains( ( string value ) => !value.Contains( "domain=", StringComparison.OrdinalIgnoreCase ), deletions );
         AddResponseCookies( browser, _client.BaseAddress!, switched );
@@ -1940,6 +2667,13 @@ public class BlueskyAuthenticationIntegrationTests {
         Assert.IsGreaterThan( 0, _oauth.Revocations );
     }
 
+    private static bool ContainsInjectedDeletionFailure( Exception exception ) {
+        for (Exception? current = exception; current is not null; current = current.InnerException) {
+            if (current.Message.Contains( "injected user deletion failure", StringComparison.Ordinal )) { return true; }
+        }
+        return false;
+    }
+
     private async Task AddAntiforgeryHeaderAsync( ) {
         // Antiforgery's cookie is separate from the SDK reference cookie.
         using HttpResponseMessage tokenResponse = await _client.GetAsync( "/account/antiforgery-token", TestContext.CancellationToken );
@@ -1958,6 +2692,206 @@ public class BlueskyAuthenticationIntegrationTests {
         _client.Dispose( );
         await _app.DisposeAsync( );
         await StartApplicationAsync( );
+    }
+
+    /// <summary>
+    /// Rebuilds the host with Bluesky sign-in left out of the service collection, which is how a deployment
+    /// that never configured OAuth signing keys runs.
+    /// </summary>
+    private async Task StartApplicationWithoutOAuthAsync( ) {
+        _client.Dispose( );
+        await _app.DisposeAsync( );
+        _blueskyEnabled = false;
+        await StartApplicationAsync( );
+        Assert.IsNull( _app.Services.GetService<BlueskySessionService>( ),
+            "The OAuth service must be absent for this test to cover the disabled-feature path." );
+    }
+
+    /// <summary>Sends the identity cookie a registration or password login issued on later requests.</summary>
+    private void SetIdentityCookie( HttpResponseMessage response ) {
+        string name = _app.Services
+            .GetRequiredService<IOptionsMonitor<Microsoft.AspNetCore.Authentication.Cookies.CookieAuthenticationOptions>>( )
+            .Get( IdentityConstants.ApplicationScheme ).Cookie.Name!;
+        string cookie = response.Headers.GetValues( "Set-Cookie" )
+            .Last( value => value.StartsWith( name + "=", StringComparison.Ordinal ) ).Split( ';' )[0];
+        // Only the identity cookie is kept. A token requested later is bound to this identity, and the
+        // antiforgery cookie issued for the anonymous request before sign-in must not shadow the fresh one.
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", cookie );
+    }
+
+    /// <summary>
+    /// Stores <paramref name="refresh"/> as the credential row for the linked DID the way a sign-in does,
+    /// so the row carries the current proof key and registers the browser session that stores it.
+    /// </summary>
+    private async Task AddReplacementCredentialsAsync( BridgeBeatsIdentityStore store, DateTime expires, string refresh ) {
+        await using AsyncServiceScope scope = _app.Services.CreateAsyncScope( );
+        ApplicationUser user = await scope.ServiceProvider.GetRequiredService<ApplicationDbContext>( ).Users
+            .SingleAsync( TestContext.CancellationToken );
+        // A sign-in always mints a new browser session, so this must not reuse one that already has a row.
+        string sessionId = Guid.NewGuid( ).ToString( "N" );
+        IHttpContextAccessor accessor = scope.ServiceProvider.GetRequiredService<IHttpContextAccessor>( );
+        HttpContext? previousContext = accessor.HttpContext;
+        DefaultHttpContext request = new( ) { RequestServices = scope.ServiceProvider };
+        request.Items[BridgeBeatsIdentityStore.ExpectedStampKey] = user.SecurityStamp!;
+        request.Items[BridgeBeatsIdentityStore.PendingBrowserSessionKey] =
+            new BridgeBeatsIdentityStore.PendingBrowserSession( DidValue, sessionId, DateTimeOffset.UtcNow.AddDays( 7 ) );
+        accessor.HttpContext = request;
+        try {
+            await store.Add( IIdentityStore.BuildClaimsIdentity( CreateCredentials( expires, refresh ) ),
+                TestContext.CancellationToken );
+        } finally {
+            accessor.HttpContext = previousContext;
+        }
+    }
+
+    /// <summary>
+    /// Writes the OAuth rows a working sign-in would have left behind, then links the local account to the
+    /// same DID, reproducing a deployment whose accounts were linked while the feature was enabled.
+    /// </summary>
+    private async Task SeedLinkedBlueskyRowsAsync( ) {
+        await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
+            ApplicationDbContext db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>( );
+            ApplicationUser user = await db.Users.SingleAsync( TestContext.CancellationToken );
+            user.AtProtoDid = DidValue;
+            _ = await db.SaveChangesAsync( TestContext.CancellationToken );
+        }
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        await using SqliteConnection connection = new( connectionString );
+        await connection.OpenAsync( TestContext.CancellationToken );
+        await using SqliteCommand seed = connection.CreateCommand( );
+        seed.CommandText = """
+                           INSERT INTO "idunno_bluesky_identities" ("Did", "Identity", "ExpiresAtUtcTicks", "ProofKeyHash")
+                           VALUES (@did, X'00', @expires, @proof);
+                           INSERT INTO "bridgebeats_bluesky_sessions" ("SessionId", "Did", "ExpiresAtUtcTicks")
+                           VALUES ('disabled-oauth-session', @did, @expires);
+                           INSERT INTO "idunno_bluesky_refresh_locks" ("Did", "LockToken", "ExpiresAtUtcTicks")
+                           VALUES (@did, 'disabled-oauth-lock', @expires);
+                           """;
+        _ = seed.Parameters.AddWithValue( "@did", DidValue );
+        _ = seed.Parameters.AddWithValue( "@proof", "disabled-oauth-proof" );
+        _ = seed.Parameters.AddWithValue( "@expires", DateTime.UtcNow.AddDays( 7 ).Ticks );
+        _ = await seed.ExecuteNonQueryAsync( TestContext.CancellationToken );
+    }
+
+    /// <summary>
+    /// Runs <paramref name="endSession"/> against a credential row that is replaced while the removal is in
+    /// flight, and returns the refresh token of the grant the removal deleted.
+    ///
+    /// The removal is parked inside the restore of the row it deleted. <see cref="IdentityStoreEvents.OnRetrieved"/>
+    /// is raised there, from <c>BridgeBeatsIdentityStore.ReadCredentialAsync</c>, and it fires once for each
+    /// row the removal turns back into a credential. The gate is armed for exactly one call and disarms itself
+    /// on that call, so the replacement's own storing — which raises the same event while reading the row it
+    /// compares — is never held by this barrier. The replacement is then committed in full, including its
+    /// browser session row, and the removal is released to revoke.
+    ///
+    /// A removal that read the credential before deleting it would have taken the grant in place when it read,
+    /// which is the grant stored before the replacement, and its deleting statement would then remove the
+    /// replacement row. Both are rejected by the assertions the callers make.
+    /// </summary>
+    private async Task<string> StoreReplacementWhileRemovalIsInFlightAsync(
+        BridgeBeatsIdentityStore store, Func<Task> endSession ) {
+        string deletedGrant = (await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ))!
+            .FindFirst( AtProtoClaims.RefreshToken )!.Value;
+        TaskCompletionSource removalIsRestoringTheDeletedRow = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        TaskCompletionSource releaseRemoval = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        // Armed before the removal starts and disarmed by the gate itself on its first call, so only the
+        // removal waits here and the replacement's own retrieval passes straight through.
+        bool armed = false;
+        Func<IdentityStoreRetrievedContext, Task>? previousOnRetrieved = store.Events.OnRetrieved;
+        try {
+            store.Events.OnRetrieved = retrieved => {
+                if (!armed) { return Task.CompletedTask; }
+                armed = false;
+                _ = removalIsRestoringTheDeletedRow.TrySetResult( );
+                return releaseRemoval.Task.WaitAsync( TimeSpan.FromSeconds( 10 ), TestContext.CancellationToken );
+            };
+            armed = true;
+            Task removal = endSession( );
+            await removalIsRestoringTheDeletedRow.Task.WaitAsync( TimeSpan.FromSeconds( 10 ), TestContext.CancellationToken );
+
+            // The replacement commits in full while the removal holds the row it deleted, so it is stored,
+            // complete with its own browser session, before the removal is allowed to revoke.
+            _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+            await AddReplacementCredentialsAsync( store, DateTime.UtcNow.AddHours( 2 ), "replacement-grant" );
+            releaseRemoval.SetResult( );
+
+            await removal.WaitAsync( TimeSpan.FromSeconds( 20 ), TestContext.CancellationToken );
+        } finally {
+            _ = releaseRemoval.TrySetResult( );
+            store.Events.OnRetrieved = previousOnRetrieved;
+        }
+        return deletedGrant;
+    }
+
+    /// <summary>
+    /// Asserts exactly one grant was revoked and that it was the one the removal deleted, not the grant the
+    /// replacement carries. The revoked tokens are read from the requests the fake authorization server
+    /// actually received, so a removal that reported the right row but revoked another grant, or revoked both,
+    /// fails here.
+    /// </summary>
+    private void AssertRevocationTargetedOnlyTheDeletedRow( string deletedGrant ) {
+        Assert.Contains( deletedGrant, _oauth.RevokedRefreshTokens,
+            "Revocation must present the grant of the row the removal deleted." );
+        Assert.DoesNotContain( "replacement-grant", _oauth.RevokedRefreshTokens,
+            "The grant stored while the removal was in flight must not be revoked." );
+        Assert.HasCount( 1, _oauth.RevokedRefreshTokens,
+            "The removal deleted one row, so exactly one grant may be revoked for it." );
+    }
+
+    /// <summary>Reads the browser session id the DID currently has stored, or null when it has none.</summary>
+    private async Task<string?> StoredBrowserSessionIdAsync( ) {
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        await using SqliteConnection connection = new( connectionString );
+        await connection.OpenAsync( TestContext.CancellationToken );
+        await using SqliteCommand read = connection.CreateCommand( );
+        read.CommandText = """
+                           SELECT "SessionId" FROM "bridgebeats_bluesky_sessions"
+                           WHERE "Did" = @did AND "ExpiresAtUtcTicks" > @now LIMIT 1;
+                           """;
+        _ = read.Parameters.AddWithValue( "@did", DidValue );
+        _ = read.Parameters.AddWithValue( "@now", DateTime.UtcNow.Ticks );
+        return await read.ExecuteScalarAsync( TestContext.CancellationToken ) as string;
+    }
+
+    /// <summary>
+    /// Asserts each of the three seeded OAuth tables still holds its row for the linked DID. The rows are
+    /// counted individually so a partial removal — a credential row gone while a session row remains, or the
+    /// reverse — cannot pass as "the expected total is still there".
+    /// </summary>
+    private async Task AssertLinkedBlueskyRowsAsync( string when ) {
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            $"The credential row must be present {when}." );
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" ),
+            $"The browser session row must be present {when}." );
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_refresh_locks" ),
+            $"The refresh lock row must be present {when}." );
+    }
+
+    /// <summary>Counts the rows for the linked DID in one of the three OAuth tables.</summary>
+    private async Task<int> LinkedBlueskyRowCountAsync( string table ) {
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        await using SqliteConnection connection = new( connectionString );
+        await connection.OpenAsync( TestContext.CancellationToken );
+        await using SqliteCommand count = connection.CreateCommand( );
+        count.CommandText = $"SELECT COUNT(*) FROM \"{table}\" WHERE \"Did\" = @did;";
+        _ = count.Parameters.AddWithValue( "@did", DidValue );
+        return Convert.ToInt32( await count.ExecuteScalarAsync( TestContext.CancellationToken ), CultureInfo.InvariantCulture );
+    }
+
+    /// <summary>Counts every stored row that belongs to the linked DID across the three OAuth tables.</summary>
+    private async Task<int> BlueskyRowCountAsync( ) {
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        await using SqliteConnection connection = new( connectionString );
+        await connection.OpenAsync( TestContext.CancellationToken );
+        await using SqliteCommand count = connection.CreateCommand( );
+        count.CommandText = """
+                            SELECT (SELECT COUNT(*) FROM "idunno_bluesky_identities" WHERE "Did" = @did) +
+                                   (SELECT COUNT(*) FROM "bridgebeats_bluesky_sessions" WHERE "Did" = @did) +
+                                   (SELECT COUNT(*) FROM "idunno_bluesky_refresh_locks" WHERE "Did" = @did);
+                            """;
+        _ = count.Parameters.AddWithValue( "@did", DidValue );
+        return Convert.ToInt32( await count.ExecuteScalarAsync( TestContext.CancellationToken ), CultureInfo.InvariantCulture );
     }
 
     private static void AddResponseCookies( CookieContainer browser, Uri requestUri, HttpResponseMessage response ) {
@@ -2027,11 +2961,12 @@ public class BlueskyAuthenticationIntegrationTests {
         await store.Update( identity, TestContext.CancellationToken );
     }
 
-    private DPoPAccessCredentials CreateCredentials( DateTime expires, string refresh = "initial-refresh", string did = DidValue ) {
+    private DPoPAccessCredentials CreateCredentials( DateTime expires, string refresh = "initial-refresh",
+        string did = DidValue, string? proofKey = null, string nonce = "test-nonce" ) {
         string jwt = new JwtSecurityTokenHandler( ).WriteToken( new JwtSecurityToken(
             issuer: _service, audience: $"did:web:{new Uri( _service ).Host}", claims: [new Claim( "sub", did ), new Claim( "scope", "atproto repo:link.bridgebeats.playlist" )],
             notBefore: expires.AddHours( -1 ), expires: expires ) );
-        return new DPoPAccessCredentials( new Uri( _service ), jwt, refresh, _proofKey, "test-nonce" );
+        return new DPoPAccessCredentials( new Uri( _service ), jwt, refresh, proofKey ?? _proofKey, nonce );
     }
 
     private sealed class ActionExceptionObserver : IAsyncActionFilter {
@@ -2086,6 +3021,14 @@ public class BlueskyAuthenticationIntegrationTests {
         public Func<CancellationToken, Task<JsonElement>> MetadataRetriever { get; set; } = null!;
         public ConcurrentQueue<string> ClientAssertionKeyIds { get; } = new( );
         public string? LastAssertionValidationFailure { get; set; }
+        /// <summary>Issues the refresh token for each grant. Tests replace this to make grants distinguishable.</summary>
+        public Func<string> RefreshTokenFactory { get; set; } = ( ) => "rotated-refresh";
+        /// <summary>Every token presented to the revocation endpoint, with the hint that accompanied it.</summary>
+        public ConcurrentQueue<(string Token, string TokenTypeHint)> RevokedGrants { get; } = new( );
+        /// <summary>When set, the first revocation request waits for this task before responding.</summary>
+        public TaskCompletionSource? RevokeGate { get; set; }
+        public IReadOnlyList<string> RevokedRefreshTokens =>
+            [.. RevokedGrants.Where( grant => grant.TokenTypeHint == "refresh_token" ).Select( grant => grant.Token )];
         protected override async Task<HttpResponseMessage> SendAsync( HttpRequestMessage request, CancellationToken cancellationToken ) {
             string path = request.RequestUri!.AbsolutePath;
             object body;
@@ -2134,10 +3077,16 @@ public class BlueskyAuthenticationIntegrationTests {
                 } else {
                     _ = Interlocked.Increment( ref _refreshes );
                 }
-                body = new { access_token = TokenFactory( ), refresh_token = "rotated-refresh", token_type = "DPoP", expires_in = 3600, scope = "atproto repo:link.bridgebeats.playlist", sub = TokenSubjectDid };
+                body = new { access_token = TokenFactory( ), refresh_token = RefreshTokenFactory( ), token_type = "DPoP", expires_in = 3600, scope = "atproto repo:link.bridgebeats.playlist", sub = TokenSubjectDid };
             } else if (path == "/revoke") {
                 _ = Interlocked.Increment( ref _revocations );
-                await ValidateClientAssertionAsync( ParseParameters( await request.Content!.ReadAsStringAsync( cancellationToken ) ), cancellationToken );
+                Dictionary<string, string> revocation = ParseParameters( await request.Content!.ReadAsStringAsync( cancellationToken ) );
+                RevokedGrants.Enqueue( (revocation["token"], revocation["token_type_hint"]) );
+                if (RevokeGate is { } gate) {
+                    RevokeGate = null;
+                    await gate.Task.WaitAsync( TimeSpan.FromSeconds( 10 ), cancellationToken );
+                }
+                await ValidateClientAssertionAsync( revocation, cancellationToken );
                 if (RevocationFails) {
                     return new HttpResponseMessage( HttpStatusCode.ServiceUnavailable ) { Content = JsonContent.Create( new { error = "temporarily_unavailable" } ) };
                 }

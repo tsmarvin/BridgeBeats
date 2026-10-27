@@ -1,6 +1,7 @@
 using System.Net;
 using BridgeBeats.Web.Authentication;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
 
 #pragma warning disable CS1591
 namespace BridgeBeats.Tests.Unit;
@@ -10,7 +11,7 @@ namespace BridgeBeats.Tests.Unit;
 public class OAuthLoginClientAddressResolverTests {
     [TestMethod]
     public async Task TrustedProxy_UsesForwardedClientAddress( ) {
-        using OAuthLoginClientAddressResolver resolver = new( "192.0.2.10" );
+        using OAuthLoginClientAddressResolver resolver = Resolver( "192.0.2.10", Resolve( "192.0.2.10" ) );
         await resolver.RefreshAsync( CancellationToken.None );
         DefaultHttpContext context = NewContext( "192.0.2.10", "198.51.100.5" );
 
@@ -19,7 +20,7 @@ public class OAuthLoginClientAddressResolverTests {
 
     [TestMethod]
     public async Task UntrustedPeer_CannotChooseRateLimitBucket( ) {
-        using OAuthLoginClientAddressResolver resolver = new( "192.0.2.10" );
+        using OAuthLoginClientAddressResolver resolver = Resolver( "192.0.2.10", Resolve( "192.0.2.10" ) );
         await resolver.RefreshAsync( CancellationToken.None );
         DefaultHttpContext context = NewContext( "203.0.113.7", "198.51.100.5" );
 
@@ -28,7 +29,7 @@ public class OAuthLoginClientAddressResolverTests {
 
     [TestMethod]
     public async Task TrustedProxy_RejectsAmbiguousForwardingChain( ) {
-        using OAuthLoginClientAddressResolver resolver = new( "192.0.2.10" );
+        using OAuthLoginClientAddressResolver resolver = Resolver( "192.0.2.10", Resolve( "192.0.2.10" ) );
         await resolver.RefreshAsync( CancellationToken.None );
         DefaultHttpContext context = NewContext( "192.0.2.10", "198.51.100.5, 203.0.113.7" );
 
@@ -43,10 +44,135 @@ public class OAuthLoginClientAddressResolverTests {
         Assert.AreEqual( "192.0.2.10", resolver.GetPartitionKey( context ) );
     }
 
+    /// <summary>
+    /// A lookup failure the old <c>SocketException</c>-only catch did not cover must not propagate.
+    /// The refresh loop is a hosted service, so an escaping exception stops the whole application.
+    /// </summary>
+    [TestMethod]
+    public async Task LookupFailure_DoesNotPropagateAndFailsClosed( ) {
+        CapturingLoggerFactory loggerFactory = new( );
+        using OAuthLoginClientAddressResolver resolver = Resolver(
+            "192.0.2.10",
+            ( _, _ ) => throw new InvalidOperationException( "name resolution is unavailable" ),
+            loggerFactory );
+        DefaultHttpContext context = NewContext( "192.0.2.10", "198.51.100.5" );
+
+        await resolver.RefreshAsync( CancellationToken.None );
+
+        Assert.AreEqual( "192.0.2.10", resolver.GetPartitionKey( context ),
+            "an unresolved proxy must not be trusted to choose a rate-limit bucket" );
+        Assert.Contains( entry => entry.Level == LogLevel.Warning, loggerFactory.Entries,
+            "a failed proxy lookup must be reported" );
+    }
+
+    /// <summary>A resolved proxy must lose its trust when a later lookup fails.</summary>
+    [TestMethod]
+    public async Task LookupFailure_ClearsPreviouslyTrustedAddress( ) {
+        bool fail = false;
+        using OAuthLoginClientAddressResolver resolver = Resolver( "192.0.2.10", ( host, _ ) => {
+            if (fail) { throw new InvalidOperationException( "name resolution is unavailable" ); }
+            return Task.FromResult( ToAddresses( [host] ) );
+        } );
+        DefaultHttpContext context = NewContext( "192.0.2.10", "198.51.100.5" );
+
+        await resolver.RefreshAsync( CancellationToken.None );
+        Assert.AreEqual( "198.51.100.5", resolver.GetPartitionKey( context ) );
+
+        fail = true;
+        await resolver.RefreshAsync( CancellationToken.None );
+
+        Assert.AreEqual( "192.0.2.10", resolver.GetPartitionKey( context ) );
+    }
+
+    /// <summary>A transient failure must not latch forwarded addresses off permanently.</summary>
+    [TestMethod]
+    public async Task LookupFailure_RecoversOnNextSuccessfulRefresh( ) {
+        bool fail = true;
+        using OAuthLoginClientAddressResolver resolver = Resolver( "192.0.2.10", ( host, _ ) => {
+            if (fail) { throw new InvalidOperationException( "name resolution is unavailable" ); }
+            return Task.FromResult( ToAddresses( [host] ) );
+        } );
+        DefaultHttpContext context = NewContext( "192.0.2.10", "198.51.100.5" );
+
+        await resolver.RefreshAsync( CancellationToken.None );
+        Assert.AreEqual( "192.0.2.10", resolver.GetPartitionKey( context ) );
+
+        fail = false;
+        await resolver.RefreshAsync( CancellationToken.None );
+
+        Assert.AreEqual( "198.51.100.5", resolver.GetPartitionKey( context ) );
+    }
+
+    /// <summary>
+    /// Shutdown cancellation is expected control flow, not a lookup failure: it must escape
+    /// <c>RefreshAsync</c> so the host stops instead of logging an error and looping.
+    /// </summary>
+    [TestMethod]
+    public async Task CancelledLookup_PropagatesCancellation( ) {
+        CapturingLoggerFactory loggerFactory = new( );
+        using CancellationTokenSource stopping = new( );
+        await stopping.CancelAsync( );
+        using OAuthLoginClientAddressResolver resolver = Resolver(
+            "192.0.2.10",
+            ( _, token ) => Task.FromCanceled<IPAddress[]>( token ),
+            loggerFactory );
+
+        _ = await Assert.ThrowsAsync<OperationCanceledException>( ( ) => resolver.RefreshAsync( stopping.Token ) );
+        Assert.IsEmpty( loggerFactory.Entries, "shutdown cancellation must not be reported as a lookup failure" );
+    }
+
+    /// <summary>A lookup that returns no usable address must not leave stale trust in place.</summary>
+    [TestMethod]
+    public async Task LookupReturningNoAddresses_FailsClosed( ) {
+        using OAuthLoginClientAddressResolver resolver = Resolver( "192.0.2.10", ( _, _ ) => Task.FromResult( Array.Empty<IPAddress>( ) ) );
+        await resolver.RefreshAsync( CancellationToken.None );
+        DefaultHttpContext context = NewContext( "192.0.2.10", "198.51.100.5" );
+
+        Assert.AreEqual( "192.0.2.10", resolver.GetPartitionKey( context ) );
+    }
+
+    private static OAuthLoginClientAddressResolver Resolver(
+        string? trustedProxyHost,
+        Func<string, CancellationToken, Task<IPAddress[]>> resolveHost,
+        ILoggerFactory? loggerFactory = null
+    ) => new( trustedProxyHost, resolveHost, loggerFactory );
+
+    private static Func<string, CancellationToken, Task<IPAddress[]>> Resolve( params string[] addresses ) =>
+        ( _, _ ) => Task.FromResult( ToAddresses( addresses ) );
+
+    private static IPAddress[] ToAddresses( string[] addresses ) => Array.ConvertAll( addresses, IPAddress.Parse );
+
     private static DefaultHttpContext NewContext( string peerAddress, string forwardedAddress ) {
         DefaultHttpContext context = new( );
         context.Connection.RemoteIpAddress = IPAddress.Parse( peerAddress );
         context.Request.Headers["X-Forwarded-For"] = forwardedAddress;
         return context;
     }
+
+    private sealed record CapturedLogEntry( LogLevel Level, string Message );
+
+    private sealed class CapturingLoggerFactory : ILoggerFactory {
+        internal List<CapturedLogEntry> Entries { get; } = [];
+
+        public void AddProvider( ILoggerProvider provider ) { }
+
+        public ILogger CreateLogger( string categoryName ) => new CapturingLogger( Entries );
+
+        public void Dispose( ) { }
+
+        private sealed class CapturingLogger( List<CapturedLogEntry> entries ) : ILogger {
+            public IDisposable? BeginScope<TState>( TState state ) where TState : notnull => null;
+
+            public bool IsEnabled( LogLevel logLevel ) => true;
+
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter
+            ) => entries.Add( new CapturedLogEntry( logLevel, formatter( state, exception ) ) );
+        }
+    }
 }
+#pragma warning restore CS1591

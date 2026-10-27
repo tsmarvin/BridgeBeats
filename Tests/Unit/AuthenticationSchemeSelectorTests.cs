@@ -23,16 +23,15 @@ public class AuthenticationSchemeSelectorTests {
             ("bluesky", false, IdentityConstants.ApplicationScheme)
         ];
         foreach ((string scenario, bool domainEnabled, string expectedScheme) in cases) {
-            ServiceCollection services = new( );
-            _ = services.AddLogging( );
             AppSettings settings = new( ) {
                 ApiKeySalt = "selector-test-salt",
                 InternalServiceKey = "selector-test-key",
-                Domain = domainEnabled ? "bridgebeats.example" : " "
+                Domain = domainEnabled ? "bridgebeats.example" : " ",
+                // The helper mirrors production enablement, which requires the signing key as well as
+                // the domain. No file is read during registration, so a placeholder path is enough.
+                ATProtoOAuthSigningKeyPath = domainEnabled ? "/selector-test/signing-key.json" : string.Empty
             };
-            StartupExtensions.ConfigureApiKeyAuth( services, settings );
-            using ServiceProvider provider = services.BuildServiceProvider( );
-            PolicySchemeOptions selector = provider.GetRequiredService<IOptionsMonitor<PolicySchemeOptions>>( ).Get( "MultiScheme" );
+            PolicySchemeOptions selector = SelectorFor( settings );
             DefaultHttpContext context = new( );
             if (scenario == "internal") {
                 context.Request.Headers[InternalServiceDefaults.HeaderName] = "selector-test-key";
@@ -49,6 +48,32 @@ public class AuthenticationSchemeSelectorTests {
 
             Assert.AreEqual( expectedScheme, selector.ForwardDefaultSelector!( context ), scenario );
         }
+    }
+
+    /// <summary>
+    /// A domain with no signing key leaves Bluesky disabled in the host, so the selector must not
+    /// route a Bluesky cookie to a scheme that was never registered.
+    /// </summary>
+    [TestMethod]
+    public void Selector_WithDomainButNoSigningKey_DoesNotRouteToBluesky( ) {
+        PolicySchemeOptions selector = SelectorFor( new AppSettings {
+            ApiKeySalt = "selector-test-salt",
+            InternalServiceKey = "selector-test-key",
+            Domain = "bridgebeats.example",
+            ATProtoOAuthSigningKeyPath = string.Empty
+        } );
+        DefaultHttpContext context = new( );
+        context.Request.Headers["Cookie"] = $"{BlueskyAuthenticationConfiguration.CookieName}=session";
+
+        Assert.AreEqual( IdentityConstants.ApplicationScheme, selector.ForwardDefaultSelector!( context ) );
+    }
+
+    private static PolicySchemeOptions SelectorFor( AppSettings settings ) {
+        ServiceCollection services = new( );
+        _ = services.AddLogging( );
+        StartupExtensions.ConfigureApiKeyAuth( services, settings );
+        using ServiceProvider provider = services.BuildServiceProvider( );
+        return provider.GetRequiredService<IOptionsMonitor<PolicySchemeOptions>>( ).Get( "MultiScheme" );
     }
 }
 #pragma warning restore CS1591

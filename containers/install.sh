@@ -131,6 +131,426 @@ secret_has_content() {
     return 1
 }
 
+# Create a mode-700 scratch directory for staging secret content. The secrets directory itself
+# is mode 700 and owned by the container UID on upgrades, so it is not usable as scratch space
+# for the installing user even when they are permitted to sudo.
+make_secure_tmp_dir() {
+    local tmp_dir
+    if ! tmp_dir=$(mktemp -d 2>/dev/null); then
+        return 1
+    fi
+    if ! chmod 700 "$tmp_dir" 2>/dev/null; then
+        rmdir "$tmp_dir" 2>/dev/null
+        return 1
+    fi
+    printf '%s\n' "$tmp_dir"
+}
+
+# True when the directory cannot be used by the current user but sudo is available.
+# Only the containing directory decides this: it is the mode-700 / container-UID permission on
+# secrets/ that blocks access, not anything about the secret file itself.
+directory_needs_sudo() {
+    local dir="$1"
+    if [[ -w "$dir" ]] && [[ -r "$dir" ]]; then
+        return 1
+    fi
+    [[ "$USE_SUDO" == "true" ]]
+}
+
+# True when the secret's contents cannot be inspected at all: the directory is not searchable by
+# the current user and sudo is not available. Callers must abort on this rather than fall through
+# to the create path, which would report a real key as missing.
+secret_is_inaccessible() {
+    local file="$1"
+    local dir
+    dir=$(dirname "$file")
+    [[ -r "$dir" && -x "$dir" ]] && return 1
+    [[ "$USE_SUDO" == "true" ]] && return 1
+    return 0
+}
+
+# Echo the contents of a secret, reading through sudo only when the directory requires it.
+# Returns non-zero when the content cannot be read at all.
+read_secret_content() {
+    local file="$1"
+    if directory_needs_sudo "$(dirname "$file")"; then
+        sudo cat "$file" 2>/dev/null
+    else
+        cat "$file" 2>/dev/null
+    fi
+}
+
+# True when a secret file exists. On an upgraded install the secrets directory is mode 700 and
+# owned by the container UID, so the current user cannot stat inside it without sudo; treating
+# that as "missing" would take the fresh-install path and discard an existing key.
+secret_file_exists() {
+    local file="$1"
+    [[ -f "$file" ]] && return 0
+    if directory_needs_sudo "$(dirname "$file")"; then
+        sudo test -f "$file" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+# Validate ATProto signing key content by shape, without echoing any of it. Prints "ok" when the
+# content is an ES256 private key the application can load, otherwise a short reason.
+#
+# Fail-closed: content that is neither a private JWK nor a PEM private key is rejected rather than
+# accepted merely because it is non-blank. Accepting it would report a generated or preserved key
+# as usable while the application refuses to start on it.
+signing_key_shape() {
+    local content="$1"
+    local trimmed
+
+    if [[ "$content" == *"-----BEGIN"*"PRIVATE KEY-----"* ]]; then
+        printf 'ok\n'
+        return 0
+    fi
+
+    # Leading whitespace is tolerated: the application trims before deciding whether the content is
+    # a JWK, so rejecting it here would refuse a key the application would load.
+    trimmed="${content#"${content%%[![:space:]]*}"}"
+    if [[ "$trimmed" != \{* ]]; then
+        printf 'not a JSON JWK or a PEM private key\n'
+        return 0
+    fi
+
+    # The application requires an EC P-256 private JWK carrying all of these members. Matching the
+    # quoted member names is a shape check, not a parse: it cannot confirm the values decode, so the
+    # installer still leaves final validation to the application at startup.
+    local member
+    for member in kty crv x y d kid; do
+        if [[ "$trimmed" != *"\"${member}\""* ]]; then
+            printf 'JWK is missing the %s member\n' "${member}"
+            return 0
+        fi
+    done
+    if [[ "$trimmed" != *'"EC"'* ]] || [[ "$trimmed" != *'"P-256"'* ]]; then
+        printf 'JWK is not an EC P-256 key\n'
+        return 0
+    fi
+
+    printf 'ok\n'
+}
+# Classify an existing signing key as usable, unusable, or unreadable. A read failure is a
+# separate outcome from unusable content: without the ability to read the file, replacing it
+# could destroy a key the application is currently using and publishing.
+signing_key_state() {
+    local file="$1"
+    local raw stripped
+
+    # Without sudo access there is nothing to distinguish here; the read below fails and the
+    # key is reported unreadable rather than usable or unusable.
+    if ! raw=$(read_secret_content "$file"); then
+        printf 'unreadable\n'
+        return 0
+    fi
+
+    # Strip whitespace and braces one pattern at a time: a bracketed class mixing a named class
+    # with literal braces does not remove the braces, which would read "{}" as usable. The stripped
+    # form is only for the emptiness test; the shape check needs the original content.
+    stripped="${raw//[[:space:]]/}"
+    stripped="${stripped//\{/}"
+    stripped="${stripped//\}/}"
+    if [[ -z "$stripped" ]]; then
+        printf 'unusable\n'
+        return 0
+    fi
+    if [[ "$raw" =~ ^[[:space:]]*(your_|REPLACE_WITH_) ]]; then
+        printf 'unusable\n'
+        return 0
+    fi
+
+    # Non-blank is not the same as loadable. A malformed key is reported separately rather than as
+    # unusable, because replacing it would discard content the operator may have intended: the
+    # caller must fail with an actionable message instead of silently overwriting it.
+    if [[ "$(signing_key_shape "$raw")" != "ok" ]]; then
+        printf 'malformed\n'
+        return 0
+    fi
+
+    printf 'usable\n'
+}
+
+# Print a manifest of a directory tree: one line per file with its path relative to the tree, its
+# size, and its checksum. Used to prove a backup holds exactly what the source holds.
+#
+# Only metadata and checksums are emitted; file content never reaches stdout. Both trees are read
+# with the same privilege as each other, so a backup created through sudo is compared with
+# privileged reads rather than being read as empty by an unprivileged listing.
+secrets_tree_manifest() {
+    local dir="$1"
+    local use_sudo="$2"
+
+    # The inner shell receives the tree root as $1 and one or more file paths as the rest, so each
+    # checksum is computed in the same process that knows the relative path.
+    local snippet='
+        root="$1"; shift
+        for f in "$@"; do
+            stats=$(cksum < "$f" 2>/dev/null) || continue
+            printf "%s\t%s\n" "${f#"$root"/}" "$stats"
+        done'
+
+    if [[ "$use_sudo" == "true" ]]; then
+        sudo find "$dir" -type f -exec sh -c "$snippet" sh "$dir" {} + 2>/dev/null | LC_ALL=C sort
+    else
+        find "$dir" -type f -exec sh -c "$snippet" sh "$dir" {} + 2>/dev/null | LC_ALL=C sort
+    fi
+}
+
+# True when a directory tree needs elevated reads: either it is not searchable by the current user,
+# or it is owned by another account (which is how a sudo-created copy appears).
+tree_needs_sudo() {
+    local dir="$1"
+    directory_needs_sudo "$dir" && return 0
+    [[ "$USE_SUDO" == "true" ]] && [[ "$(file_owner_uid "$dir" 2>/dev/null)" != "$(id -u)" ]]
+}
+
+# Restrict a backup tree to its owner: directories mode 700, files mode 600. `mkdir` and `cp` apply
+# the process umask, so under the default 0022 a backup root lands mode 755 and copied files keep a
+# world-readable mode — a private key readable by every local account. Applied to the whole tree so
+# nested directories cannot keep looser permissions than the root.
+restrict_backup_tree() {
+    local dir="$1"
+    local use_sudo="$2"
+
+    if [[ "$use_sudo" == "true" ]]; then
+        sudo chmod 700 "$dir" 2>/dev/null || return 1
+        sudo find "$dir" -type d -exec chmod 700 {} + 2>/dev/null || return 1
+        sudo find "$dir" -type f -exec chmod 600 {} + 2>/dev/null || return 1
+    else
+        chmod 700 "$dir" 2>/dev/null || return 1
+        find "$dir" -type d -exec chmod 700 {} + 2>/dev/null || return 1
+        find "$dir" -type f -exec chmod 600 {} + 2>/dev/null || return 1
+    fi
+    return 0
+}
+
+# True when no directory or file in the tree grants group or other permissions. Prints the first
+# offending path and fails when one is found, so the caller can fail closed rather than report a
+# backup whose permissions were never confirmed.
+backup_tree_is_private() {
+    local dir="$1"
+    local use_sudo="$2"
+    local offending
+    local snippet='
+        for f in "$@"; do
+            mode=$(stat -c "%a" "$f" 2>/dev/null || stat -f "%Lp" "$f" 2>/dev/null) || { echo "$f"; exit 0; }
+            if (( (8#$mode & 8#77) != 0 )); then echo "$f"; exit 0; fi
+        done'
+
+    if [[ "$use_sudo" == "true" ]]; then
+        offending=$(sudo find "$dir" \( -type d -o -type f \) -exec sh -c "$snippet" sh {} + 2>/dev/null)
+    else
+        offending=$(find "$dir" \( -type d -o -type f \) -exec sh -c "$snippet" sh {} + 2>/dev/null)
+    fi
+
+    if [[ -n "$offending" ]]; then
+        echo "[ERROR] Backup path ${offending} is readable beyond its owner" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Keep the three most recent backups and remove older ones. Removal failures are reported instead of
+# hidden: a root-owned backup cannot be removed without privilege, and silently leaving it while
+# reporting success would misstate what is actually on disk.
+prune_secrets_backups() {
+    local keep=3
+    local failed=0 index
+    local -a backups=()
+    local dir
+
+    while IFS= read -r dir; do
+        [[ -n "$dir" ]] && backups+=("$dir")
+    done < <(ls -dt ./secrets_backup_*/ 2>/dev/null)
+
+    for (( index = keep; index < ${#backups[@]}; index++ )); do
+        dir="${backups[$index]}"
+        # Path safety: only ever operate on a direct child backup directory of the install root.
+        case "$dir" in
+            ./secrets_backup_*/) ;;
+            *) continue ;;
+        esac
+
+        if rm -rf -- "$dir" 2>/dev/null; then
+            :
+        elif [[ "$USE_SUDO" == "true" ]] && sudo rm -rf -- "$dir" 2>/dev/null; then
+            :
+        else
+            failed=$((failed + 1))
+        fi
+    done
+
+    if (( failed > 0 )); then
+        echo "[WARN] Could not remove ${failed} old backup director$( (( failed == 1 )) && echo y || echo ies)"
+        echo "       Remove them manually if they are no longer needed: ls -dt $(pwd)/secrets_backup_*/"
+        log_upgrade "WARN: ${failed} old backup director(ies) could not be removed"
+    fi
+    return 0
+}
+
+# Keep a timestamped copy of a secret before replacing it, and verify the copy is byte-identical.
+# The caller must treat a non-zero return as "do not touch the original": replacing a live signing
+# key without a readable copy would discard the only record of a published key.
+# The copy stays inside the secrets directory, which docker-compose.yml mounts file by file, so no
+# container ever loads it.
+backup_secret_file() {
+    local path="$1"
+    local backup="${path}.bak.${TIMESTAMP}"
+    local copied=false verified=false
+
+    if directory_needs_sudo "$(dirname "$path")"; then
+        cp -p "$path" "$backup" 2>/dev/null && copied=true
+        [[ "$copied" == "true" ]] || { sudo cp -p "$path" "$backup" 2>/dev/null && copied=true; }
+        cmp -s "$path" "$backup" 2>/dev/null && verified=true
+        [[ "$verified" == "true" ]] || { sudo cmp -s "$path" "$backup" 2>/dev/null && verified=true; }
+    else
+        cp -p "$path" "$backup" 2>/dev/null && copied=true
+        cmp -s "$path" "$backup" 2>/dev/null && verified=true
+    fi
+
+    if [[ "$copied" != "true" ]] || [[ "$verified" != "true" ]]; then
+        echo "[ERROR] Could not back up ${path}; leaving the original untouched" >&2
+        rm -f "$backup" 2>/dev/null || sudo rm -f "$backup" 2>/dev/null || true
+        return 1
+    fi
+
+    # The copy sits inside a mode-700 directory, so it is already unreachable to other accounts; this
+    # keeps the file itself owner-only too, matching the secret it mirrors.
+    if directory_needs_sudo "$(dirname "$path")"; then
+        sudo chmod 600 "$backup" 2>/dev/null || true
+    else
+        chmod 600 "$backup" 2>/dev/null || true
+    fi
+
+    echo "[OK] Backed up existing $(basename "$path") to $(basename "$backup")"
+    return 0
+}
+
+# Echo the numeric owner UID of a file, or fail. Prefers the GNU option and falls back to BSD.
+# Reads through sudo when the containing directory cannot be searched by the current user, which is
+# the state an upgraded install leaves behind (mode 700, owned by the container UID). Without that
+# the metadata read fails, and a caller would misread a correctly owned key as unreadable.
+file_owner_uid() {
+    local path="$1"
+    if directory_needs_sudo "$(dirname "$path")"; then
+        sudo stat -c '%u' "$path" 2>/dev/null || sudo stat -f '%u' "$path" 2>/dev/null
+    else
+        stat -c '%u' "$path" 2>/dev/null || stat -f '%u' "$path" 2>/dev/null
+    fi
+}
+
+# Echo the permission bits of a file in octal, or fail. Prefers the GNU option and falls back to BSD.
+# Reads through sudo for the same reason as file_owner_uid.
+file_mode_bits() {
+    local path="$1"
+    if directory_needs_sudo "$(dirname "$path")"; then
+        sudo stat -c '%a' "$path" 2>/dev/null || sudo stat -f '%Lp' "$path" 2>/dev/null
+    else
+        stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null
+    fi
+}
+
+# True when the container user (UID ${CONTAINER_UID}) can read a file. Ownership is checked rather
+# than attempting a read, because the installing user may not be a member of the container's UID and
+# a privileged read would succeed regardless of who can actually read the file in the container.
+secret_readable_by_container() {
+    local path="$1"
+    local owner mode
+
+    owner=$(file_owner_uid "$path") || return 1
+    if [[ "$owner" == "$CONTAINER_UID" ]]; then
+        return 0
+    fi
+
+    mode=$(file_mode_bits "$path") || return 1
+    # Any read permission for "other" also lets the container user read it.
+    (( (8#$mode & 8#4) != 0 ))
+}
+
+# Generate a secret with the named generator function and install it only when the generated
+# content is non-blank, so a failed generation cannot leave a truncated secret behind.
+#
+# Generated content is staged in a private scratch directory rather than beside the secret: on
+# upgrades the secrets directory is mode 700 and owned by the container UID, so a temp file there
+# cannot be created without elevated privileges. Replacing an existing file writes into it rather
+# than renaming over it, because the container reads the key as UID ${CONTAINER_UID} through the
+# docker-compose bind mount and losing that ownership would lock the application out of its key.
+install_generated_secret() {
+    local path="$1"
+    local generator="$2"
+    local dir created_new=false
+    local tmp_dir tmp_file installed=false used_sudo=false
+
+    dir=$(dirname "$path")
+    if ! tmp_dir=$(make_secure_tmp_dir); then
+        echo "[ERROR] Could not create a temporary directory to stage ${path}" >&2
+        return 1
+    fi
+    tmp_file="${tmp_dir}/generated"
+
+    if ! "$generator" > "$tmp_file" 2>/dev/null || ! grep -qE '\S' "$tmp_file" 2>/dev/null; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    chmod 600 "$tmp_file" 2>/dev/null || true
+
+    if [[ -f "$path" ]]; then
+        # cp onto an existing file keeps that file's owner and mode, which is what the container
+        # needs in order to read the key through the bind mount.
+        if directory_needs_sudo "$dir"; then
+            used_sudo=true
+            sudo cp "$tmp_file" "$path" 2>/dev/null && installed=true
+        else
+            cp "$tmp_file" "$path" 2>/dev/null && installed=true
+            if [[ "$installed" != "true" ]] && [[ "$USE_SUDO" == "true" ]]; then
+                used_sudo=true
+                sudo cp "$tmp_file" "$path" 2>/dev/null && installed=true
+            fi
+        fi
+    else
+        created_new=true
+        cp "$tmp_file" "$path" 2>/dev/null && installed=true
+        if [[ "$installed" != "true" ]] && [[ "$USE_SUDO" == "true" ]]; then
+            used_sudo=true
+            sudo cp "$tmp_file" "$path" 2>/dev/null && installed=true
+        fi
+    fi
+
+    rm -rf "$tmp_dir"
+
+    if [[ "$installed" != "true" ]]; then
+        return 1
+    fi
+
+    # An existing file keeps its own mode; one placed with sudo needs the restrictive mode applied
+    # with the same privileges.
+    if [[ "$used_sudo" == "true" ]]; then
+        sudo chmod 600 "$path" 2>/dev/null || true
+    else
+        chmod 600 "$path" 2>/dev/null || true
+    fi
+
+    # A file this run created has no established owner to preserve, and a root-owned copy placed by
+    # sudo would be unreadable to the container user. A fresh install corrects the whole directory
+    # afterwards, but that step is skipped when the directory already existed, so ownership has to
+    # be settled here for an upgrade: otherwise the installer reports a generated key the container
+    # cannot read.
+    if [[ "$created_new" == "true" ]]; then
+        if ! secret_readable_by_container "$path" && [[ "$USE_SUDO" == "true" ]]; then
+            sudo chown "${CONTAINER_UID}:${CONTAINER_UID}" "$path" 2>/dev/null || true
+        fi
+        if ! secret_readable_by_container "$path" && [[ "$secrets_created" != "true" ]]; then
+            echo "[ERROR] $(basename "$path") is not readable by the container user (UID ${CONTAINER_UID})" >&2
+            echo "        Grant the container read access or allow this script to use sudo, then re-run:" >&2
+            echo "        sudo chown ${CONTAINER_UID}:${CONTAINER_UID} ${path}" >&2
+            return 1
+        fi
+    fi
+    return 0
+}
+
 # Generate a cryptographically secure random string using openssl
 generate_random_string() {
     openssl rand -base64 32
@@ -492,20 +912,81 @@ if [[ "$containers_exist" == "true" ]]; then
     log_upgrade "=== Upgrade: $(date '+%Y-%m-%d %H:%M:%S') ==="
     log_upgrade "Branch: ${BRANCH}"
 
-    # Back up secrets before any modifications
+    # Back up secrets before any modifications. On an upgraded install the directory is mode 700 and
+    # owned by the container UID, so an unprivileged copy cannot read it: the copy is attempted
+    # through sudo and verified before the script reports a backup, and the prune only runs after a
+    # verified copy exists. Pruning on a failed backup would delete the previous good copies and
+    # leave nothing to roll back to.
     if [[ -d "$SECRETS_DIR" ]]; then
         backup_timestamp=$(date +%Y%m%d_%H%M%S)
         backup_dir="./secrets_backup_${backup_timestamp}"
-        if cp -r "$SECRETS_DIR" "$backup_dir"; then
-            echo "[OK] Backed up secrets to ${backup_dir}/"
-            log_upgrade "Backed up secrets to ${backup_dir}/"
-        else
-            echo "[WARN] Failed to back up secrets directory"
-            log_upgrade "WARN: Failed to back up secrets directory"
+
+        # Create the backup root with mode 700 BEFORE copying anything. `mkdir` and `cp` apply the
+        # process umask, so with the common 0022 the root would otherwise be 755 and the first secret
+        # copied into it would already be reachable by other local accounts for the duration of the
+        # copy. The recursive hardening below still runs; this closes the window in which the tree
+        # exists but is not yet restricted.
+        #
+        # Copy the *contents* rather than the directory: `cp -r src dst` nests the tree inside an
+        # existing dst, which would put the secrets one level deeper than the backup is read from.
+        copied=false
+        if [[ -e "$backup_dir" ]]; then
+            echo "[ERROR] Backup path already exists: ${backup_dir}"
+            exit 1
         fi
 
-        # Prune old backups, keep 3 most recent
-        ls -dt ./secrets_backup_*/ 2>/dev/null | tail -n +4 | xargs rm -rf
+        if (umask 077 && mkdir -m 700 "$backup_dir" && cp -R "$SECRETS_DIR"/. "$backup_dir"/) 2>/dev/null; then
+            copied=true
+        elif [[ "$USE_SUDO" == "true" ]]; then
+            if sudo rm -rf "$backup_dir" 2>/dev/null \
+                && sudo sh -c 'umask 077 && mkdir -m 700 "$2" && cp -R "$1"/. "$2"/' sh "$SECRETS_DIR" "$backup_dir" 2>/dev/null; then
+                copied=true
+            fi
+        fi
+
+        # Prove the copy holds exactly what the source holds, by comparing a path/size/checksum
+        # manifest of both trees. An entry count alone cannot tell a complete copy from one that
+        # missed content; the manifest is read at matching privilege so a sudo-created copy is not
+        # read as empty. No secret content is printed.
+        verified=false
+        copy_source_unreadable=false
+        if [[ "$copied" == "true" ]]; then
+            manifest_privileged=false
+            if tree_needs_sudo "$SECRETS_DIR" || tree_needs_sudo "$backup_dir"; then
+                if [[ "$USE_SUDO" != "true" ]]; then
+                    copy_source_unreadable=true
+                else
+                    manifest_privileged=true
+                fi
+            fi
+
+            if [[ "$copy_source_unreadable" != "true" ]] \
+                && restrict_backup_tree "$backup_dir" "$manifest_privileged" \
+                && backup_tree_is_private "$backup_dir" "$manifest_privileged"; then
+                source_manifest=$(secrets_tree_manifest "$SECRETS_DIR" "$manifest_privileged")
+                copy_manifest=$(secrets_tree_manifest "$backup_dir" "$manifest_privileged")
+                if [[ -n "$source_manifest" ]] && [[ "$source_manifest" == "$copy_manifest" ]]; then
+                    verified=true
+                fi
+            fi
+        fi
+
+        if [[ "$verified" == "true" ]]; then
+            echo "[OK] Backed up secrets to ${backup_dir}/"
+            log_upgrade "Backed up secrets to ${backup_dir}/"
+
+            # Prune old backups, keep 3 most recent. Only reached once the new copy is proven complete
+            # and restricted to its owner, so an unverified copy is never a candidate for deletion.
+            prune_secrets_backups
+        else
+            # Drop the partial copy: leaving it in place would let a later run mistake it for a
+            # rollback point that does not actually hold every secret.
+            rm -rf "$backup_dir" 2>/dev/null || sudo rm -rf "$backup_dir" 2>/dev/null || true
+            echo "[ERROR] Failed to back up the secrets directory; no rollback copy was created"
+            echo "        Old backups were left in place. Allow sudo or fix the permissions on $(pwd)/secrets, then re-run this script."
+            log_upgrade "ERROR: Failed to back up secrets directory"
+            exit 1
+        fi
     fi
 
     # Log current container image information with RepoDigests
@@ -578,8 +1059,55 @@ for secret_config in "${SECRET_FILES[@]}"; do
         echo "[WARN] Removed directory at ${secret_name} (expected file)"
     fi
 
-    if [[ -f "$secret_path" ]]; then
-        if secret_has_content "$secret_path"; then
+    # Without sudo, a mode-700 secrets directory hides its contents entirely. Abort instead of
+    # reporting the key as missing and taking the create path over a real signing key.
+    if secret_is_inaccessible "$secret_path"; then
+        echo "[ERROR] Cannot inspect $(dirname "$secret_path") (permission denied)"
+        echo "        Allow sudo or fix the directory permissions, then re-run this script."
+        exit 2
+    fi
+
+    if secret_file_exists "$secret_path"; then
+        # The ATProto signing key is the one secret the application refuses to start without,
+        # so an unusable file must be replaced here rather than reported and left in place.
+        if [[ "$secret_name" == "atproto_oauth_key.json" ]]; then
+            case "$(signing_key_state "$secret_path")" in
+                usable)
+                    echo "[OK] Secret exists and has content: ${secret_name}"
+                    ;;
+                unusable)
+                    echo "[WARN] ${secret_name} is empty, placeholder, or '{}' - a usable ES256 signing key is required"
+                    if ! backup_secret_file "$secret_path"; then
+                        echo "[ERROR] Refusing to replace ${secret_name} without a verified backup"
+                        echo "        Fix the permissions on $(dirname "$secret_path") or allow sudo, then re-run this script."
+                        exit 1
+                    fi
+                    if install_generated_secret "$secret_path" generate_es256_jwk; then
+                        echo "[OK] Regenerated ${secret_name} with a new ES256 signing key"
+                        log_upgrade "Regenerated ${secret_name} (previous content was unusable)"
+                    else
+                        echo "[ERROR] Could not generate a replacement ${secret_name}"
+                        echo "        Verify openssl is working ('openssl version'), or supply an ES256 JWK manually, then re-run this script."
+                        exit 1
+                    fi
+                    ;;
+                malformed)
+                    # Non-blank but not a loadable ES256 key. Replacing it could discard content the
+                    # operator intended, so fail with guidance instead of overwriting.
+                    echo "[ERROR] ${secret_name} is not a usable ES256 signing key"
+                    echo "        It must be an ES256 private JWK (kty/crv/x/y/d/kid) or a PEM private key."
+                    echo "        Review $(dirname "$secret_path")/${secret_name}, or move it aside and re-run to generate a new key."
+                    exit 1
+                    ;;
+                *)
+                    # Unreadable content is not evidence that the key is broken, and replacing it
+                    # would invalidate a key the application may be publishing.
+                    echo "[ERROR] Cannot read ${secret_name} to verify it"
+                    echo "        Fix the permissions on $(dirname "$secret_path") or allow sudo, then re-run this script."
+                    exit 1
+                    ;;
+            esac
+        elif secret_has_content "$secret_path"; then
             echo "[OK] Secret exists and has content: ${secret_name}"
         else
             echo "[WARN] Secret exists but appears empty or contains placeholder content: ${secret_name}"
@@ -588,11 +1116,15 @@ for secret_config in "${SECRET_FILES[@]}"; do
         if [[ "$auto_generate" == "true" ]]; then
             # Auto-generate this secret
             if [[ "$secret_name" == "atproto_oauth_key.json" ]]; then
-                generate_es256_jwk > "$secret_path"
+                if ! install_generated_secret "$secret_path" generate_es256_jwk; then
+                    echo "[ERROR] Could not generate ${secret_name}"
+                    echo "        Verify openssl is working ('openssl version'), or supply an ES256 JWK manually, then re-run this script."
+                    exit 1
+                fi
             else
                 generate_random_string > "$secret_path"
+                chmod 600 "$secret_path"
             fi
-            chmod 600 "$secret_path"
             echo "[OK] Auto-generated: ${secret_name}"
         else
             # Create placeholder

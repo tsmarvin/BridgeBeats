@@ -22,6 +22,8 @@
   href: DISCORD_SETTINGS.md
 - name: ATProto Lexicon Setup
   href: ATPROTO_LEXICON.md
+- name: Lookup Collection Report
+  href: LOOKUP_COLLECTION_REPORT.md
 - name: Caddy + Cloudflare
   href: CADDY_CLOUDFLARE.md
 - name: SBOM and Provenance

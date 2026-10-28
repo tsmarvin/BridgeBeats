@@ -1,10 +1,3 @@
-using System.Text.Json;
-using BridgeBeats.Contracts.Enums;
-using BridgeBeats.Contracts.Interfaces;
-using BridgeBeats.Core.Domain.Providers.AppleMusic;
-using BridgeBeats.Core.Domain.Providers.Spotify;
-using BridgeBeats.Core.Domain.Providers.Tidal;
-using BridgeBeats.Core.Domain.Services.LinkResolver;
 using BridgeBeats.Core.Infrastructure.Identity;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -12,8 +5,8 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Http.Resilience;
-using Microsoft.Extensions.Logging;
 using StackExchange.Redis;
 
 namespace BridgeBeats.Tests;
@@ -21,40 +14,40 @@ namespace BridgeBeats.Tests;
 /// <summary>
 /// A <see cref="WebApplicationFactory{TEntryPoint}"/> over the BridgeBeats web app's entry point that
 /// hosts the real application in-memory for integration and end-to-end tests. It points the app at the
-/// shared Redis container, replaces the identity store with a per-instance SQLite database, applies a
-/// fast retry/timeout resilience profile, and can swap the media-link service into a direct
-/// (non-worker) mode for tests that bypass the distributed queue.
+/// shared Redis container, replaces the identity store with a per-instance SQLite database, and applies
+/// a fast retry/timeout resilience profile.
 /// </summary>
+/// <remarks>
+/// <para>
+/// The host registers its configuration-bound settings and its music providers during eager service
+/// registration, so anything this factory needs the application to honor must reach the host before
+/// that registration runs — not merely before the host is built. Host configuration is therefore the
+/// seam: the test infrastructure replays host configuration entries as command-line arguments into the
+/// entry point, and the application layers command-line arguments above its other sources. The entries
+/// this factory supplies are consequently applied at the same point as any other command-line argument
+/// and drive the app's normal registration path; no test-only provider mode or parallel registration
+/// path exists.
+/// </para>
+/// <para>
+/// Because those entries outrank the machine's environment, the defaults decide the enabled provider
+/// set on their own: the credential keys are supplied empty and the worker enablement flags are
+/// supplied <see langword="false"/>, so exactly the providers a test's configuration intends are
+/// registered no matter how the machine running the tests is configured. A caller that wants a
+/// provider — or the worker branch that derives the provider set from the per-provider worker flags —
+/// supplies those keys itself and its values win.
+/// </para>
+/// <para>
+/// Tests that deliberately exercise the real providers layer their credentials on top through
+/// <see cref="TestConfiguration"/>; the rest pass only the values they depend on.
+/// </para>
+/// </remarks>
 public class CustomWebApplicationFactory : WebApplicationFactory<Web.Program> {
-    /// <summary>The in-memory configuration overlaid on the host's normal configuration sources.</summary>
+    /// <summary>
+    /// The configuration this instance supplies to the host, keyed by normal configuration key.
+    /// </summary>
     private readonly Dictionary<string, string?> _configData;
     /// <summary>Filesystem path of this instance's isolated SQLite identity database.</summary>
     private readonly string _identityDbPath;
-    /// <summary>Environment variables overridden for this factory, with their prior process values, restored on dispose to prevent cross-test contamination.</summary>
-    private readonly List<(string Name, string? PriorValue)> _envRestore;
-
-    /// <summary>
-    /// Environment variables forced empty for the lifetime of every factory instance.
-    /// </summary>
-    /// <remarks>
-    /// The host binds <c>BridgeBeats</c> settings and registers the music providers during eager
-    /// service registration, which happens before this factory's in-memory configuration is applied.
-    /// Any credential a developer keeps in their local user secrets therefore reaches provider
-    /// startup here, so these must be neutralized at the environment level to keep the suite
-    /// independent of the machine it runs on. Each entry is restored in <see cref="Dispose(bool)"/>.
-    /// </remarks>
-    private static readonly string[] s_hostBootCredentialKeys = [
-        // ATProto: a developer's credentials would trip DID validation during registration.
-        "BridgeBeats__ATProtoIdentifier",
-        "BridgeBeats__ATProtoPassword",
-        "BridgeBeats__ATProtoUserDID",
-        "BridgeBeats__ATProtoOAuthSigningKeyPath",
-        // Apple Music: a developer's AppleKeyPath points at a local .p8 file, and provider
-        // registration throws FileNotFoundException when that file is absent from the machine.
-        "BridgeBeats__AppleTeamId",
-        "BridgeBeats__AppleKeyId",
-        "BridgeBeats__AppleKeyPath",
-    ];
 
     /// <summary>
     /// Creates a factory with the default test configuration and no overrides.
@@ -81,7 +74,10 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Web.Program> {
         // Get the Redis connection string AFTER RequireRedis() has initialized the container
         string redisConnectionString = SharedTestInfrastructure.RedisConnectionString;
 
-        // Default test configuration (Spotify only)
+        // Default test configuration. The provider credential entries are deliberately empty: they
+        // replace whatever the machine's environment or user secrets hold so that a developer's own
+        // credentials can neither add providers the tests do not expect nor point a provider at a key
+        // file that only exists on that developer's machine.
         Dictionary<string, string?> defaults = new( ) {
             ["BridgeBeats:SpotifyClientId"] = "test",
             ["BridgeBeats:SpotifyClientSecret"] = "test",
@@ -92,18 +88,31 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Web.Program> {
             // Set both keys to ensure Aspire can find the connection string
             ["ConnectionStrings:redis"] = redisConnectionString,
             ["Aspire:StackExchange:Redis:ConnectionString"] = redisConnectionString,
+            // ATProto: a developer's service-account credentials would trip DID validation during
+            // registration, and the signing-key path would enable Bluesky sign-in against a key file
+            // this machine may not have.
+            ["BridgeBeats:ATProtoIdentifier"] = "",
+            ["BridgeBeats:ATProtoPassword"] = "",
+            ["BridgeBeats:ATProtoUserDID"] = "",
+            ["BridgeBeats:ATProtoOAuthSigningKeyPath"] = "",
+            // Apple Music: a developer's AppleKeyPath points at a local .p8 file, and provider
+            // registration throws FileNotFoundException when that file is absent from the machine.
+            ["BridgeBeats:AppleTeamId"] = "",
+            ["BridgeBeats:AppleKeyId"] = "",
+            ["BridgeBeats:AppleKeyPath"] = "",
+            // Tidal: absent credentials mean the provider is simply not enabled.
+            ["BridgeBeats:TidalClientId"] = "",
+            ["BridgeBeats:TidalClientSecret"] = "",
+            // Worker wiring is pinned so the enabled provider set is a property of this factory
+            // rather than of the machine. When worker services are enabled the enabled provider set
+            // comes from the per-provider worker flags instead of from the credentials above, so an
+            // ambient `true` here would silently register providers no test asked for. A caller that
+            // wants the worker branch passes its own values and they win, as with every other key.
+            ["BridgeBeats:Workers:UseWorkerServices"] = "false",
+            ["BridgeBeats:Workers:SpotifyWorkerEnabled"] = "false",
+            ["BridgeBeats:Workers:AppleMusicWorkerEnabled"] = "false",
+            ["BridgeBeats:Workers:TidalWorkerEnabled"] = "false",
         };
-
-        // Force the host-boot credentials empty so the host does not pick up a developer's
-        // local user-secret credentials. See s_hostBootCredentialKeys for why environment
-        // variables rather than the in-memory overlay are required.
-        // Prior values are captured and restored in Dispose to keep the override scoped to
-        // this factory's lifetime.
-        _envRestore = [];
-        foreach (string key in s_hostBootCredentialKeys) {
-            _envRestore.Add( (key, Environment.GetEnvironmentVariable( key )) );
-            Environment.SetEnvironmentVariable( key, "" );
-        }
 
         // Merge overrides onto defaults (overrides win), EXCEPT for critical test infrastructure keys
         // that must always use the test container connection
@@ -146,35 +155,31 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Web.Program> {
     }
 
     /// <summary>
-    /// Configures the test host: switches to the <c>Testing</c> environment, replaces any in-memory
-    /// configuration with the test configuration, repoints the Redis connection and identity
-    /// <c>DbContext</c> at the test infrastructure, registers a fast resilience profile, and (when
-    /// <c>BridgeBeats:Workers:UseWorkerServices</c> is <c>false</c>) wires a direct, in-process
-    /// media-link service over the enabled providers.
+    /// Contributes this instance's configuration as host configuration, which the test infrastructure
+    /// replays into the entry point as command-line arguments. This is what makes the settings reach
+    /// the host before its eager service registration; see the type remarks.
+    /// </summary>
+    /// <param name="builder">The host builder supplied by the test host.</param>
+    /// <returns>The same <paramref name="builder"/> instance, to allow call chaining.</returns>
+    protected override IHost CreateHost( IHostBuilder builder ) {
+        _ = builder.ConfigureHostConfiguration( config => config.AddInMemoryCollection( _configData ) );
+        return base.CreateHost( builder );
+    }
+
+    /// <summary>
+    /// Configures the test host: switches to the <c>Testing</c> environment, repoints the Redis
+    /// connection and identity <c>DbContext</c> at the test infrastructure, and registers a fast
+    /// resilience profile.
     /// </summary>
     /// <param name="builder">The web host builder supplied by the test host.</param>
     protected override void ConfigureWebHost( IWebHostBuilder builder ) {
         _ = builder.UseEnvironment( "Testing" );
 
-        _ = builder.ConfigureAppConfiguration( ( context, config ) => {
-            // Remove any existing in-memory collections to avoid conflicts
-            IConfigurationSource[] existingSources = [.. config.Sources];
-            config.Sources.Clear( );
-
-            // Add back non-memory sources (like environment variables, command line, etc.)
-            foreach (IConfigurationSource source in existingSources.Where( s => s is not Microsoft.Extensions.Configuration.Memory.MemoryConfigurationSource )) {
-                config.Sources.Add( source );
-            }
-
-            // Add test configuration as the highest priority source (last wins)
-            _ = config.AddInMemoryCollection( _configData );
-        } );
-
         // Override services registered by the application
         _ = builder.ConfigureServices( ( context, services ) => {
-            // CRITICAL: Replace the Aspire Redis client registration with a direct connection
-            // The Aspire AddRedisClient doesn't work properly with WebApplicationFactory because
-            // it captures configuration before ConfigureAppConfiguration runs.
+            // CRITICAL: Replace the Aspire Redis client registration with a direct connection.
+            // The Aspire AddRedisClient registration does not resolve to the container's connection
+            // string under an in-memory test host, so the multiplexer is created directly here.
             _ = services.RemoveAll<IConnectionMultiplexer>( );
             _ = services.AddSingleton<IConnectionMultiplexer>( _ => {
                 string connStr = _configData.TryGetValue( "ConnectionStrings:redis", out string? cs ) && !string.IsNullOrEmpty( cs )
@@ -214,47 +219,6 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Web.Program> {
                 options.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds( 20 ); // Shorter total timeout
                 options.AttemptTimeout.Timeout = TimeSpan.FromSeconds( 5 ); // Shorter per-attempt timeout
             } );
-
-            // CRITICAL: Check if we're in direct provider mode (bypassing queue/caching)
-            // This fixes the timing issue where the application's service registration happens before
-            // our configuration overrides are applied. The application may have registered
-            // CachingMediaLinkService (which uses LookupOrchestrator and requires workers) based on
-            // the original configuration. We need to explicitly replace it with DefaultMediaLinkService
-            // for tests that want direct provider access.
-            bool useDirectMode = _configData.TryGetValue( "BridgeBeats:Workers:UseWorkerServices", out string? workerMode )
-                && workerMode?.Equals( "false", StringComparison.OrdinalIgnoreCase ) == true;
-
-            if (useDirectMode) {
-                // Remove the potentially-registered caching service and orchestrator
-                _ = services.RemoveAll<IMediaLinkService>( );
-                _ = services.RemoveAll<ILookupOrchestrator>( );
-
-                // Re-register DefaultMediaLinkService for direct provider access
-                _ = services.AddTransient<IMediaLinkService>( sp => {
-                    // Get enabled providers from the service provider (registered by the application)
-                    HashSet<SupportedProviders> enabledProviders = sp.GetRequiredService<HashSet<SupportedProviders>>( );
-
-                    // Build provider dictionary from registered lookup services
-                    Dictionary<SupportedProviders, IMusicLookupService> providerServices = [];
-                    foreach (SupportedProviders provider in enabledProviders) {
-                        IMusicLookupService? lookupService = provider switch {
-                            SupportedProviders.Spotify => sp.GetService<SpotifyLookupService>( ),
-                            SupportedProviders.AppleMusic => sp.GetService<AppleMusicLookupService>( ),
-                            SupportedProviders.Tidal => sp.GetService<TidalLookupService>( ),
-                            _ => null
-                        };
-                        if (lookupService is not null) {
-                            providerServices.Add( provider, lookupService );
-                        }
-                    }
-
-                    return new DefaultMediaLinkService(
-                        providerServices,
-                        sp.GetRequiredService<ILogger<DefaultMediaLinkService>>( ),
-                        sp.GetRequiredService<JsonSerializerOptions>( )
-                    );
-                } );
-            }
         } );
     }
 
@@ -287,20 +251,13 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Web.Program> {
     }
 
     /// <summary>
-    /// Disposes the test host, restores the environment variables this factory forced empty to their
-    /// pre-construction values, and deletes this instance's SQLite identity database file.
+    /// Disposes the test host and deletes this instance's SQLite identity database file.
     /// </summary>
     /// <param name="disposing"><c>true</c> when called from <c>Dispose</c> rather than a finalizer.</param>
     protected override void Dispose( bool disposing ) {
         base.Dispose( disposing );
 
         if (disposing) {
-            // Restore the env vars captured in the constructor so this factory does
-            // not leak empty credentials settings into other tests in the same process.
-            foreach ((string name, string? priorValue) in _envRestore) {
-                Environment.SetEnvironmentVariable( name, priorValue );
-            }
-
             // Clean up temp database files
             TryDeleteFile( _identityDbPath );
         }

@@ -350,8 +350,15 @@ namespace BridgeBeats.Web.Configuration {
 
         /// <summary>
         /// Layers the configuration sources in precedence order: the required <c>appsettings.json</c> file,
-        /// optional user secrets, command-line arguments, and environment variables.
+        /// optional user secrets, environment variables, and finally command-line arguments.
         /// </summary>
+        /// <remarks>
+        /// Command-line arguments are added last so they take precedence over the environment. The
+        /// in-memory test host supplies the entries it needs the application to honor as host
+        /// configuration, which the test infrastructure replays as command-line arguments; if the
+        /// environment were layered on top instead, a developer's own machine-level credentials would
+        /// silently override them. Explicit command-line arguments still win over everything else.
+        /// </remarks>
         /// <param name="config">The configuration builder to populate.</param>
         /// <param name="args">The command-line arguments to add as a configuration source.</param>
         /// <returns>The same <paramref name="config"/> instance, to allow call chaining.</returns>
@@ -365,14 +372,13 @@ namespace BridgeBeats.Web.Configuration {
                 reloadOnChange: false
             );
 
-            // Always load user secrets in non-production environments
-            // Tests use WebApplicationFactory.ConfigureAppConfiguration to inject test config
-            // which overrides user secrets values for test-specific settings
+            // Always load user secrets in non-production environments. Command-line arguments are
+            // layered above them so a deployment or a test host can override a machine's secrets.
             _ = config.AddUserSecrets<Program>( optional: true );
 
             return config
-                .AddCommandLine( args )
-                .AddEnvironmentVariables( );
+                .AddEnvironmentVariables( )
+                .AddCommandLine( args );
         }
 
         /// <summary>

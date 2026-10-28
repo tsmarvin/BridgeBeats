@@ -65,6 +65,33 @@ public class OAuthLoginClientAddressResolverTests {
             "a failed proxy lookup must be reported" );
     }
 
+    /// <summary>
+    /// The lookup-failure warning must not carry the proxy host name or the resolver's exception.
+    /// Host names reveal the deployment's private network topology, and resolver exceptions can echo
+    /// it back in their messages, so neither belongs in application logs.
+    /// </summary>
+    [TestMethod]
+    public async Task LookupFailure_WarningOmitsProxyHostAndException( ) {
+        const string ProxyHost = "proxy.internal.example.invalid";
+        CapturingLoggerFactory loggerFactory = new( );
+        using OAuthLoginClientAddressResolver resolver = Resolver(
+            ProxyHost,
+            ( _, _ ) => throw new InvalidOperationException( $"name resolution is unavailable for {ProxyHost}" ),
+            loggerFactory );
+        DefaultHttpContext context = NewContext( "192.0.2.10", "198.51.100.5" );
+
+        await resolver.RefreshAsync( CancellationToken.None );
+
+        // Behavior is unchanged: the failure still fails closed.
+        Assert.AreEqual( "192.0.2.10", resolver.GetPartitionKey( context ),
+            "an unresolved proxy must not be trusted to choose a rate-limit bucket" );
+
+        CapturedLogEntry warning = loggerFactory.Entries.Single( entry => entry.Level == LogLevel.Warning );
+        Assert.IsFalse( warning.Message.Contains( ProxyHost, StringComparison.Ordinal ),
+            $"the warning must not name the proxy host: {warning.Message}" );
+        Assert.IsNull( warning.Exception, "the warning must not attach the resolver's exception" );
+    }
+
     /// <summary>A resolved proxy must lose its trust when a later lookup fails.</summary>
     [TestMethod]
     public async Task LookupFailure_ClearsPreviouslyTrustedAddress( ) {
@@ -149,7 +176,7 @@ public class OAuthLoginClientAddressResolverTests {
         return context;
     }
 
-    private sealed record CapturedLogEntry( LogLevel Level, string Message );
+    private sealed record CapturedLogEntry( LogLevel Level, string Message, Exception? Exception );
 
     private sealed class CapturingLoggerFactory : ILoggerFactory {
         internal List<CapturedLogEntry> Entries { get; } = [];
@@ -171,7 +198,7 @@ public class OAuthLoginClientAddressResolverTests {
                 TState state,
                 Exception? exception,
                 Func<TState, Exception?, string> formatter
-            ) => entries.Add( new CapturedLogEntry( logLevel, formatter( state, exception ) ) );
+            ) => entries.Add( new CapturedLogEntry( logLevel, formatter( state, exception ), exception ) );
         }
     }
 }

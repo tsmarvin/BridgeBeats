@@ -46,41 +46,6 @@ $RepoName   = 'BridgeBeats'
 $Timestamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
 $UpgradeLog = 'upgrade.log'
 
-# =============================================================================
-# ACL Capability (resolved up front)
-# =============================================================================
-# Every path that may hold secret material is ACL-restricted, and those restrictions are applied
-# before any secret is copied. The capability and the acting principal are therefore resolved here,
-# before any backup or secret handling runs: reading an unset variable later in the script yields
-# $null, and "-not $null" is $true, so a guard written that way would pass while the restriction was
-# silently skipped.
-$isWindowsPlatform = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
-$currentUser = $null
-$aclCapabilityError = $null
-
-if ($isWindowsPlatform) {
-    # A Windows host is expected to be able to apply permissions. Absence of the capability is a
-    # hard error rather than a silent downgrade.
-    try {
-        $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-        if (-not $currentUser) { $aclCapabilityError = 'could not determine the current user' }
-    } catch {
-        $aclCapabilityError = $_.Exception.Message
-    }
-    if (-not $aclCapabilityError -and -not (Get-Command icacls -ErrorAction Ignore)) {
-        $aclCapabilityError = 'icacls was not found on PATH'
-    }
-}
-
-# True when this host can restrict a path to the current user. False means "ACLs do not apply here"
-# (a non-Windows host), not "failed" — failures are reported through $aclCapabilityError.
-$canRestrictAcl = $isWindowsPlatform -and (-not $aclCapabilityError)
-
-# Marks that the resolution above actually ran. Callers require this to be $true before skipping a
-# restriction: if the variables were somehow unset, "-not $canRestrictAcl" is $true, which would
-# silently permit an unprotected copy. Requiring an explicit resolved flag makes that case fail.
-$aclCapabilityResolved = $true
-
 # Files to download from the repository
 $DownloadFiles = @('docker-compose.yml', 'Caddyfile', '.env.example')
 
@@ -162,249 +127,6 @@ function Test-SecretHasContent {
 
     # Has non-whitespace, non-placeholder content
     return ($content -match '\S')
-}
-
-function Protect-PathToCurrentUser {
-    param(
-        [string]$Path,
-        [string]$User
-    )
-
-    # Replaces the discretionary ACL with a single full-control entry for $User, then verifies the
-    # result by reading the ACL back.
-    #
-    # `icacls /inheritance:r /grant:r` is deliberately not used: /inheritance:r removes only
-    # *inherited* entries, so any explicit ACE already on the path survives. On an install that was
-    # set up before this change, or where another tool granted access explicitly, that would leave a
-    # second principal with read access while appearing to succeed.
-    #
-    # Inheritance is switched off and the target marked protected, so children start from this ACL.
-    # No principal beyond $User is ever added: the Docker service account that resolves bind mounts on
-    # a Windows host is not known here, and inventing one would grant access to an unverified account.
-    try {
-        $acl = Get-Acl -Path $Path -ErrorAction Stop
-        $acl.SetAccessRuleProtection($true, $false)
-        foreach ($existing in @($acl.Access)) {
-            $acl.RemoveAccessRule($existing) | Out-Null
-        }
-
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            $User,
-            [System.Security.AccessControl.FileSystemRights]::FullControl,
-            [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
-            [System.Security.AccessControl.PropagationFlags]::None,
-            [System.Security.AccessControl.AccessControlType]::Allow)
-        $acl.AddAccessRule($rule)
-        Set-Acl -Path $Path -AclObject $acl -ErrorAction Stop
-
-        # Read back and confirm the intended state: no inherited entries, and every remaining explicit
-        # entry grants the current user and nobody else.
-        $verified = Get-Acl -Path $Path -ErrorAction Stop
-        if (-not $verified.AreAccessRulesProtected) {
-            Write-Err "ACL on $Path is still inheriting entries after being restricted"
-            return $false
-        }
-
-        $entries = @($verified.Access)
-        if ($entries.Count -eq 0) {
-            Write-Err "ACL on $Path has no explicit entries after being restricted"
-            return $false
-        }
-
-        foreach ($entry in $entries) {
-            if ($entry.IdentityReference.Value -notlike "*$User") {
-                Write-Err "ACL on $Path grants access to $($entry.IdentityReference.Value), which is not the current user"
-                return $false
-            }
-        }
-        return $true
-    } catch {
-        Write-Err "Could not restrict $Path : $($_.Exception.Message)"
-        return $false
-    }
-}
-
-function Get-TreeManifest {
-    param([string]$Root)
-
-    # One line per file: relative path, length, SHA256. Only metadata and hashes are produced, never
-    # file content, so the manifest can be compared without exposing secret values.
-    if (-not (Test-Path $Root)) { return @() }
-
-    return Get-ChildItem -Path $Root -Recurse -File -Force -ErrorAction Stop | ForEach-Object {
-        $relative = $_.FullName.Substring($Root.Length).TrimStart('\', '/')
-        $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
-        "$relative`t$($_.Length)`t$hash"
-    } | Sort-Object
-}
-
-function Test-SecretsTreeCopied {
-    param(
-        [string]$Source,
-        [string]$Destination
-    )
-
-    # Copies the tree into a fresh destination and verifies the result against a manifest of the
-    # source. Returns $true only when every file is present with identical content; on any failure
-    # the partial copy is removed so a later run cannot mistake it for a rollback point.
-    try {
-        $sourceManifest = Get-TreeManifest -Root $Source
-        if (-not $sourceManifest -or $sourceManifest.Count -eq 0) {
-            Write-Err 'No secrets were found to back up'
-            return $false
-        }
-
-        if (-not (Test-Path $Destination)) {
-            New-Item -Path $Destination -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        }
-
-        # Copy the contents, not the directory: Copy-Item -Recurse of a directory into an existing
-        # destination nests the tree one level deeper than the backup is read from.
-        foreach ($item in Get-ChildItem -Path $Source -Force -ErrorAction Stop) {
-            Copy-Item -Path $item.FullName -Destination $Destination -Recurse -Force -ErrorAction Stop
-        }
-
-        $copyManifest = Get-TreeManifest -Root $Destination
-        if (Compare-Object -ReferenceObject $sourceManifest -DifferenceObject $copyManifest) {
-            Write-Err 'The secrets backup does not match the source; no rollback copy was created'
-            Remove-Item -Path $Destination -Recurse -Force -ErrorAction Ignore
-            return $false
-        }
-
-        return $true
-    } catch {
-        Write-Err "Failed to back up the secrets directory: $($_.Exception.Message)"
-        Remove-Item -Path $Destination -Recurse -Force -ErrorAction Ignore
-        return $false
-    }
-}
-
-function Get-SigningKeyShape {
-    param([string]$Content)
-
-    # Fail-closed shape check mirroring the application's loader: content that is neither a PEM
-    # private key nor an EC P-256 private JWK is rejected rather than accepted for being non-blank.
-    # This is a shape check, not a parse, so the application still performs final validation.
-    if ($Content -match '-----BEGIN[^-]*PRIVATE KEY-----') {
-        return 'ok'
-    }
-
-    if (-not $Content.TrimStart().StartsWith('{')) {
-        return 'not a JSON JWK or a PEM private key'
-    }
-
-    # Leading whitespace is tolerated: the application trims before deciding whether the content is
-    # a JWK, so rejecting it here would refuse a key the application would load.
-    $trimmed = $Content.TrimStart()
-    foreach ($member in @('kty', 'crv', 'x', 'y', 'd', 'kid')) {
-        if ($trimmed -notmatch ('"' + $member + '"')) {
-            return "JWK is missing the $member member"
-        }
-    }
-
-    if ($trimmed -notmatch '"EC"' -or $trimmed -notmatch '"P-256"') {
-        return 'JWK is not an EC P-256 key'
-    }
-
-    return 'ok'
-}
-
-function Get-SigningKeyState {
-    param([string]$FilePath)
-
-    # Startup rejects a blank, whitespace-only, placeholder, or "{}" ATProto signing key
-    # (BlueskyAuthenticationConfiguration.LoadSigningKey), so none of those shapes may be
-    # accepted as a working key. PEM and JWK content both contain other characters.
-    #
-    # An unreadable file is reported separately from unusable content: a read failure is not
-    # evidence that the key is broken, and replacing it would invalidate a key the application
-    # may currently be publishing.
-    try {
-        $content = Get-Content -Path $FilePath -Raw -ErrorAction Stop
-    } catch {
-        return 'Unreadable'
-    }
-
-    if ([string]::IsNullOrWhiteSpace($content)) {
-        return 'Unusable'
-    }
-
-    if ([string]::IsNullOrWhiteSpace($content.Replace('{', '').Replace('}', ''))) {
-        return 'Unusable'
-    }
-
-    if ($content -match '^(your_|REPLACE_WITH_)') {
-        return 'Unusable'
-    }
-
-    # Non-blank is not the same as loadable. A malformed key is reported separately rather than as
-    # unusable, because replacing it would discard content the operator may have intended.
-    if ((Get-SigningKeyShape -Content $content) -ne 'ok') {
-        return 'Malformed'
-    }
-
-    return 'Usable'
-}
-
-function Backup-SecretFile {
-    param([string]$FilePath)
-
-    # Returns $true only when a byte-identical copy is verified on disk. The caller must not
-    # replace the original otherwise: without a readable copy, replacing a live signing key
-    # would discard the only record of a published key.
-    # The copy stays inside the secrets directory, which docker-compose.yml mounts file by
-    # file, so no container ever loads it.
-    $backupPath = "$FilePath.bak.$Timestamp"
-    try {
-        Copy-Item -Path $FilePath -Destination $backupPath -Force -ErrorAction Stop
-    } catch {
-        Write-Err "Could not back up $FilePath : $($_.Exception.Message)"
-        return $false
-    }
-
-    try {
-        $original = (Get-FileHash -Path $FilePath -Algorithm SHA256 -ErrorAction Stop).Hash
-        $copy = (Get-FileHash -Path $backupPath -Algorithm SHA256 -ErrorAction Stop).Hash
-    } catch {
-        Write-Err "Could not verify the backup of $FilePath : $($_.Exception.Message)"
-        Remove-Item -Path $backupPath -Force -ErrorAction Ignore
-        return $false
-    }
-
-    if ($original -ne $copy) {
-        Write-Err "Backup of $FilePath did not verify; leaving the original untouched"
-        Remove-Item -Path $backupPath -Force -ErrorAction Ignore
-        return $false
-    }
-
-    Write-Ok "Backed up existing $([System.IO.Path]::GetFileName($FilePath)) to $([System.IO.Path]::GetFileName($backupPath))"
-    return $true
-}
-
-function New-SigningKeyJwk {
-    param([string]$FilePath)
-
-    # Generate first, then write, so a generation failure cannot leave a truncated key behind.
-    try {
-        $generated = Get-ES256SigningKeyJwk
-    } catch {
-        Write-Err "Could not generate the ATProto OAuth signing key: $($_.Exception.Message)"
-        return $false
-    }
-
-    if ([string]::IsNullOrWhiteSpace($generated)) {
-        Write-Err 'Could not generate the ATProto OAuth signing key: generation produced no content'
-        return $false
-    }
-
-    try {
-        Set-Content -Path $FilePath -Value $generated -NoNewline
-    } catch {
-        Write-Err "Could not write $FilePath : $($_.Exception.Message)"
-        return $false
-    }
-
-    return $true
 }
 
 function Get-RandomString {
@@ -673,69 +395,20 @@ if ($containersExist) {
     Write-UpgradeLog "=== Upgrade: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ==="
     Write-UpgradeLog "Branch: $Branch"
 
-    # Back up secrets before any modifications. A failed backup must stop the run: the prune below
-    # removes older copies, so continuing after a failure could leave no rollback point at all.
+    # Back up secrets before any modifications
     if (Test-Path $secretsDir) {
         $backupTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-        $backupName = "secrets_backup_$backupTimestamp"
-        $backupDir = Join-Path $Directory $backupName
-
-        # A sibling backup directory inherits the ACL of the install root, not of the secrets
-        # directory it mirrors, so its ACL is replaced with the intended one *before* any secret
-        # material is copied into it (children then inherit that ACL). The install root itself is
-        # deliberately left alone: it also holds the Compose file and data directories.
-        # Failure is fatal, so the copy cannot proceed into an unprotected directory.
-        #
-        # An unset capability is treated as a failure on Windows, never as permission to copy: the
-        # intended ACL must be established and verified before the first secret is written.
-        $backupRestricted = $false
-        if (-not $aclCapabilityResolved) {
-            Write-Err "Cannot restrict $backupName : the ACL capability was never resolved"
-        } elseif ($aclCapabilityError) {
-            Write-Err "Cannot restrict $backupName : $aclCapabilityError"
-        } elseif (-not $canRestrictAcl) {
-            # Not a Windows host, so there is no ACL to apply here.
-            $backupRestricted = $true
-        } else {
-            if (-not (Test-Path $backupDir)) {
-                New-Item -Path $backupDir -ItemType Directory -Force | Out-Null
-            }
-            $backupRestricted = Protect-PathToCurrentUser -Path $backupDir -User $currentUser
+        $backupDir = Join-Path $Directory "secrets_backup_$backupTimestamp"
+        try {
+            Copy-Item -Path $secretsDir -Destination $backupDir -Recurse
+            Write-Ok "Backed up secrets to secrets_backup_$backupTimestamp/"
+            Write-UpgradeLog "Backed up secrets to secrets_backup_$backupTimestamp/"
+        } catch {
+            Write-Warn 'Failed to back up secrets directory'
+            Write-UpgradeLog 'WARN: Failed to back up secrets directory'
         }
 
-        if (-not $backupRestricted) {
-            Write-Err "Refusing to write secret backups: $backupName is not restricted to the current user."
-            Remove-Item -Path $backupDir -Recurse -Force -ErrorAction Ignore
-            Write-UpgradeLog 'ERROR: Backup directory ACL was not restricted'
-            exit 1
-        }
-
-        $backedUp = $false
-        if (Test-SecretsTreeCopied -Source $secretsDir -Destination $backupDir) {
-            $backedUp = $true
-            Write-Ok "Backed up secrets to $backupName/"
-            Write-UpgradeLog "Backed up secrets to $backupName/"
-        } else {
-            Write-Err 'Failed to back up the secrets directory; no rollback copy was created'
-            Write-Err 'Old backups were left in place. Fix the file access permissions, then re-run this script.'
-            Write-UpgradeLog 'ERROR: Failed to back up secrets directory'
-        }
-
-        if (-not $backedUp) {
-            exit 1
-        }
-
-        # Each retained backup holds the same private keys, so the older siblings receive the same
-        # intended ACL. A failure here is reported rather than ignored.
-        if ($canRestrictAcl) {
-            foreach ($existingBackup in Get-ChildItem -Path $Directory -Directory -Filter 'secrets_backup_*' -ErrorAction Ignore) {
-                if (-not (Protect-PathToCurrentUser -Path $existingBackup.FullName -User $currentUser)) {
-                    Write-Warn "Could not restrict $($existingBackup.Name)"
-                }
-            }
-        }
-
-        # Prune old backups, keep 3 most recent. Only reached once the new copy is verified.
+        # Prune old backups, keep 3 most recent
         Get-ChildItem -Path $Directory -Directory -Filter 'secrets_backup_*' |
             Sort-Object Name -Descending |
             Select-Object -Skip 3 |
@@ -794,40 +467,14 @@ if ($containersExist) {
 # =============================================================================
 Write-Section 'Setting Up Secrets'
 
-# On Windows the secrets directory inherits the ACL of whatever directory it is created in, which
-# for an arbitrary -Directory is not the current user's profile and may grant other principals
-# access to the signing key. Restrict the directory to the installing user explicitly. No other
-# principal is granted access: the container reads secrets through bind mounts resolved by the
-# Docker service, not through a Windows account on this host.
+# On Windows, the secrets directory inherits the current user's profile ACL.
+# Linux-style ownership and mode-700 permission hardening is handled by install.sh on Linux hosts.
+
 if (Test-Path $secretsDir) {
     Write-Ok "Secrets directory already exists: $secretsDir"
 } else {
     New-Item -Path $secretsDir -ItemType Directory -Force | Out-Null
     Write-Ok "Created secrets directory: $secretsDir"
-}
-
-# The secrets directory is restricted before any secret is written into it, and a failure is fatal:
-# continuing would store private keys in a directory other local accounts can read, and then report
-# success. The capability was resolved at the top of the script; nothing is re-derived here.
-$secretsRestricted = $false
-if (-not $aclCapabilityResolved) {
-    Write-Err 'Could not restrict the secrets directory ACL: the ACL capability was never resolved'
-} elseif ($aclCapabilityError) {
-    Write-Err "Could not restrict the secrets directory ACL: $aclCapabilityError"
-} elseif (-not $canRestrictAcl) {
-    # Not a Windows host, so there is no ACL to apply here.
-    $secretsRestricted = $true
-} elseif (Protect-PathToCurrentUser -Path $secretsDir -User $currentUser) {
-    $secretsRestricted = $true
-    Write-Ok 'Restricted the secrets directory to the installing user'
-}
-
-if (-not $secretsRestricted) {
-    # Braces around $env:USERNAME matter: PowerShell reads "$env:USERNAME:(OI)(CI)F" as a
-    # scope-qualified variable name and interpolates an empty account.
-    Write-Err 'Refusing to continue: the secrets directory ACL was not restricted, so stored private keys would be readable by other accounts on this host.'
-    Write-Err "Restrict it and re-run: icacls `"$secretsDir`" /inheritance:r /grant:r `"${env:USERNAME}:(OI)(CI)F`""
-    exit 1
 }
 
 # Track secrets that need user attention
@@ -837,42 +484,7 @@ foreach ($secret in $SecretFiles) {
     $secretPath = Join-Path -Path $secretsDir -ChildPath $secret.Name
 
     if (Test-Path $secretPath) {
-        # The ATProto signing key is the one secret the application refuses to start without,
-        # so an unusable file must be replaced here rather than reported and left in place.
-        if ($secret.Name -eq 'atproto_oauth_key.json') {
-            switch (Get-SigningKeyState -FilePath $secretPath) {
-                'Usable' {
-                    Write-Ok "Secret exists and has content: $($secret.Name)"
-                }
-                'Unusable' {
-                    Write-Warn "$($secret.Name) is empty, placeholder, or '{}' - a usable ES256 signing key is required"
-                    if (-not (Backup-SecretFile $secretPath)) {
-                        Write-Err "Refusing to replace $($secret.Name) without a verified backup. Fix the file's access permissions, then re-run this script."
-                        exit 1
-                    }
-                    if (New-SigningKeyJwk -FilePath $secretPath) {
-                        Write-Ok "Regenerated $($secret.Name) with a new ES256 signing key"
-                        Write-UpgradeLog "Regenerated $($secret.Name) (previous content was unusable)"
-                    } else {
-                        Write-Err "Could not generate a replacement $($secret.Name). Supply an ES256 JWK manually, then re-run this script."
-                        exit 1
-                    }
-                }
-                'Malformed' {
-                    # Non-blank but not a loadable ES256 key. Replacing it could discard content the
-                    # operator intended, so fail with guidance instead of overwriting.
-                    Write-Err "$($secret.Name) is not a usable ES256 signing key."
-                    Write-Err 'It must be an ES256 private JWK (kty/crv/x/y/d/kid) or a PEM private key.'
-                    Write-Err "Review $secretPath, or move it aside and re-run to generate a new key."
-                    exit 1
-                }
-                default {
-                    # An unreadable file is not evidence that the key is broken.
-                    Write-Err "Cannot read $($secret.Name) to verify it. Fix the file's access permissions, then re-run this script."
-                    exit 1
-                }
-            }
-        } elseif (Test-SecretHasContent $secretPath) {
+        if (Test-SecretHasContent $secretPath) {
             Write-Ok "Secret exists and has content: $($secret.Name)"
         } else {
             Write-Warn "Secret exists but appears empty or contains placeholder content: $($secret.Name)"
@@ -881,14 +493,10 @@ foreach ($secret in $SecretFiles) {
         if ($secret.AutoGenerate) {
             # Auto-generate this secret
             if ($secret.Name -eq 'atproto_oauth_key.json') {
-                if (-not (New-SigningKeyJwk -FilePath $secretPath)) {
-                    Write-Err "Could not generate $($secret.Name). Supply an ES256 JWK manually, then re-run this script."
-                    exit 1
-                }
-                Write-Ok "Auto-generated: $($secret.Name)"
-                continue
+                $generatedValue = Get-ES256SigningKeyJwk
+            } else {
+                $generatedValue = Get-RandomString
             }
-            $generatedValue = Get-RandomString
             Set-Content -Path $secretPath -Value $generatedValue -NoNewline
             Write-Ok "Auto-generated: $($secret.Name)"
         } else {

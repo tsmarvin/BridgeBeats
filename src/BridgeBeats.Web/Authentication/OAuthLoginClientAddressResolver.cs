@@ -56,13 +56,15 @@ internal sealed class OAuthLoginClientAddressResolver(
             Volatile.Write( ref _trustedProxyAddresses, [.. addresses.Select( Normalize ).Where( address => address is not null ).Cast<IPAddress>( )] );
         } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
             throw;
-        } catch (Exception ex) {
+        } catch (Exception) {
             // Clear before logging: a resolver that throws must never keep stale trust, even if the
             // logging pipeline itself fails.
             Volatile.Write( ref _trustedProxyAddresses, [] );
-            _logger.LogWarning( ex,
-                "Could not resolve trusted OAuth proxy host {TrustedProxyHost}; forwarded client addresses are ignored for login rate limiting.",
-                _trustedProxyHost );
+            // Neither the host name nor the resolver's exception is recorded here. The warning is
+            // actionable without them because trust is already off, and both can carry details of
+            // the deployment's private network topology into logs.
+            _logger.LogWarning(
+                "Could not resolve the trusted OAuth proxy host; forwarded client addresses are ignored for login rate limiting." );
         }
     }
 

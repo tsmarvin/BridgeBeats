@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using BridgeBeats.Contracts.DTOs;
+using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Web.Controllers;
 using Microsoft.Extensions.Configuration;
 
@@ -32,6 +33,14 @@ public class MusicLookupControllerTests {
     private static string? s_apiKey;
     /// <summary>The internal service key configured for the test host and sent by the internal client.</summary>
     private const string TestInternalServiceKey = "test-internal-service-key-abc123";
+    /// <summary>
+    /// The host built on demand for the tests that perform live provider lookups, and the API-key
+    /// client connected to it. It is separate from the class's deterministic host so that a machine
+    /// without usable provider credentials affects only the tests that need a live provider.
+    /// </summary>
+    private static CustomWebApplicationFactory? s_liveFactory;
+    /// <summary>The API-key client connected to the live-provider host.</summary>
+    private static HttpClient? s_liveClient;
 
     /// <summary>
     /// Builds the test host with worker services disabled, registers a test user to obtain an API key,
@@ -40,74 +49,22 @@ public class MusicLookupControllerTests {
     /// <param name="context">The MSTest class context, used for its cancellation token.</param>
     [ClassInitialize]
     public static async Task ClassInitialize( TestContext context ) {
-        // Load configuration from appsettings.json and user secrets
-        IConfigurationRoot configuration = new ConfigurationBuilder()
-            .AddJsonFile( Path.Combine( "src", "BridgeBeats.Web", "appsettings.json" ), optional: true )
-            .AddUserSecrets<Web.Program>( optional: true )
-            .AddEnvironmentVariables()
-            .Build();
-
-        // Build config overrides from loaded configuration
-        Dictionary<string, string?> configData = configuration
-            .AsEnumerable()
-            .Where( kv => kv.Value is not null )
-            .Where( kv => !kv.Key.EndsWith( "ConnectionString", StringComparison.OrdinalIgnoreCase ) )
-            .ToDictionary( );
-
-        // Inject a known internal-service key via environment variable so it is available
-        // during service registration (AddBridgeBeatsServices runs before ConfigureAppConfiguration
-        // test overrides are applied, so environment variables are the reliable injection point).
-        Environment.SetEnvironmentVariable( "BridgeBeats__InternalServiceKey", TestInternalServiceKey );
+        // These tests assert controller behavior (authorization, validation, rendering) and the
+        // lookup-result assertions are provider-gated, so the host runs from the isolated test
+        // settings plus the values this class depends on. No ambient credential is copied.
+        Dictionary<string, string?> configData = TestHostConfiguration.Isolated( );
+        // The internal service key is passed as host configuration alongside the other settings
+        // below; no process-wide environment variable is needed.
         configData["BridgeBeats:InternalServiceKey"] = TestInternalServiceKey;
-        // Force Discord token to null to prevent Discord service registration
-        configData["BridgeBeats:DiscordToken"] = string.Empty;
-        // Disable worker services mode - use direct provider implementations
-        configData["BridgeBeats:Workers:UseWorkerServices"] = "false";
-        // Force ATProto credentials to empty to disable caching service
-        // The caching service requires background workers (QueueProcessorBackgroundService)
-        // that are not running in the test environment, causing tests to timeout
-        configData["BridgeBeats:ATProtoIdentifier"] = string.Empty;
-        configData["BridgeBeats:ATProtoPassword"] = string.Empty;
-        configData["BridgeBeats:ATProtoUserDID"] = string.Empty;
         // Higher rate limit for integration tests
         configData["BridgeBeats:RateLimitRequestsPerHour"] = "1000";
 
         s_factory = new CustomWebApplicationFactory( configData );
 
-        // Create HTTP client for registration
-        HttpClient registrationClient = s_factory.CreateClient();
-
         // Initialize databases after services are configured
         await s_factory.InitializeDatabasesAsync( );
 
-        // Generate unique email for this test class
-        string testEmail = $"musiclookup-test-{Guid.NewGuid():N}@test.com";
-        string testPassword = "TestPassword123!";
-
-        // Get antiforgery token for registration using shared helper
-        string antiforgeryToken = await AntiforgeryTestHelper.GetAntiforgeryTokenAsync( registrationClient, context.CancellationToken );
-
-        // Register user via the actual API endpoint with antiforgery token
-        var registerRequest = new { Email = testEmail, Password = testPassword };
-        HttpResponseMessage registerResponse = await AntiforgeryTestHelper.PostWithAntiforgeryAsync(
-            registrationClient, "/account/register", JsonContent.Create( registerRequest ), antiforgeryToken, context.CancellationToken );
-
-        if (!registerResponse.IsSuccessStatusCode) {
-            string errorContent = await registerResponse.Content.ReadAsStringAsync( context.CancellationToken );
-            throw new InvalidOperationException( $"Failed to register test user: {registerResponse.StatusCode} - {errorContent}" );
-        }
-
-        // Extract API key from response
-        JsonElement? registerResult = await registerResponse.Content.ReadFromJsonAsync<JsonElement>( context.CancellationToken );
-        if (!registerResult.HasValue) {
-            throw new InvalidOperationException( "Failed to parse registration response" );
-        }
-
-        s_apiKey = registerResult.Value.GetProperty( "apiKey" ).GetString( );
-
-        if (string.IsNullOrEmpty( s_apiKey )) {
-            throw new InvalidOperationException( "Failed to extract API key from registration response" );
-        }
+        s_apiKey = await RegisterUserAndGetApiKeyAsync( s_factory, context.CancellationToken );
 
         // Create HTTP client with API key header for actual tests
         s_client = s_factory.CreateClient( );
@@ -123,17 +80,79 @@ public class MusicLookupControllerTests {
         // Create a client bearing an invalid X-Service-Key for negative-control auth tests
         s_badInternalClient = s_factory.CreateClient( );
         s_badInternalClient.DefaultRequestHeaders.Add( "X-Service-Key", "wrong-key" );
-
-        registrationClient.Dispose( );
     }
 
     /// <summary>
-    /// Disposes the test host and clears the internal service key environment variable.
+    /// Disposes the test hosts.
     /// </summary>
     [ClassCleanup]
     public static void ClassCleanup( ) {
+        s_liveClient?.Dispose( );
+        s_liveFactory?.Dispose( );
         s_factory?.Dispose( );
-        Environment.SetEnvironmentVariable( "BridgeBeats__InternalServiceKey", null );
+    }
+
+    /// <summary>
+    /// Registers a fresh test user through the real registration endpoint and returns the API key the
+    /// response carries.
+    /// </summary>
+    /// <param name="factory">The host to register the user against.</param>
+    /// <param name="cancellationToken">A token to cancel the requests.</param>
+    /// <returns>The API key issued to the newly registered user.</returns>
+    private static async Task<string> RegisterUserAndGetApiKeyAsync(
+        CustomWebApplicationFactory factory,
+        CancellationToken cancellationToken
+    ) {
+        using HttpClient registrationClient = factory.CreateClient( );
+        string testEmail = $"musiclookup-test-{Guid.NewGuid( ):N}@test.com";
+        string testPassword = "TestPassword123!";
+
+        string antiforgeryToken = await AntiforgeryTestHelper.GetAntiforgeryTokenAsync( registrationClient, cancellationToken );
+
+        var registerRequest = new { Email = testEmail, Password = testPassword };
+        HttpResponseMessage registerResponse = await AntiforgeryTestHelper.PostWithAntiforgeryAsync(
+            registrationClient, "/account/register", JsonContent.Create( registerRequest ), antiforgeryToken, cancellationToken );
+
+        if (!registerResponse.IsSuccessStatusCode) {
+            string errorContent = await registerResponse.Content.ReadAsStringAsync( cancellationToken );
+            throw new InvalidOperationException( $"Failed to register test user: {registerResponse.StatusCode} - {errorContent}" );
+        }
+
+        JsonElement? registerResult = await registerResponse.Content.ReadFromJsonAsync<JsonElement>( cancellationToken );
+        if (!registerResult.HasValue) {
+            throw new InvalidOperationException( "Failed to parse registration response" );
+        }
+
+        string? apiKey = registerResult.Value.GetProperty( "apiKey" ).GetString( );
+        return string.IsNullOrEmpty( apiKey )
+            ? throw new InvalidOperationException( "Failed to extract API key from registration response" )
+            : apiKey;
+    }
+
+    /// <summary>
+    /// Returns an API-key client connected to a host built with this machine's real provider
+    /// credentials, creating that host on first use, and marks the calling test inconclusive when no
+    /// provider credential is available to perform a live lookup.
+    /// </summary>
+    /// <returns>An API-key client connected to the live-provider host.</returns>
+    private static async Task<HttpClient> LiveClientAsync( ) {
+        // Checked before the host is built: a machine without a usable provider credential must report
+        // that, not run a lookup against a placeholder and call the empty result rate limiting.
+        TestHostConfiguration.RequireAnyLiveCredentials(
+            SupportedProviders.Spotify, SupportedProviders.AppleMusic, SupportedProviders.Tidal );
+
+        if (s_liveFactory is null) {
+            Dictionary<string, string?> configData = TestHostConfiguration.LiveProviders( );
+            configData["BridgeBeats:InternalServiceKey"] = TestInternalServiceKey;
+            configData["BridgeBeats:RateLimitRequestsPerHour"] = "1000";
+            s_liveFactory = new CustomWebApplicationFactory( configData );
+            await s_liveFactory.InitializeDatabasesAsync( );
+            string liveApiKey = await RegisterUserAndGetApiKeyAsync( s_liveFactory, CancellationToken.None );
+            s_liveClient = s_liveFactory.CreateClient( );
+            s_liveClient.DefaultRequestHeaders.Add( "X-API-Key", liveApiKey );
+        }
+
+        return s_liveClient!;
     }
 
     /// <summary>
@@ -149,7 +168,9 @@ public class MusicLookupControllerTests {
         MusicLookupController.UrlReq request = new("https://music.apple.com/us/album/bohemian-rhapsody/1440806041");
 
         // Act
-        HttpResponseMessage response = await s_client!.PostAsJsonAsync("/music/lookup/urlList", request, cancellationToken: TestContext.CancellationToken );
+        TestHostConfiguration.RequireLiveCredentials( SupportedProviders.AppleMusic );
+        HttpClient client = await LiveClientAsync( );
+        HttpResponseMessage response = await client.PostAsJsonAsync("/music/lookup/urlList", request, cancellationToken: TestContext.CancellationToken );
 
         // Assert
         Assert.AreEqual( HttpStatusCode.OK, response.StatusCode );
@@ -177,7 +198,9 @@ public class MusicLookupControllerTests {
         MusicLookupController.UrlReq request = new( "https://open.spotify.com/album/6i6folBtxKV28WX3msQ4FE"  );
 
         // Act
-        HttpResponseMessage response = await s_client!.PostAsJsonAsync("/music/lookup/urlList", request, cancellationToken: TestContext.CancellationToken );
+        TestHostConfiguration.RequireLiveCredentials( SupportedProviders.Spotify );
+        HttpClient client = await LiveClientAsync( );
+        HttpResponseMessage response = await client.PostAsJsonAsync("/music/lookup/urlList", request, cancellationToken: TestContext.CancellationToken );
 
         // Assert
         Assert.AreEqual( HttpStatusCode.OK, response.StatusCode );
@@ -205,7 +228,9 @@ public class MusicLookupControllerTests {
         MusicLookupController.UrlReq request = new(  "https://tidal.com/track/96572657"  );
 
         // Act
-        HttpResponseMessage response = await s_client!.PostAsJsonAsync("/music/lookup/urlList", request, cancellationToken: TestContext.CancellationToken );
+        TestHostConfiguration.RequireLiveCredentials( SupportedProviders.Tidal );
+        HttpClient client = await LiveClientAsync( );
+        HttpResponseMessage response = await client.PostAsJsonAsync("/music/lookup/urlList", request, cancellationToken: TestContext.CancellationToken );
 
         // Assert
         Assert.AreEqual( HttpStatusCode.OK, response.StatusCode );
@@ -237,7 +262,10 @@ public class MusicLookupControllerTests {
         );
 
         // Act
-        HttpResponseMessage response = await s_client!.PostAsJsonAsync("/music/lookup/urlList", request, cancellationToken: TestContext.CancellationToken );
+        TestHostConfiguration.RequireLiveCredentials( SupportedProviders.AppleMusic );
+        TestHostConfiguration.RequireLiveCredentials( SupportedProviders.Spotify );
+        HttpClient client = await LiveClientAsync( );
+        HttpResponseMessage response = await client.PostAsJsonAsync("/music/lookup/urlList", request, cancellationToken: TestContext.CancellationToken );
 
         // Assert
         Assert.AreEqual( HttpStatusCode.OK, response.StatusCode );
@@ -268,7 +296,8 @@ public class MusicLookupControllerTests {
         MusicLookupController.IsrcReq request = new( "GBUM71029604" );
 
         // Act
-        HttpResponseMessage response = await s_client!.PostAsJsonAsync("/music/lookup/isrc", request, cancellationToken: TestContext.CancellationToken );
+        HttpClient client = await LiveClientAsync( );
+        HttpResponseMessage response = await client.PostAsJsonAsync("/music/lookup/isrc", request, cancellationToken: TestContext.CancellationToken );
 
         // Assert
         Assert.AreEqual( HttpStatusCode.OK, response.StatusCode );
@@ -298,7 +327,8 @@ public class MusicLookupControllerTests {
         MusicLookupController.UpcReq request = new( "00602547202307" );
 
         // Act
-        HttpResponseMessage response = await s_client!.PostAsJsonAsync("/music/lookup/upc", request, cancellationToken: TestContext.CancellationToken );
+        HttpClient client = await LiveClientAsync( );
+        HttpResponseMessage response = await client.PostAsJsonAsync("/music/lookup/upc", request, cancellationToken: TestContext.CancellationToken );
 
         // Assert
         Assert.AreEqual( HttpStatusCode.OK, response.StatusCode );
@@ -328,7 +358,8 @@ public class MusicLookupControllerTests {
         MusicLookupController.TitleReq request = new( "Bohemian Rhapsody", "Queen" );
 
         // Act
-        HttpResponseMessage response = await s_client!.PostAsJsonAsync("/music/lookup/title", request, cancellationToken: TestContext.CancellationToken );
+        HttpClient client = await LiveClientAsync( );
+        HttpResponseMessage response = await client.PostAsJsonAsync("/music/lookup/title", request, cancellationToken: TestContext.CancellationToken );
 
         // Assert
         Assert.AreEqual( HttpStatusCode.OK, response.StatusCode );
@@ -356,7 +387,9 @@ public class MusicLookupControllerTests {
         MusicLookupController.UrlReq request = new(  "https://open.spotify.com/track/4u7EnebtmKWzUH433cf5Qv"  );
 
         // Act
-        HttpResponseMessage response = await s_client!.PostAsJsonAsync("/music/lookup/url", request, cancellationToken: TestContext.CancellationToken );
+        TestHostConfiguration.RequireLiveCredentials( SupportedProviders.Spotify );
+        HttpClient client = await LiveClientAsync( );
+        HttpResponseMessage response = await client.PostAsJsonAsync("/music/lookup/url", request, cancellationToken: TestContext.CancellationToken );
 
         // Assert
         Assert.AreEqual( HttpStatusCode.OK, response.StatusCode );

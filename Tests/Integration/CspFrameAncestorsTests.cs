@@ -26,23 +26,9 @@ public class CspFrameAncestorsTests {
     /// <param name="_">The MSTest class context (unused).</param>
     [ClassInitialize]
     public static async Task Setup( TestContext _ ) {
-        IConfigurationRoot configuration = new ConfigurationBuilder()
-            .AddJsonFile( Path.Combine( "src", "BridgeBeats.Web", "appsettings.json" ), optional: true )
-            .AddUserSecrets<Web.Program>( optional: true )
-            .AddEnvironmentVariables()
-            .Build();
-
-        Dictionary<string, string?> configData = configuration
-            .AsEnumerable()
-            .Where( kv => kv.Value is not null )
-            .Where( kv => !kv.Key.EndsWith( "ConnectionString", StringComparison.OrdinalIgnoreCase ) )
-            .ToDictionary();
-
-        configData["BridgeBeats:DiscordToken"] = string.Empty;
-        configData["BridgeBeats:Workers:UseWorkerServices"] = "false";
-        configData["BridgeBeats:ATProtoIdentifier"] = string.Empty;
-        configData["BridgeBeats:ATProtoPassword"] = string.Empty;
-        configData["BridgeBeats:ATProtoUserDID"] = string.Empty;
+        // These assertions are about the response headers the CSP middleware writes, which do not
+        // depend on any provider credential.
+        Dictionary<string, string?> configData = TestHostConfiguration.Isolated( );
 
         s_factory = new CustomWebApplicationFactory( configData );
         s_client = s_factory.CreateClient( );

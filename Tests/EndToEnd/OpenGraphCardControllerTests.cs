@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using BridgeBeats.Contracts.Enums;
 using Microsoft.Extensions.Configuration;
 
 namespace BridgeBeats.Tests.EndToEnd;
@@ -19,6 +20,14 @@ public class WebLookupTests {
     private static CustomWebApplicationFactory? s_factory;
     /// <summary>The HTTP client connected to the test host.</summary>
     private static HttpClient? s_client;
+    /// <summary>
+    /// The host built on demand for the tests that perform live provider lookups, and the client
+    /// connected to it. It is separate from the class's deterministic host so that a machine without
+    /// usable provider credentials affects only the tests that need a live provider.
+    /// </summary>
+    private static CustomWebApplicationFactory? s_liveFactory;
+    /// <summary>The HTTP client connected to the live-provider host.</summary>
+    private static HttpClient? s_liveClient;
 
     /// <summary>
     /// Builds the test host with worker services disabled and external integrations blanked, creates a
@@ -27,29 +36,9 @@ public class WebLookupTests {
     /// <param name="_">The MSTest class context (unused).</param>
     [ClassInitialize]
     public static async Task ClassInitialize( TestContext _ ) {
-        // Load configuration from appsettings.json and user secrets
-        IConfigurationRoot configuration = new ConfigurationBuilder()
-            .AddJsonFile( Path.Combine( "src", "BridgeBeats.Web", "appsettings.json" ), optional: true )
-            .AddUserSecrets<Web.Program>( optional: true )
-            .AddEnvironmentVariables()
-            .Build();
-
-        // Build config overrides from loaded configuration
-        Dictionary<string, string?> configData = configuration
-            .AsEnumerable()
-            .Where( kv => kv.Value is not null )
-            .Where( kv => !kv.Key.EndsWith( "ConnectionString", StringComparison.OrdinalIgnoreCase ) )
-            .ToDictionary( );
-
-        // Force Discord token to null to prevent Discord service registration
-        configData["BridgeBeats:DiscordToken"] = string.Empty;
-        // Disable worker services mode - use direct provider implementations
-        configData["BridgeBeats:Workers:UseWorkerServices"] = "false";
-        // Force ATProto credentials to empty to disable caching service
-        // The caching service requires background workers that are not running in the test environment
-        configData["BridgeBeats:ATProtoIdentifier"] = string.Empty;
-        configData["BridgeBeats:ATProtoPassword"] = string.Empty;
-        configData["BridgeBeats:ATProtoUserDID"] = string.Empty;
+        // These tests assert card URL and rendering behavior; the lookup-result assertions are
+        // provider-gated, so no ambient credential is copied into the host.
+        Dictionary<string, string?> configData = TestHostConfiguration.Isolated( );
 
         s_factory = new CustomWebApplicationFactory( configData );
         s_client = s_factory.CreateClient( );
@@ -59,11 +48,36 @@ public class WebLookupTests {
     }
 
     /// <summary>
-    /// Disposes the test host after the class completes.
+    /// Disposes the test hosts after the class completes.
     /// </summary>
     [ClassCleanup]
     public static void ClassCleanup( ) {
+        s_liveClient?.Dispose( );
+        s_liveFactory?.Dispose( );
         s_factory?.Dispose( );
+    }
+
+    /// <summary>
+    /// Returns a client connected to a host built with this machine's real provider credentials,
+    /// creating that host on first use, and marks the calling test inconclusive when no provider
+    /// credential is available to perform a live lookup.
+    /// </summary>
+    /// <returns>A client connected to the live-provider host.</returns>
+    private static async Task<HttpClient> LiveClientAsync( ) {
+        // Checked before the host is built: a machine without a usable provider credential must report
+        // that, not run a lookup against the deterministic host's placeholder and call the empty
+        // result rate limiting.
+        TestHostConfiguration.RequireAnyLiveCredentials(
+            SupportedProviders.Spotify, SupportedProviders.AppleMusic, SupportedProviders.Tidal );
+
+        if (s_liveFactory is null) {
+            Dictionary<string, string?> configData = TestHostConfiguration.LiveProviders( );
+            s_liveFactory = new CustomWebApplicationFactory( configData );
+            s_liveClient = s_liveFactory.CreateClient( );
+            await s_liveFactory.InitializeDatabasesAsync( );
+        }
+
+        return s_liveClient!;
     }
 
     /// <summary>
@@ -79,7 +93,9 @@ public class WebLookupTests {
         object payload = new { uri = "https://open.spotify.com/track/3n3Ppam7vgaVa1iaRUc9Lp" };
 
         // Act
-        HttpResponseMessage response = await s_client!.PostAsJsonAsync(
+        TestHostConfiguration.RequireLiveCredentials( SupportedProviders.Spotify );
+        HttpClient client = await LiveClientAsync( );
+        HttpResponseMessage response = await client.PostAsJsonAsync(
             "/lookup/web",
             payload,
             TestContext.CancellationToken
@@ -119,7 +135,10 @@ public class WebLookupTests {
         object payload = new { uri = "https://open.spotify.com/track/3n3Ppam7vgaVa1iaRUc9Lp https://music.apple.com/us/album/chiron/1695231829" };
 
         // Act
-        HttpResponseMessage response = await s_client!.PostAsJsonAsync(
+        TestHostConfiguration.RequireLiveCredentials( SupportedProviders.Spotify );
+        TestHostConfiguration.RequireLiveCredentials( SupportedProviders.AppleMusic );
+        HttpClient client = await LiveClientAsync( );
+        HttpResponseMessage response = await client.PostAsJsonAsync(
             "/lookup/web",
             payload,
             TestContext.CancellationToken

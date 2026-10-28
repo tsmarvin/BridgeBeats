@@ -46,23 +46,9 @@ public class PlaylistCreateValidationTests : IDisposable {
     /// </summary>
     [TestInitialize]
     public async Task Setup( ) {
-        IConfigurationRoot configuration = new ConfigurationBuilder()
-            .AddJsonFile( Path.Combine( "src", "BridgeBeats.Web", "appsettings.json" ), optional: true )
-            .AddUserSecrets<Web.Program>( optional: true )
-            .AddEnvironmentVariables()
-            .Build();
-
-        Dictionary<string, string?> configData = configuration
-            .AsEnumerable()
-            .Where( kv => kv.Value is not null )
-            .Where( kv => !kv.Key.EndsWith( "ConnectionString", StringComparison.OrdinalIgnoreCase ) )
-            .ToDictionary();
-
-        configData["BridgeBeats:DiscordToken"] = string.Empty;
-        configData["BridgeBeats:Workers:UseWorkerServices"] = "false";
-        configData["BridgeBeats:ATProtoIdentifier"] = string.Empty;
-        configData["BridgeBeats:ATProtoPassword"] = string.Empty;
-        configData["BridgeBeats:ATProtoUserDID"] = string.Empty;
+        // Playlist creation is exercised through a stub playlist service, so the host needs a domain
+        // but no provider credentials.
+        Dictionary<string, string?> configData = TestHostConfiguration.Isolated( );
         configData["BridgeBeats:Domain"] = "bridgebeats.link";
 
         _factory = new PlaylistCreateTestWebApplicationFactory( configData );

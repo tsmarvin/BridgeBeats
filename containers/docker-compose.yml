@@ -30,6 +30,7 @@ services:
       - MAX_RECORDS_PER_RUN=${MAX_RECORDS_PER_RUN:-100}
       - IDENTITY_CONNECTION_STRING=${IDENTITY_CONNECTION_STRING:-Data Source=/app/data/bridgebeats.db}
       - RATE_LIMIT_REQUESTS_PER_HOUR=${RATE_LIMIT_REQUESTS_PER_HOUR:-20}
+      - OAUTH_TRUSTED_PROXY_HOST=${OAUTH_TRUSTED_PROXY_HOST-bridgebeats-caddy}
     volumes:
       - ./data/app:/app/data # Persistent data directory (sqlite + Aspire store)
       - ./logs:/app/data/logs # Logs bind-mounted to host for easy access

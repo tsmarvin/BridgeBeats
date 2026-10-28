@@ -532,6 +532,23 @@
           "idunno.AtProto": "8.0.0"
         }
       },
+      "idunno.Bluesky.AspNet.Authentication": {
+        "type": "Transitive",
+        "resolved": "8.0.0",
+        "contentHash": "u21lYA0GjyayfaSfikHZ1qQ4v7/i4kJB0t7vQihWa1YMI/u8Y4VkLOi6GDdhGmM1QkkO2FdhWBCCJrPsMGlcLA==",
+        "dependencies": {
+          "idunno.Bluesky": "8.0.0"
+        }
+      },
+      "idunno.Bluesky.AspNet.Authentication.SQLite": {
+        "type": "Transitive",
+        "resolved": "8.0.0",
+        "contentHash": "YMsluTgQi4+OBXt4LzUcTal8M3/s61pcm/v0SMe9Qago0RU1z8Smo65W7XVUm9MMEX0B1+l66otEqu45c2Pw+w==",
+        "dependencies": {
+          "Microsoft.Data.Sqlite": "10.0.13",
+          "idunno.Bluesky.AspNet.Authentication": "8.0.0"
+        }
+      },
       "idunno.Security.Ssrf": {
         "type": "Transitive",
         "resolved": "5.4.0",
@@ -610,6 +627,16 @@
         "type": "Transitive",
         "resolved": "18.11.0",
         "contentHash": "MhN9wpvL1Es4hfIYslrsVgIsUdDFxuOBTbAl9mGIMvFo8PP5CLf4DrGdNrfwWSyn0lqi6sssm+I/qkkLL3MU+g=="
+      },
+      "Microsoft.Data.Sqlite": {
+        "type": "Transitive",
+        "resolved": "10.0.13",
+        "contentHash": "w37nz3WFmDtRfXxWEwIXX2OgqDRiwhD1JGbFwfpFCF8GkCrV/yO6Y2JF5058J2RGoI2sCcdn02wrk0yEcekWcw==",
+        "dependencies": {
+          "Microsoft.Data.Sqlite.Core": "10.0.13",
+          "SQLitePCLRaw.bundle_e_sqlite3": "2.1.13",
+          "SQLitePCLRaw.core": "2.1.13"
+        }
       },
       "Microsoft.Data.Sqlite.Core": {
         "type": "Transitive",
@@ -1722,8 +1749,8 @@
       "bridgebeats.contracts": {
         "type": "Project",
         "dependencies": {
-          "idunno.AtProto": "[8.0.0, )",
-          "idunno.Bluesky": "[8.0.0, )"
+          "idunno.AtProto": "[8.0.0, 8.0.0]",
+          "idunno.Bluesky": "[8.0.0, 8.0.0]"
         }
       },
       "bridgebeats.core": {
@@ -1753,7 +1780,9 @@
         "dependencies": {
           "BridgeBeats.Core": "[1.0.0, )",
           "Microsoft.OpenApi": "[3.11.0, )",
-          "Swashbuckle.AspNetCore": "[10.3.1, )"
+          "Swashbuckle.AspNetCore": "[10.3.1, )",
+          "idunno.Bluesky.AspNet.Authentication": "[8.0.0, 8.0.0]",
+          "idunno.Bluesky.AspNet.Authentication.SQLite": "[8.0.0, 8.0.0]"
         }
       },
       "bridgebeats.worker.discord": {
@@ -1768,8 +1797,8 @@
         "type": "Project",
         "dependencies": {
           "BridgeBeats.Core": "[1.0.0, )",
-          "idunno.AtProto": "[8.0.0, )",
-          "idunno.Bluesky": "[8.0.0, )"
+          "idunno.AtProto": "[8.0.0, 8.0.0]",
+          "idunno.Bluesky": "[8.0.0, 8.0.0]"
         }
       },
       "bridgebeats.worker.maintenance": {

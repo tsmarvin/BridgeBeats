@@ -1,6 +1,9 @@
 @{
     // Get CSP nonce from HttpContext
     var cspNonce = Context.Items["CSPNonce"] as string ?? string.Empty;
+    var logoLightUrl = FileVersionProvider.AddFileVersionToPath(Context.Request.PathBase, Url.Content("~/public/Icons/BridgeBeats_BlackBridgeText.svg"));
+    var logoDarkUrl = FileVersionProvider.AddFileVersionToPath(Context.Request.PathBase, Url.Content("~/public/Icons/BridgeBeats_WhiteBridgeText.svg"));
+    var logoAuthUrl = FileVersionProvider.AddFileVersionToPath(Context.Request.PathBase, Url.Content("~/public/Icons/BridgeBeats_FullColor.svg"));
 }
 <header class="bg-body border-bottom">
     <nav id="autocollapse" class="navbar navbar-expand-md" role="navigation">
@@ -11,10 +14,10 @@
                 <a href="/playlists" class="nav-link nav-link-hidden" id="playlistsLink">Playlists</a>
             </div>
             <a class="navbar-brand p-0 position-absolute start-50 translate-middle-x d-inline-flex align-items-center"
-                href="/" id="brandLink" data-logo-light="/public/Icons/BridgeBeats_BlackBridgeText.svg"
-                data-logo-dark="/public/Icons/BridgeBeats_WhiteBridgeText.svg"
-                data-logo-auth="/public/Icons/BridgeBeats_FullColor.svg">
-                <img id="brandLogo" alt="BridgeBeats" src="/public/Icons/BridgeBeats_BlackBridgeText.svg" />
+                href="/" id="brandLink" data-logo-light="@logoLightUrl"
+                data-logo-dark="@logoDarkUrl"
+                data-logo-auth="@logoAuthUrl">
+                <img id="brandLogo" alt="BridgeBeats" src="@logoLightUrl" />
             </a>
             <div class="d-flex align-items-center gap-2 ms-auto">
                 <button id="themeToggle" class="btn btn-sm btn-outline-secondary" type="button" title="Change theme">

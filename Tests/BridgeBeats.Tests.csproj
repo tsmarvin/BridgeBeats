@@ -36,6 +36,18 @@
     <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
   </ItemGroup>
 
+  <PropertyGroup>
+    <!-- NuGetPackageRoot comes from the generated restore props and does not consistently carry
+         a trailing separator, so concatenating it with the package path silently yields a
+         malformed path on some SDK/NuGet versions and the schema never reaches the output. -->
+    <BlueskySdkPackageRoot>$([MSBuild]::EnsureTrailingSlash('$(NuGetPackageRoot)'))</BlueskySdkPackageRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="$(BlueskySdkPackageRoot)idunno.bluesky.aspnet.authentication.sqlite/8.0.0/contentFiles/any/any/schema.sql"
+          Link="bluesky-sdk-schema.sql" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\src\BridgeBeats.AppHost\BridgeBeats.AppHost.csproj">
       <!--

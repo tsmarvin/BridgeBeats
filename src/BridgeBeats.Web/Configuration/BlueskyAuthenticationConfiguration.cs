@@ -8,6 +8,7 @@ using idunno.Bluesky.AspNet.Authentication;
 using idunno.Bluesky.AspNet.Authentication.SQLite;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -97,10 +98,16 @@ internal static class BlueskyAuthenticationConfiguration {
                     } ) );
         } );
         _ = services.AddOptions<BlueskyAuthenticationOptions>( BlueskyAuthenticationDefaults.AuthenticationScheme )
-            .Configure<ILoggerFactory, IHttpContextAccessor>( ( options, loggerFactory, httpContextAccessor ) => {
-                options.IdentityStore = new BridgeBeatsIdentityStore( settings.IdentityConnectionString, httpContextAccessor, loggerFactory );
-                options.CorrelationStateCache = new SqliteCorrelationStateCache( settings.IdentityConnectionString, loggerFactory: loggerFactory );
-            } );
+            .Configure<ILoggerFactory, IHttpContextAccessor, IDataProtectionProvider>(
+                ( options, loggerFactory, httpContextAccessor, dataProtection ) => {
+                    BridgeBeatsIdentityStore store = new( settings.IdentityConnectionString, httpContextAccessor, loggerFactory, dataProtection );
+                    options.IdentityStore = store;
+                    // The SDK's PostConfigure applies IdentityStoreEvents to IdentityStore.Events. Assign the
+                    // store's own protecting events so reads via the SDK's GetIdentityCore and writes via its
+                    // StoreIdentity use the same typed-unprotect behaviour as our direct retrieval.
+                    options.IdentityStoreEvents = store.ProtectingEvents;
+                    options.CorrelationStateCache = new SqliteCorrelationStateCache( settings.IdentityConnectionString, loggerFactory: loggerFactory );
+                } );
         // SDK v8 registers its concrete handler through AddBluesky. Our handler must run before
         // SDK cookie reads so a stale reference cannot revoke a newer DID session.
         _ = services.PostConfigure<AuthenticationOptions>( options =>

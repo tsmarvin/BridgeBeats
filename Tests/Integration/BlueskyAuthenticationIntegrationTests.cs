@@ -2688,6 +2688,62 @@ public class BlueskyAuthenticationIntegrationTests {
         _client.DefaultRequestHeaders.Add( "X-XSRF-TOKEN", data.GetProperty( "token" ).GetString( ) );
     }
 
+    /// <summary>
+    /// Adds the antiforgery header set while the request is authenticated by the internal-service scheme. The
+    /// <c>X-Service-Key</c> header is left in place so the following POST is authenticated by the same scheme
+    /// the antiforgery token was issued under (antiforgery binds the token to the principal name).
+    /// </summary>
+    private async Task AddAntiforgeryHeaderWithServiceKeyAsync( ) {
+        _ = _client.DefaultRequestHeaders.Remove( "X-Service-Key" );
+        _client.DefaultRequestHeaders.Add( "X-Service-Key", "test-service-key" );
+        await AddAntiforgeryHeaderAsync( );
+    }
+
+    /// <summary>
+    /// Signs in a second real browser and returns its cookie. The shared credential row is reused; each
+    /// browser gets its own session row, so both cookies are independently usable.
+    /// </summary>
+    private async Task<string> SignInSecondBrowserAsync( ) {
+        string existing = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        try {
+            return CookieValue( await SignInAsync( ) );
+        } finally {
+            _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+            _client.DefaultRequestHeaders.Add( "Cookie", existing );
+        }
+    }
+
+    /// <summary>Extracts the bare Bluesky reference-cookie value from a sign-in response.</summary>
+    private static string CookieValue( HttpResponseMessage response ) =>
+        response.Headers.GetValues( "Set-Cookie" )
+            .Last( c => c.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=", StringComparison.Ordinal ) )
+            .Split( ';' )[0].Split( '=', 2 )[1];
+
+    /// <summary>The browser session id a reference cookie names. Accepts the bare value or the full Name=value pair.</summary>
+    private string SessionIdOf( string cookieOrValue ) {
+        string value = cookieOrValue.Contains( '=' ) ? cookieOrValue.Split( '=', 2 )[1] : cookieOrValue;
+        return Options( ).TicketDataFormat.Unprotect( value )!
+            .Properties.GetString( BlueskyAccountEvents.BrowserSessionProperty )!;
+    }
+
+    /// <summary>The exact encrypted blob in the credential row the DID currently holds.</summary>
+    private async Task<byte[]> StoredBlobAsync( ) {
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        await using SqliteConnection connection = new( connectionString );
+        await connection.OpenAsync( TestContext.CancellationToken );
+        await using SqliteCommand read = connection.CreateCommand( );
+        read.CommandText = "SELECT \"Identity\" FROM \"idunno_bluesky_identities\" WHERE \"Did\" = @did;";
+        _ = read.Parameters.AddWithValue( "@did", DidValue );
+        return (byte[])(await read.ExecuteScalarAsync( TestContext.CancellationToken ))!;
+    }
+
+    private async Task AssertBlobEqualsAsync( byte[] expected ) {
+        byte[] actual = await StoredBlobAsync( );
+        Assert.AreEqual( Convert.ToHexString( expected ), Convert.ToHexString( actual ),
+            "The stored credential blob must be exactly the replacement's protected bytes." );
+    }
+
     private async Task RestartApplicationAsync( ) {
         _client.Dispose( );
         await _app.DisposeAsync( );
@@ -2854,6 +2910,26 @@ public class BlueskyAuthenticationIntegrationTests {
         return await read.ExecuteScalarAsync( TestContext.CancellationToken ) as string;
     }
 
+    /// <summary>Reads every browser session id the DID currently has stored.</summary>
+    private async Task<IReadOnlyList<string>> StoredBrowserSessionIdsAsync( ) {
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        await using SqliteConnection connection = new( connectionString );
+        await connection.OpenAsync( TestContext.CancellationToken );
+        await using SqliteCommand read = connection.CreateCommand( );
+        read.CommandText = """
+                           SELECT "SessionId" FROM "bridgebeats_bluesky_sessions"
+                           WHERE "Did" = @did AND "ExpiresAtUtcTicks" > @now;
+                           """;
+        _ = read.Parameters.AddWithValue( "@did", DidValue );
+        _ = read.Parameters.AddWithValue( "@now", DateTime.UtcNow.Ticks );
+        List<string> ids = new( );
+        await using SqliteDataReader reader = await read.ExecuteReaderAsync( TestContext.CancellationToken );
+        while (await reader.ReadAsync( TestContext.CancellationToken )) {
+            ids.Add( reader.GetString( 0 ) );
+        }
+        return ids;
+    }
+
     /// <summary>
     /// Asserts each of the three seeded OAuth tables still holds its row for the linked DID. The rows are
     /// counted individually so a partial removal — a credential row gone while a session row remains, or the
@@ -2967,6 +3043,1004 @@ public class BlueskyAuthenticationIntegrationTests {
             issuer: _service, audience: $"did:web:{new Uri( _service ).Host}", claims: [new Claim( "sub", did ), new Claim( "scope", "atproto repo:link.bridgebeats.playlist" )],
             notBefore: expires.AddHours( -1 ), expires: expires ) );
         return new DPoPAccessCredentials( new Uri( _service ), jwt, refresh, proofKey ?? _proofKey, nonce );
+    }
+
+    [TestMethod]
+    public async Task MixedSchemeLogout_WithServiceKeyAuthenticatedRequest_RemovesBrowserAndKeepsSharedGrant( ) {
+        _ = await SignInAsync( );
+        string browserOneCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        string browserOneSession = SessionIdOf( browserOneCookie );
+        string browserTwoCookie = await SignInSecondBrowserAsync( );
+        string browserTwoSession = SessionIdOf( browserTwoCookie );
+        Assert.AreNotEqual( browserOneSession, browserTwoSession, "Each browser must hold a distinct session." );
+        // Expire the shared access token and take provider discovery down. The logout's explicit Bluesky
+        // AuthenticateAsync then fails at refresh (thrown discovery error), which is exactly the case where
+        // the verified ticket (set before the refresh attempt) must still authorize browser removal. The SDK
+        // does not Remove the identity on a thrown refresh failure, so the second browser and shared grant
+        // survive; reverting the ticket gate to `result.Succeeded` must fail this test.
+        await ExpireStoredAccessTokenAsync( );
+        _oauth.ProtectedResourceDiscoveryFails = true;
+        int revocationsBefore = _oauth.Revocations;
+
+        // Both antiforgery acquisition and the logout POST are authenticated by the internal-service scheme,
+        // not the Bluesky cookie scheme. The logged-out cookie still authorizes browser removal.
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", browserOneCookie );
+        await AddAntiforgeryHeaderWithServiceKeyAsync( );
+        using HttpResponseMessage logout = await _client.PostAsync( "/account/logout", null, TestContext.CancellationToken );
+        _ = _client.DefaultRequestHeaders.Remove( "X-Service-Key" );
+
+        Assert.AreEqual( HttpStatusCode.OK, logout.StatusCode, await logout.Content.ReadAsStringAsync( TestContext.CancellationToken ) );
+        Assert.AreEqual( revocationsBefore, _oauth.Revocations,
+            "The shared credential must not be revoked while another browser still uses it." );
+        // The logout response must delete the reference cookie and must not renew it (no non-empty value).
+        string[] logoutCookies = [.. logout.Headers.GetValues( "Set-Cookie" )
+            .Where( value => value.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=", StringComparison.Ordinal ) )];
+        Assert.HasCount( 1, logoutCookies, "Logout must emit exactly one Bluesky Set-Cookie (the deletion)." );
+        Assert.IsTrue( logoutCookies.Single( ).StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=;", StringComparison.Ordinal ),
+            "Logout must not renew the reference cookie." );
+
+        // The requesting browser row is gone; the other browser row and the credential remain.
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" ),
+            "Only the requesting browser row is removed; the other browser row remains." );
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ) );
+        Assert.AreEqual( browserTwoSession, await StoredBrowserSessionIdAsync( ),
+            "The surviving browser row must be browser two." );
+
+        // Recovery before replay: with discovery working again, the old cookie is rejected and cannot remove
+        // the remaining session; the other cookie still authenticates the agent and the local user.
+        _oauth.ProtectedResourceDiscoveryFails = false;
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", browserOneCookie );
+        JsonElement replay = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsFalse( replay.GetProperty( "authenticated" ).GetBoolean( ) );
+
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", BlueskyAuthenticationConfiguration.CookieName + "=" + browserTwoCookie );
+        JsonElement other = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( other.GetProperty( "authenticated" ).GetBoolean( ),
+            "The other browser must still authenticate after the first browser logs out." );
+        Assert.IsTrue( other.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            "The shared credential must remain usable for the surviving browser." );
+    }
+
+    [TestMethod]
+    public async Task MixedSchemeLogout_SingleBrowser_RemovesFinalLocalIdentity( ) {
+        // With only one browser, the mixed-scheme logout is the final local removal: the credential row and
+        // the browser row are deleted. Remote revocation is best effort and, with provider discovery down,
+        // cannot complete here, so only the local removal is asserted.
+        _ = await SignInAsync( );
+        string cookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        await ExpireStoredAccessTokenAsync( );
+        _oauth.ProtectedResourceDiscoveryFails = true;
+
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", cookie );
+        await AddAntiforgeryHeaderWithServiceKeyAsync( );
+        using HttpResponseMessage logout = await _client.PostAsync( "/account/logout", null, TestContext.CancellationToken );
+        _ = _client.DefaultRequestHeaders.Remove( "X-Service-Key" );
+
+        Assert.AreEqual( HttpStatusCode.OK, logout.StatusCode, await logout.Content.ReadAsStringAsync( TestContext.CancellationToken ) );
+        // Discovery is failing, so the best-effort remote revoke cannot complete. The final identity removal
+        // (credential + browser rows) is what the mixed-scheme single-browser case must prove.
+        Assert.AreEqual( 0, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            "The final browser removal must delete the credential row." );
+        Assert.AreEqual( 0, await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" ),
+            "The final browser removal must delete the browser row." );
+        _oauth.ProtectedResourceDiscoveryFails = false;
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", cookie );
+        JsonElement replay = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsFalse( replay.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.IsFalse( replay.GetProperty( "agentAuthenticated" ).GetBoolean( ) );
+    }
+
+    [TestMethod]
+    [DataRow( "unprotectable" )]
+    [DataRow( "expired" )]
+    [DataRow( "stale-stamp" )]
+    [DataRow( "stale-session" )]
+    public async Task MixedSchemeLogout_OldReferenceCookie_CannotRemoveNewerSession( string variant ) {
+        // Negative matrix: an unprotectable, expired, or stale (stamp/session) reference cookie must not
+        // remove the NEWER current session. Each variant first establishes the old-reference state, then a
+        // real, distinct current sign-in, then attempts a mixed-scheme logout carrying only the old
+        // reference. The newer session row, its identity, and its authentication must all survive, and no
+        // grant may be revoked beyond what the newer sign-in itself already revoked.
+        string cookieName = BlueskyAuthenticationConfiguration.CookieName;
+        string? oldReferenceCookie = null;
+
+        switch (variant) {
+            case "unprotectable":
+                // No prior state needed; the old reference is a garbage cookie.
+                oldReferenceCookie = cookieName + "=not-a-valid-ticket";
+                break;
+            case "expired": {
+                    // A real prior session whose ticket is aged past expiry.
+                    _ = await SignInAsync( );
+                    string priorCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+                    string priorValue = priorCookie.Split( '=', 2 )[1];
+                    AuthenticationTicket ticket = Options( ).TicketDataFormat.Unprotect( priorValue )!;
+                    AuthenticationProperties aged = new( ticket.Properties.Items ) {
+                        IssuedUtc = DateTimeOffset.UtcNow.AddDays( -10 ),
+                        ExpiresUtc = DateTimeOffset.UtcNow.AddDays( -3 )
+                    };
+                    oldReferenceCookie = cookieName + "=" + Options( ).TicketDataFormat.Protect(
+                        new AuthenticationTicket( ticket.Principal, aged, ticket.AuthenticationScheme ) );
+                    break;
+                }
+            case "stale-stamp": {
+                    // A real prior session whose ticket predates a security-stamp rotation.
+                    _ = await SignInAsync( );
+                    string priorCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+                    oldReferenceCookie = priorCookie;
+                    await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
+                        ApplicationUser user = await scope.ServiceProvider.GetRequiredService<ApplicationDbContext>( ).Users.SingleAsync( TestContext.CancellationToken );
+                        user.SecurityStamp = Guid.NewGuid( ).ToString( "N" );
+                        _ = await scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>( ).UpdateAsync( user );
+                    }
+                    break;
+                }
+            case "stale-session": {
+                    // A real prior cookie whose browser session row has been removed.
+                    _ = await SignInAsync( );
+                    string priorCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+                    string priorSession = SessionIdOf( priorCookie );
+                    oldReferenceCookie = priorCookie;
+                    await using (SqliteConnection connection = new( $"Data Source={Path.Combine( _directory, "identity.db" )}" )) {
+                        await connection.OpenAsync( TestContext.CancellationToken );
+                        await using SqliteCommand remove = connection.CreateCommand( );
+                        remove.CommandText = "DELETE FROM \"bridgebeats_bluesky_sessions\" WHERE \"SessionId\" = @session AND \"Did\" = @did;";
+                        _ = remove.Parameters.AddWithValue( "@session", priorSession );
+                        _ = remove.Parameters.AddWithValue( "@did", DidValue );
+                        _ = await remove.ExecuteNonQueryAsync( TestContext.CancellationToken );
+                    }
+                    break;
+                }
+        }
+
+        // Establish the NEWER current session: a real sign-in distinct from the old-reference state.
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        using HttpResponseMessage newerSignIn = await SignInAsync( );
+        string newerCookie = CookieValue( newerSignIn );
+        string newerSession = SessionIdOf( newerCookie );
+        int revocationsAfterNewerSignIn = _oauth.Revocations;
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            "The newer sign-in must own the identity row." );
+
+        // Mixed-scheme logout carrying ONLY the old reference cookie (X-Service-Key on GET and POST).
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", oldReferenceCookie! );
+        await AddAntiforgeryHeaderWithServiceKeyAsync( );
+        using HttpResponseMessage logout = await _client.PostAsync( "/account/logout", null, TestContext.CancellationToken );
+        _ = _client.DefaultRequestHeaders.Remove( "X-Service-Key" );
+
+        Assert.AreEqual( HttpStatusCode.OK, logout.StatusCode, await logout.Content.ReadAsStringAsync( TestContext.CancellationToken ) );
+        Assert.AreEqual( revocationsAfterNewerSignIn, _oauth.Revocations,
+            $"A {variant} reference cookie must not revoke the newer session's grant." );
+        IReadOnlyList<string> survivingSessions = await StoredBrowserSessionIdsAsync( );
+        Assert.Contains( newerSession, survivingSessions,
+            $"The exact newer browser row ({newerSession}) must survive a {variant} reference logout; found [{string.Join( ", ", survivingSessions )}]." );
+        Assert.IsNotEmpty( await StoredBlobAsync( ),
+            $"The newer session's credential bytes must survive a {variant} reference logout." );
+        Assert.IsNotNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ),
+            $"The newer session's identity must remain usable after a {variant} reference logout." );
+
+        // The newer cookie still authenticates (agent + local) once the service header is gone.
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", cookieName + "=" + newerCookie );
+        JsonElement who = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( who.GetProperty( "authenticated" ).GetBoolean( ),
+            $"The newer cookie must still authenticate after a {variant} reference logout." );
+        Assert.IsTrue( who.GetProperty( "agentAuthenticated" ).GetBoolean( ),
+            $"The newer cookie's agent must still authenticate after a {variant} reference logout." );
+    }
+
+    [TestMethod]
+    public async Task MissingCredential_WithOrphanBrowserRows_ReconcilesAndDeletesCookieInSameResponse( ) {
+        // A credential row that never existed leaves orphan browser rows behind. A request carrying the
+        // cookie loses authentication and the orphan rows are reconciled on that same request.
+        string sessionId = Guid.NewGuid( ).ToString( "N" );
+        (string userId, string securityStamp) = await SeedLinkedAccountAndBrowserAsync( sessionId, "orphan-two" );
+        string? concurrencyStamp = await CurrentStampAsync( "ConcurrencyStamp" );
+        string? securityStampBefore = await CurrentStampAsync( "SecurityStamp" );
+        AuthenticationTicket ticket = BuildTicketForDid( DidValue, sessionId, userId, securityStamp );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket ) );
+
+        using HttpResponseMessage who = await _client.GetAsync( "/test/who", TestContext.CancellationToken );
+        JsonElement body = await who.Content.ReadFromJsonAsync<JsonElement>( TestContext.CancellationToken );
+        Assert.IsFalse( body.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.IsTrue( who.Headers.TryGetValues( "Set-Cookie", out IEnumerable<string>? cookies ) &&
+                       cookies.Any( value => value.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=;", StringComparison.Ordinal ) ),
+            "The missing credential must delete the referring cookie in the same response." );
+
+        Assert.AreEqual( 0, await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" ),
+            "The orphan browser rows must be reconciled." );
+        Assert.AreEqual( 0, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            "No credential row may be created." );
+        Assert.AreEqual( 0, await LinkedBlueskyRowCountAsync( "idunno_bluesky_refresh_locks" ),
+            "Refresh-lock ownership must be untouched." );
+        Assert.AreNotEqual( concurrencyStamp, await CurrentStampAsync( "ConcurrencyStamp" ),
+            "Removing orphan rows must rotate the local account concurrency stamp." );
+        Assert.AreEqual( securityStampBefore, await CurrentStampAsync( "SecurityStamp" ),
+            "The security stamp must not change for a missing-credential cleanup." );
+    }
+
+    [TestMethod]
+    public async Task MissingCredentialReadBeforeReplacement_CasMissPreservesReplacementAndNoCookie( ) {
+        // A request observes no credential row, then a fresh grant commits before the missing reconciliation
+        // writes. The reconciliation's write-time guard sees an active row, leaves it and its browser alone,
+        // rotates no stamp, and publishes no cookie outcome.
+        string sessionId = Guid.NewGuid( ).ToString( "N" );
+        (string userId, string securityStamp) = await SeedLinkedAccountAndBrowserAsync( sessionId );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        Func<Task>? previousSeam = BridgeBeatsIdentityStore.BeforeMissingCleanupDelete;
+        string? concurrencyStamp = await CurrentStampAsync( "ConcurrencyStamp" );
+        byte[]? replacementBlob = null;
+        string replacementSession = "unset";
+        try {
+            TaskCompletionSource gate = new( TaskCreationOptions.RunContinuationsAsynchronously );
+            TaskCompletionSource replacementCommitted = new( TaskCreationOptions.RunContinuationsAsynchronously );
+            BridgeBeatsIdentityStore.BeforeMissingCleanupDelete = async ( ) => {
+                // Runs before the missing-reconciliation writer opens, so the replacement commits first.
+                await AddReplacementCredentialsAsync( store, DateTime.UtcNow.AddHours( 2 ), "race-replacement" );
+                replacementBlob = await StoredBlobAsync( );
+                // The replacement registers its own browser session; capture the one that is not the ticket's.
+                replacementSession = (await StoredBrowserSessionIdsAsync( )).Single( id => id != sessionId );
+                _ = replacementCommitted.TrySetResult( );
+                await gate.Task.WaitAsync( TimeSpan.FromSeconds( 10 ), TestContext.CancellationToken );
+            };
+            AuthenticationTicket ticket = BuildTicketForDid( DidValue, sessionId, userId, securityStamp );
+            _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+            _client.DefaultRequestHeaders.Add( "Cookie", BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket ) );
+
+            Task<HttpResponseMessage> request = _client.GetAsync( "/test/who", TestContext.CancellationToken );
+            await replacementCommitted.Task.WaitAsync( TimeSpan.FromSeconds( 10 ), TestContext.CancellationToken );
+            Assert.IsNotNull( replacementBlob );
+            gate.SetResult( );
+            using HttpResponseMessage who = await request;
+            Assert.IsFalse( (await who.Content.ReadFromJsonAsync<JsonElement>( TestContext.CancellationToken ))
+                .GetProperty( "authenticated" ).GetBoolean( ) );
+            Assert.IsTrue( who.Headers.TryGetValues( "Set-Cookie", out _ ) == false ||
+                           who.Headers.GetValues( "Set-Cookie" ).All( value =>
+                               !value.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=;", StringComparison.Ordinal ) ),
+                "A missing-read race that found a committed replacement must not delete the cookie." );
+        } finally {
+            BridgeBeatsIdentityStore.BeforeMissingCleanupDelete = previousSeam;
+        }
+
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            "The replacement row must survive the missing reconciliation." );
+        Assert.AreEqual( 2, await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" ),
+            "The ticket's seeded browser row and the replacement's browser row must both survive." );
+        IReadOnlyList<string> surviving = await StoredBrowserSessionIdsAsync( );
+        Assert.IsTrue( surviving.Contains( sessionId ) && surviving.Contains( replacementSession ),
+            "The surviving browser rows must be the ticket's session and the replacement's distinct session." );
+        await AssertBlobEqualsAsync( replacementBlob! );
+        Assert.AreEqual( concurrencyStamp, await CurrentStampAsync( "ConcurrencyStamp" ),
+            "No rows changed, so the concurrency stamp must not rotate." );
+    }
+
+    [TestMethod]
+    public async Task OverlappingMissingCleanup_StillPublishesCookieOutcomeWhenNoActiveRowRemains( ) {
+        // A prior overlapping request already removed the orphan rows: this request's rowsChanged is zero, but
+        // because no active credential remains the browser-bound cookie outcome must still be published so the
+        // stale reference cookie is deleted. The stamp is not rotated (this request changed no rows).
+        // The session row exists during Initialize (so account binding passes there); the overlapping removal
+        // lands after Initialize via the missing-cleanup seam, so the cookie deletion can only come from the
+        // cleanup outcome and would be lost if the outcome were gated on rowsChanged.
+        string sessionId = Guid.NewGuid( ).ToString( "N" );
+        (string userId, string securityStamp) = await SeedLinkedAccountAndBrowserAsync( sessionId );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        Func<Task>? previousSeam = BridgeBeatsIdentityStore.BeforeMissingCleanupDelete;
+        string? concurrencyStamp = await CurrentStampAsync( "ConcurrencyStamp" );
+        try {
+            BridgeBeatsIdentityStore.BeforeMissingCleanupDelete = async ( ) => {
+                // Simulate an overlapping cleanup that removed the browser rows this request did not change.
+                await using SqliteConnection connection = new( $"Data Source={Path.Combine( _directory, "identity.db" )}" );
+                await connection.OpenAsync( TestContext.CancellationToken );
+                await using SqliteCommand remove = connection.CreateCommand( );
+                remove.CommandText = "DELETE FROM \"bridgebeats_bluesky_sessions\" WHERE \"Did\" = @did;";
+                _ = remove.Parameters.AddWithValue( "@did", DidValue );
+                _ = await remove.ExecuteNonQueryAsync( TestContext.CancellationToken );
+            };
+            AuthenticationTicket ticket = BuildTicketForDid( DidValue, sessionId, userId, securityStamp );
+            _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+            _client.DefaultRequestHeaders.Add( "Cookie", BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket ) );
+
+            using HttpResponseMessage who = await _client.GetAsync( "/test/who", TestContext.CancellationToken );
+            Assert.IsFalse( (await who.Content.ReadFromJsonAsync<JsonElement>( TestContext.CancellationToken ))
+                .GetProperty( "authenticated" ).GetBoolean( ) );
+            Assert.IsTrue( who.Headers.TryGetValues( "Set-Cookie", out IEnumerable<string>? cookies ) &&
+                           cookies.Any( value => value.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=;", StringComparison.Ordinal ) ),
+                "Even with no rows changed by this request, the stale cookie must be deleted when no active row remains." );
+        } finally {
+            BridgeBeatsIdentityStore.BeforeMissingCleanupDelete = previousSeam;
+        }
+        Assert.AreEqual( concurrencyStamp, await CurrentStampAsync( "ConcurrencyStamp" ),
+            "No rows changed by this request, so the concurrency stamp must not rotate." );
+        Assert.AreEqual( 0, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ) );
+    }
+
+    [TestMethod]
+    public async Task CorruptCiphertext_CleanupRemovesExactRowAndBrowser_AndRotatesConcurrencyStampOnly( ) {
+        string sessionId = Guid.NewGuid( ).ToString( "N" );
+        (string userId, string securityStamp) = await SeedLinkedAccountAndBrowserAsync( sessionId );
+        string? concurrencyStamp = await CurrentStampAsync( "ConcurrencyStamp" );
+        string? securityStampBefore = await CurrentStampAsync( "SecurityStamp" );
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        byte[] corrupt = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        await using (SqliteConnection connection = new( connectionString )) {
+            await connection.OpenAsync( TestContext.CancellationToken );
+            await using SqliteCommand seed = connection.CreateCommand( );
+            seed.CommandText = """
+                               INSERT INTO "idunno_bluesky_identities" ("Did", "Identity", "ExpiresAtUtcTicks", "ProofKeyHash")
+                               VALUES (@did, @identity, @expires, 'old-proof');
+                               """;
+            _ = seed.Parameters.AddWithValue( "@did", DidValue );
+            _ = seed.Parameters.AddWithValue( "@identity", corrupt );
+            _ = seed.Parameters.AddWithValue( "@expires", DateTime.UtcNow.AddDays( 7 ).Ticks );
+            _ = await seed.ExecuteNonQueryAsync( TestContext.CancellationToken );
+        }
+
+        AuthenticationTicket ticket = BuildTicketForDid( DidValue, sessionId, userId, securityStamp );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket ) );
+
+        using HttpResponseMessage who = await _client.GetAsync( "/test/who", TestContext.CancellationToken );
+        JsonElement body = await who.Content.ReadFromJsonAsync<JsonElement>( TestContext.CancellationToken );
+        Assert.IsFalse( body.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.AreEqual( 0, _oauth.Revocations, "A corrupt blob must never trigger remote revocation." );
+        Assert.AreEqual( 0, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            "The exact corrupt row must be removed." );
+        Assert.AreEqual( 0, await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" ),
+            "Its browser rows must be removed." );
+        Assert.AreNotEqual( concurrencyStamp, await CurrentStampAsync( "ConcurrencyStamp" ) );
+        Assert.AreEqual( securityStampBefore, await CurrentStampAsync( "SecurityStamp" ),
+            "Corrupt-row cleanup must not rotate the security stamp." );
+        Assert.IsTrue( who.Headers.TryGetValues( "Set-Cookie", out IEnumerable<string>? cookies ) &&
+                       cookies.Any( value => value.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=;", StringComparison.Ordinal ) ),
+            "The corrupt row must delete the referring cookie in the same response." );
+    }
+
+    [TestMethod]
+    public async Task ProtectedMalformedPayload_CleanupRemovesRowWithoutRevocation( ) {
+        // A blob that unprotects but does not deserialize to a usable identity shape is treated as corrupt.
+        string sessionId = Guid.NewGuid( ).ToString( "N" );
+        (string userId, string securityStamp) = await SeedLinkedAccountAndBrowserAsync( sessionId );
+        byte[] malformed = [0x01, 0x02, 0x03, 0x04];
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        byte[] protectedMalformed = Options( ).DataProtectionProvider!
+            .CreateProtector( idunno.Bluesky.AspNet.Authentication.Events.DataProtectingIdentityStoreEvents.ProtectorPurpose )
+            .Protect( malformed );
+        await using (SqliteConnection connection = new( connectionString )) {
+            await connection.OpenAsync( TestContext.CancellationToken );
+            await using SqliteCommand seed = connection.CreateCommand( );
+            seed.CommandText = """
+                               INSERT INTO "idunno_bluesky_identities" ("Did", "Identity", "ExpiresAtUtcTicks", "ProofKeyHash")
+                               VALUES (@did, @identity, @expires, 'malformed-proof');
+                               """;
+            _ = seed.Parameters.AddWithValue( "@did", DidValue );
+            _ = seed.Parameters.AddWithValue( "@identity", protectedMalformed );
+            _ = seed.Parameters.AddWithValue( "@expires", DateTime.UtcNow.AddDays( 7 ).Ticks );
+            _ = await seed.ExecuteNonQueryAsync( TestContext.CancellationToken );
+        }
+
+        AuthenticationTicket ticket = BuildTicketForDid( DidValue, sessionId, userId, securityStamp );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket ) );
+
+        using HttpResponseMessage who = await _client.GetAsync( "/test/who", TestContext.CancellationToken );
+        JsonElement body = await who.Content.ReadFromJsonAsync<JsonElement>( TestContext.CancellationToken );
+        Assert.IsFalse( body.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.AreEqual( 0, _oauth.Revocations );
+        Assert.AreEqual( 0, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ) );
+        Assert.AreEqual( 0, await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" ) );
+    }
+
+    [TestMethod]
+    public async Task ConcurrentReplacementBeforeCorruptCas_SurvivesExactRowAndBrowser( ) {
+        // A corrupt row observed by a read is replaced by a fresh grant before the corrupt cleanup's CAS
+        // delete runs. The gate is a bounded TaskCompletionSource awaited by the cleanup strictly BEFORE it
+        // opens any writer; the replacement commits fully before the gate releases, so the CAS delete must
+        // miss (different blob) and the replacement must survive with its distinct browser session.
+        string sessionId = Guid.NewGuid( ).ToString( "N" );
+        (string userId, string securityStamp) = await SeedLinkedAccountAndBrowserAsync( sessionId );
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        byte[] corrupt = [0xAA, 0xBB, 0xCC, 0xDD];
+        await using (SqliteConnection connection = new( connectionString )) {
+            await connection.OpenAsync( TestContext.CancellationToken );
+            await using SqliteCommand seed = connection.CreateCommand( );
+            seed.CommandText = """
+                               INSERT INTO "idunno_bluesky_identities" ("Did", "Identity", "ExpiresAtUtcTicks", "ProofKeyHash")
+                               VALUES (@did, @identity, @expires, 'corrupt-proof');
+                               """;
+            _ = seed.Parameters.AddWithValue( "@did", DidValue );
+            _ = seed.Parameters.AddWithValue( "@identity", corrupt );
+            _ = seed.Parameters.AddWithValue( "@expires", DateTime.UtcNow.AddDays( 7 ).Ticks );
+            _ = await seed.ExecuteNonQueryAsync( TestContext.CancellationToken );
+        }
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        Func<Task>? previousSeam = BridgeBeatsIdentityStore.BeforeCorruptCleanupDelete;
+        string? concurrencyStampBefore = await CurrentStampAsync( "ConcurrencyStamp" );
+        byte[]? replacementBlob = null;
+        string replacementSession = "unset";
+        try {
+            TaskCompletionSource gate = new( TaskCreationOptions.RunContinuationsAsynchronously );
+            TaskCompletionSource replacementCommitted = new( TaskCreationOptions.RunContinuationsAsynchronously );
+            BridgeBeatsIdentityStore.BeforeCorruptCleanupDelete = async ( ) => {
+                // Runs outside any writer: land the replacement and prove it committed before releasing.
+                await AddReplacementCredentialsAsync( store, DateTime.UtcNow.AddHours( 2 ), "replacement-grant" );
+                replacementBlob = await StoredBlobAsync( );
+                // The replacement registers its own browser session; there are now two rows (the ticket's
+                // seeded session and the replacement's). Capture the one that is not the ticket's.
+                replacementSession = (await StoredBrowserSessionIdsAsync( )).Single( id => id != sessionId );
+                _ = replacementCommitted.TrySetResult( );
+                await gate.Task.WaitAsync( TimeSpan.FromSeconds( 10 ), TestContext.CancellationToken );
+            };
+            AuthenticationTicket ticket = BuildTicketForDid( DidValue, sessionId, userId, securityStamp );
+            _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+            _client.DefaultRequestHeaders.Add( "Cookie", BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket ) );
+
+            Task<HttpResponseMessage> request = _client.GetAsync( "/test/who", TestContext.CancellationToken );
+            await replacementCommitted.Task.WaitAsync( TimeSpan.FromSeconds( 10 ), TestContext.CancellationToken );
+            Assert.IsNotNull( replacementBlob, "The replacement must have committed before the gate releases." );
+            Assert.AreNotEqual( Convert.ToHexString( corrupt ), Convert.ToHexString( replacementBlob ),
+                "The replacement blob must differ from the observed corrupt blob." );
+            Assert.AreNotEqual( sessionId, replacementSession,
+                "The replacement must register a distinct browser session." );
+            gate.SetResult( );
+            using HttpResponseMessage who = await request;
+            JsonElement body = await who.Content.ReadFromJsonAsync<JsonElement>( TestContext.CancellationToken );
+            Assert.IsFalse( body.GetProperty( "authenticated" ).GetBoolean( ),
+                "The request that observed the corrupt row is unauthenticated, but must not have deleted the replacement." );
+        } finally {
+            BridgeBeatsIdentityStore.BeforeCorruptCleanupDelete = previousSeam;
+        }
+
+        // The replacement and its browser row survive; no stamp change; no revocation; no cookie deletion.
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            "The replacement row must survive the corrupt cleanup." );
+        Assert.AreEqual( 2, await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" ),
+            "Both the ticket's seeded browser row and the replacement's browser row must survive a CAS miss." );
+        IReadOnlyList<string> surviving = await StoredBrowserSessionIdsAsync( );
+        Assert.IsTrue( surviving.Contains( sessionId ) && surviving.Contains( replacementSession ),
+            "The surviving browser rows must be the ticket's session and the replacement's distinct session." );
+        Assert.IsNotNull( replacementBlob );
+        await AssertBlobEqualsAsync( replacementBlob! );
+        Assert.AreEqual( concurrencyStampBefore, await CurrentStampAsync( "ConcurrencyStamp" ),
+            "A CAS miss must not rotate the concurrency stamp." );
+        Assert.AreEqual( 0, _oauth.Revocations );
+    }
+
+    [TestMethod]
+    public async Task FreshSignInCarryingCorruptOldCookie_SucceedsWithSingleUsableNewCookie( ) {
+        // A request that arrives authenticated only by a cookie whose store row is missing/corrupt performs
+        // a fresh sign-in in the same request. The new cookie must win; the cleanup deletion must not.
+        string sessionId = Guid.NewGuid( ).ToString( "N" );
+        (string userId, string securityStamp) = await SeedLinkedAccountAndBrowserAsync( sessionId );
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        byte[] corrupt = [0x11, 0x22, 0x33];
+        await using (SqliteConnection connection = new( connectionString )) {
+            await connection.OpenAsync( TestContext.CancellationToken );
+            await using SqliteCommand seed = connection.CreateCommand( );
+            seed.CommandText = """
+                               INSERT INTO "idunno_bluesky_identities" ("Did", "Identity", "ExpiresAtUtcTicks", "ProofKeyHash")
+                               VALUES (@did, @identity, @expires, 'corrupt-proof-2');
+                               """;
+            _ = seed.Parameters.AddWithValue( "@did", DidValue );
+            _ = seed.Parameters.AddWithValue( "@identity", corrupt );
+            _ = seed.Parameters.AddWithValue( "@expires", DateTime.UtcNow.AddDays( 7 ).Ticks );
+            _ = await seed.ExecuteNonQueryAsync( TestContext.CancellationToken );
+        }
+        AuthenticationTicket ticket = BuildTicketForDid( DidValue, sessionId, userId, securityStamp );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket ) );
+
+        using HttpResponseMessage signIn = await _client.PostAsync( "/test/signin", null, TestContext.CancellationToken );
+        Assert.AreEqual( HttpStatusCode.OK, signIn.StatusCode, await signIn.Content.ReadAsStringAsync( TestContext.CancellationToken ) );
+        string[] blueskyCookies = [.. signIn.Headers.GetValues( "Set-Cookie" ).Where( value => value.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=", StringComparison.Ordinal ) )];
+        Assert.HasCount( 1, blueskyCookies, "The fresh sign-in must produce exactly one nondeleted Bluesky cookie." );
+        Assert.IsFalse( blueskyCookies.Single( ).StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=;", StringComparison.Ordinal ) );
+
+        string freshCookie = blueskyCookies.Single( ).Split( ';' )[0];
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", freshCookie );
+        JsonElement who = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( who.GetProperty( "authenticated" ).GetBoolean( ) );
+    }
+
+    [TestMethod]
+    public async Task CleanupCommit_FailureRollsBackRowsAndPublishesNoCookieOutcome( ) {
+        // A SQLite error while the corrupt cleanup's browser deletion runs aborts the whole transaction:
+        // the corrupt rows stay, the stamp stays, and no cookie outcome is published.
+        string sessionId = Guid.NewGuid( ).ToString( "N" );
+        (string userId, string securityStamp) = await SeedLinkedAccountAndBrowserAsync( sessionId );
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        byte[] corrupt = [0x41, 0x42, 0x43];
+        await using (SqliteConnection connection = new( connectionString )) {
+            await connection.OpenAsync( TestContext.CancellationToken );
+            await using SqliteCommand seed = connection.CreateCommand( );
+            seed.CommandText = """
+                               INSERT INTO "idunno_bluesky_identities" ("Did", "Identity", "ExpiresAtUtcTicks", "ProofKeyHash")
+                               VALUES (@did, @identity, @expires, 'corrupt-proof-3');
+                               CREATE TRIGGER fail_browser_delete BEFORE DELETE ON "bridgebeats_bluesky_sessions"
+                               BEGIN SELECT RAISE(ABORT, 'injected browser delete failure'); END;
+                               """;
+            _ = seed.Parameters.AddWithValue( "@did", DidValue );
+            _ = seed.Parameters.AddWithValue( "@identity", corrupt );
+            _ = seed.Parameters.AddWithValue( "@expires", DateTime.UtcNow.AddDays( 7 ).Ticks );
+            _ = await seed.ExecuteNonQueryAsync( TestContext.CancellationToken );
+        }
+        string? concurrencyStamp = await CurrentStampAsync( "ConcurrencyStamp" );
+
+        AuthenticationTicket ticket = BuildTicketForDid( DidValue, sessionId, userId, securityStamp );
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket ) );
+        using HttpResponseMessage who = await _client.GetAsync( "/test/who", TestContext.CancellationToken );
+
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            "The corrupt row must survive the failed transaction." );
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" ),
+            "The browser row must survive the failed transaction." );
+        Assert.AreEqual( concurrencyStamp, await CurrentStampAsync( "ConcurrencyStamp" ),
+            "No stamp change may be published when the cleanup transaction fails." );
+        Assert.IsFalse( who.Headers.TryGetValues( "Set-Cookie", out _ ),
+            "A failed cleanup must not produce a cookie deletion outcome." );
+    }
+
+    [TestMethod]
+    public async Task HealthyCredential_ExtendsExpiryAndRunsRetrievalEvents_AndLocksStayUsable( ) {
+        _ = await SignInAsync( );
+        IIdentityStore store = Options( ).IdentityStore!;
+        Did did = new( DidValue );
+
+        // Age the stored row by a day so a read that does NOT extend would leave it a day short. Only an
+        // active extension brings it back to ~now+7 days, so the assertion discriminates extension rather
+        // than tolerating whatever expiry the sign-in happened to write.
+        await using (SqliteConnection connection = new( $"Data Source={Path.Combine( _directory, "identity.db" )}" )) {
+            await connection.OpenAsync( TestContext.CancellationToken );
+            await using SqliteCommand age = connection.CreateCommand( );
+            age.CommandText = "UPDATE \"idunno_bluesky_identities\" SET \"ExpiresAtUtcTicks\" = @aged WHERE \"Did\" = @did;";
+            _ = age.Parameters.AddWithValue( "@did", DidValue );
+            _ = age.Parameters.AddWithValue( "@aged", DateTime.UtcNow.AddDays( 6 ).Ticks );
+            _ = await age.ExecuteNonQueryAsync( TestContext.CancellationToken );
+        }
+
+        bool onRetrievedRan = false;
+        Func<IdentityStoreRetrievedContext, Task>? previousOnRetrieved = store.Events.OnRetrieved;
+        store.Events.OnRetrieved = retrieved => {
+            onRetrievedRan = true;
+            return Task.CompletedTask;
+        };
+        try {
+            ClaimsIdentity? identity = await store.GetIdentity( did, TestContext.CancellationToken );
+            Assert.IsNotNull( identity );
+            Assert.IsTrue( onRetrievedRan, "A healthy read must still raise the retrieval event." );
+            // A healthy read extends the row back to roughly now+7 days while the row remains unexpired.
+            long extended = await StoredExpiryTicksAsync( );
+            long now = DateTime.UtcNow.Ticks;
+            long days7 = TimeSpan.FromDays( 7 ).Ticks;
+            Assert.IsTrue( extended > now + days7 - TimeSpan.FromMinutes( 1 ).Ticks &&
+                           extended <= now + days7 + TimeSpan.FromMinutes( 1 ).Ticks,
+                $"A healthy read must extend the aged row to about now+7 days; stored {extended}, now {now}." );
+        } finally {
+            store.Events.OnRetrieved = previousOnRetrieved;
+        }
+
+        // Refresh-lock delegation is unchanged: a healthy row can still take and release the lock.
+        string? lockToken = await store.StartRefresh( did, TestContext.CancellationToken );
+        Assert.IsNotNull( lockToken );
+        Assert.IsTrue( await store.EndRefresh( did, lockToken, TestContext.CancellationToken ) );
+    }
+
+    [TestMethod]
+    public async Task ReplacedStoreEvents_AreHonouredForBothWritesAndReads_WhileDbStaysProtected( ) {
+        // Installing a custom events instance drives both write (PreStoring) and read (PostRetrieval), and
+        // ReplaceIdentity made by that instance is honoured. Data protection stays the permanent outer layer:
+        // the raw stored bytes remain a DP envelope that unprotects with the exact protector purpose, and
+        // restoring the configured (wrapper) events leaves the row usable rather than classifying it corrupt.
+        _ = await SignInAsync( );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        IdentityStoreEvents previous = store.Events;
+        PassThroughEvents custom = new( );
+        store.Events = custom;
+        Assert.AreSame( custom, store.Events, "The replaced events instance must be the store's active Events." );
+        try {
+            // A write lands through the custom PreStoring (and the wrapper then protects).
+            await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
+                ApplicationUser user = await scope.ServiceProvider.GetRequiredService<ApplicationDbContext>( ).Users
+                    .SingleAsync( TestContext.CancellationToken );
+                IHttpContextAccessor accessor = scope.ServiceProvider.GetRequiredService<IHttpContextAccessor>( );
+                HttpContext? previousContext = accessor.HttpContext;
+                DefaultHttpContext request = new( ) { RequestServices = scope.ServiceProvider };
+                request.Items[BridgeBeatsIdentityStore.ExpectedStampKey] = user.SecurityStamp!;
+                request.Items[BridgeBeatsIdentityStore.PendingBrowserSessionKey] =
+                    new BridgeBeatsIdentityStore.PendingBrowserSession( DidValue, Guid.NewGuid( ).ToString( "N" ), DateTimeOffset.UtcNow.AddDays( 7 ) );
+                accessor.HttpContext = request;
+                try {
+                    await store.Add( IIdentityStore.BuildClaimsIdentity( CreateCredentials( DateTime.UtcNow.AddHours( 2 ), "replacement-via-custom-events" ) ),
+                        TestContext.CancellationToken );
+                } finally {
+                    accessor.HttpContext = previousContext;
+                }
+            }
+            Assert.IsTrue( custom._preStoringRan && custom._storedLength > 0,
+                "The write must go through the replaced PreStoring." );
+
+            // A read must go through the replaced PostRetrieval and see the identity this instance stored.
+            ClaimsIdentity? identity = await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken );
+            Assert.IsNotNull( identity, "The custom events must yield a readable identity, not a corrupt cleanup." );
+            Assert.IsTrue( custom._postRetrievalRan && custom._retrievedLength == custom._storedLength,
+                "The read must go through the replaced PostRetrieval and honor ReplaceIdentity." );
+
+            // The raw DB row is still a DP-protected envelope: unprotect with the exact purpose succeeds.
+            byte[] storedBlob = await StoredBlobAsync( );
+            byte[] unprotected = Options( ).DataProtectionProvider!
+                .CreateProtector( idunno.Bluesky.AspNet.Authentication.Events.DataProtectingIdentityStoreEvents.ProtectorPurpose )
+                .Unprotect( storedBlob );
+            Assert.IsNotEmpty( unprotected, "The stored row must remain DP-protected under custom events." );
+        } finally {
+            store.Events = previous;
+        }
+
+        // Restoring the configured (wrapper) events: the same protected row stays usable, no cleanup runs.
+        Assert.AreSame( previous, store.Events, "The original events must be restored." );
+        Assert.IsNotNull( await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ),
+            "The restored events must read the still-protected row without a corruption cleanup." );
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            "Restoring the events must not delete the row." );
+    }
+
+    [TestMethod]
+    public async Task RetrievalCallbackCryptographicException_IsNonCorruptionAndPreservesRow( ) {
+        _ = await SignInAsync( );
+        string sessionBefore = (await StoredBrowserSessionIdsAsync( )).Single( );
+        IIdentityStore store = Options( ).IdentityStore!;
+        Func<IdentityStoreRetrievedContext, Task>? previousOnRetrieved = store.Events.OnRetrieved;
+        store.Events.OnRetrieved = _ => throw new CryptographicException( "callback failure" );
+        try {
+            Assert.IsNull( await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ),
+                "A failing retrieval callback must surface as a miss, not a credential." );
+        } finally {
+            store.Events.OnRetrieved = previousOnRetrieved;
+        }
+        Assert.IsNotNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ),
+            "A callback failure must not delete or corrupt the stored row." );
+        Assert.AreEqual( 0, _oauth.Revocations );
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            "A callback CryptographicException must not be treated as corrupt-row cleanup." );
+        IReadOnlyList<string> sessionsAfter = await StoredBrowserSessionIdsAsync( );
+        Assert.HasCount( 1, sessionsAfter,
+            "A callback CryptographicException must not remove browser rows." );
+        Assert.AreEqual( sessionBefore, sessionsAfter.Single( ),
+            "The exact browser row must survive a callback CryptographicException." );
+    }
+
+    [TestMethod]
+    public async Task RetrievalCallbackInvalidOperationException_IsNonCorruptionAndPreservesRow( ) {
+        _ = await SignInAsync( );
+        string sessionBefore = (await StoredBrowserSessionIdsAsync( )).Single( );
+        IIdentityStore store = Options( ).IdentityStore!;
+        var previousOnRetrieved = store.Events.OnRetrieved;
+        store.Events.OnRetrieved = _ => throw new InvalidOperationException( "callback failure" );
+        try {
+            Assert.IsNull( await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+        } finally {
+            store.Events.OnRetrieved = previousOnRetrieved;
+        }
+        Assert.IsNotNull( await Options( ).IdentityStore!.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ) );
+        Assert.AreEqual( 0, _oauth.Revocations );
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            "A callback InvalidOperationException must not be treated as corrupt-row cleanup." );
+        IReadOnlyList<string> sessionsAfter = await StoredBrowserSessionIdsAsync( );
+        Assert.HasCount( 1, sessionsAfter,
+            "A callback InvalidOperationException must not remove browser rows." );
+        Assert.AreEqual( sessionBefore, sessionsAfter.Single( ),
+            "The exact browser row must survive a callback InvalidOperationException." );
+    }
+
+    [TestMethod]
+    public async Task RetrievalCancellation_PropagatesAndPreservesState( ) {
+        _ = await SignInAsync( );
+        string sessionBefore = (await StoredBrowserSessionIdsAsync( )).Single( );
+        IIdentityStore store = Options( ).IdentityStore!;
+
+        // Pre-cancelled token: the read must not look like a missing user and must not alter state.
+        using (CancellationTokenSource preCancelled = new( )) {
+            await preCancelled.CancelAsync( );
+            _ = await Assert.ThrowsAsync<OperationCanceledException>(
+                ( ) => store.GetIdentity( new Did( DidValue ), preCancelled.Token ) );
+        }
+
+        // Cancellation raised from inside the retrieval callback: propagates as OCE, rows/identity preserved.
+        CancellationTokenSource callbackCts = new( );
+        Func<IdentityStoreRetrievedContext, Task>? previousOnRetrieved = store.Events.OnRetrieved;
+        store.Events.OnRetrieved = retrieved => {
+            callbackCts.Cancel( );
+            return Task.CompletedTask;
+        };
+        try {
+            _ = await Assert.ThrowsAsync<OperationCanceledException>(
+                ( ) => store.GetIdentity( new Did( DidValue ), callbackCts.Token ) );
+        } finally {
+            store.Events.OnRetrieved = previousOnRetrieved;
+            callbackCts.Dispose( );
+        }
+
+        Assert.IsNotNull( await store.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ),
+            "A cancelled read must not delete or alter the stored row." );
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            "A cancelled read must not run a corrupt-row cleanup." );
+        IReadOnlyList<string> sessionsAfter = await StoredBrowserSessionIdsAsync( );
+        Assert.HasCount( 1, sessionsAfter,
+            "A cancelled read must not remove browser rows." );
+        Assert.AreEqual( sessionBefore, sessionsAfter.Single( ),
+            "The exact browser row must survive a cancelled read." );
+    }
+
+    [TestMethod]
+    public async Task StoreReadError_PreservesStateAndIsNotTreatedAsCorruption( ) {
+        // A real SQLite read failure (the identities table does not exist) must propagate as a database
+        // error, never as a corrupt-credential cleanup. A throwaway store over an unmigrated database is
+        // used so the production store and its rows are untouched.
+        string tempDb = Path.Combine( _directory, "no-tables.db" );
+        string connectionString = $"Data Source={tempDb}";
+        await using (SqliteConnection create = new( connectionString )) {
+            await create.OpenAsync( TestContext.CancellationToken );
+        }
+        BridgeBeatsIdentityStore brokenStore = new( connectionString, new Moq.Mock<IHttpContextAccessor>( ).Object,
+            Microsoft.Extensions.Logging.Abstractions.NullLoggerFactory.Instance,
+            Options( ).DataProtectionProvider! );
+        _ = await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(
+            ( ) => brokenStore.GetIdentity( new Did( DidValue ), TestContext.CancellationToken ),
+            "A missing identities table must surface as a SQLite read error." );
+        // No rows existed to clean and no cleanup can have been published (the read failed before any
+        // corruption path and there is no HttpContext to carry an outcome marker).
+        Assert.AreEqual( 0, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ) );
+    }
+
+    [TestMethod]
+    public async Task ProviderOutageDuringOrdinaryAuth_LeavesSessionUsableAndNoDeletion( ) {
+        // A provider-discovery failure during an ORDINARY authenticated request (not a logout) must not be
+        // treated as credential corruption: with an expired token the SDK's thrown refresh failure returns
+        // an unauthenticated result without removing the identity (verified against SDK source), so the
+        // session row, credential row, and cookie must all remain and no deletion Set-Cookie is emitted.
+        _ = await SignInAsync( );
+        string sessionBefore = (await StoredBrowserSessionIdsAsync( )).Single( );
+        await ExpireStoredAccessTokenAsync( );
+        _oauth.ProtectedResourceDiscoveryFails = true;
+        try {
+            using HttpResponseMessage who = await _client.GetAsync( "/test/who", TestContext.CancellationToken );
+            Assert.IsFalse( (await who.Content.ReadFromJsonAsync<JsonElement>( TestContext.CancellationToken ))
+                .GetProperty( "authenticated" ).GetBoolean( ),
+                "An unresolved provider must fail the ordinary authentication." );
+            Assert.IsTrue( who.Headers.TryGetValues( "Set-Cookie", out IEnumerable<string>? cookies ) == false ||
+                           cookies!.All( value => !value.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=;", StringComparison.Ordinal ) ),
+                "A provider outage must not delete the reference cookie." );
+        } finally {
+            _oauth.ProtectedResourceDiscoveryFails = false;
+        }
+
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            "A provider outage must not trigger corrupt-credential cleanup." );
+        IReadOnlyList<string> sessionsAfter = await StoredBrowserSessionIdsAsync( );
+        Assert.HasCount( 1, sessionsAfter,
+            "A provider outage must not remove browser rows." );
+        Assert.AreEqual( sessionBefore, sessionsAfter.Single( ),
+            "The exact browser row must survive a provider outage." );
+        Assert.AreEqual( 0, _oauth.Revocations,
+            "A provider outage on an ordinary request must not revoke the grant." );
+        Assert.IsEmpty( _oauth.RevokedRefreshTokens );
+    }
+
+    [TestMethod]
+    public async Task MissingCredentialStaleCookie_CannotRemoveFreshSignInOrRevoke( ) {
+        // A cookie whose store row is missing must not revoke or remove a fresh session stored after it.
+        _ = await SignInAsync( );
+        string validCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        await using (SqliteConnection connection = new( $"Data Source={Path.Combine( _directory, "identity.db" )}" )) {
+            await connection.OpenAsync( TestContext.CancellationToken );
+            await using SqliteCommand remove = connection.CreateCommand( );
+            remove.CommandText = "DELETE FROM \"idunno_bluesky_identities\" WHERE \"Did\" = @did; DELETE FROM \"bridgebeats_bluesky_sessions\" WHERE \"Did\" = @did;";
+            _ = remove.Parameters.AddWithValue( "@did", DidValue );
+            _ = await remove.ExecuteNonQueryAsync( TestContext.CancellationToken );
+        }
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _ = await SignInAsync( );
+        int revocations = _oauth.Revocations;
+
+        // A replay of the stale cookie after the fresh sign-in must be rejected without touching the fresh session.
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", validCookie );
+        JsonElement replay = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsFalse( replay.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.AreEqual( revocations, _oauth.Revocations,
+            "A stale missing-row cookie must not revoke the fresh session's grant." );
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+            "The fresh sign-in's credential row must be untouched." );
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" ),
+            "The fresh sign-in's browser row must be untouched." );
+    }
+
+    [TestMethod]
+    public async Task StaleStampOrSessionCookie_CannotRemoveNewSessionOrRevoke( ) {
+        // Expired-ticket / stale-stamp / stale-session cookies must not remove the new session's rows or revoke.
+        _ = await SignInAsync( );
+        string validCookie = _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( );
+        await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
+            ApplicationUser user = await scope.ServiceProvider.GetRequiredService<ApplicationDbContext>( ).Users.SingleAsync( TestContext.CancellationToken );
+            user.SecurityStamp = Guid.NewGuid( ).ToString( "N" );
+            _ = await scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>( ).UpdateAsync( user );
+        }
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _ = await SignInAsync( );
+        int revocations = _oauth.Revocations;
+        int browserRowsBeforeReplay = await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" );
+
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", validCookie );
+        JsonElement replay = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsFalse( replay.GetProperty( "authenticated" ).GetBoolean( ) );
+        Assert.AreEqual( revocations, _oauth.Revocations );
+        Assert.AreEqual( browserRowsBeforeReplay, await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" ),
+            "A stale-stamp cookie replay must not remove the fresh session's browser row." );
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ) );
+    }
+
+    [TestMethod]
+    public async Task CleanupDoesNotPublishCookieOutcomeWhenCasMisses( ) {
+        // A corrupt row replaced by a healthy row before cleanup: CAS miss leaves no browser/stamp/cookie changes,
+        // and the committed replacement's own session stays usable.
+        string sessionId = Guid.NewGuid( ).ToString( "N" );
+        (string userId, string securityStamp) = await SeedLinkedAccountAndBrowserAsync( sessionId );
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        byte[] corrupt = [0x77, 0x88, 0x99];
+        await using (SqliteConnection connection = new( connectionString )) {
+            await connection.OpenAsync( TestContext.CancellationToken );
+            await using SqliteCommand seed = connection.CreateCommand( );
+            seed.CommandText = """
+                               INSERT INTO "idunno_bluesky_identities" ("Did", "Identity", "ExpiresAtUtcTicks", "ProofKeyHash")
+                               VALUES (@did, @identity, @expires, 'corrupt-proof-4');
+                               """;
+            _ = seed.Parameters.AddWithValue( "@did", DidValue );
+            _ = seed.Parameters.AddWithValue( "@identity", corrupt );
+            _ = seed.Parameters.AddWithValue( "@expires", DateTime.UtcNow.AddDays( 7 ).Ticks );
+            _ = await seed.ExecuteNonQueryAsync( TestContext.CancellationToken );
+        }
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        Func<Task>? previousSeam = BridgeBeatsIdentityStore.BeforeCorruptCleanupDelete;
+        string? concurrencyStamp = await CurrentStampAsync( "ConcurrencyStamp" );
+        byte[]? replacementBlob = null;
+        string replacementSession = "unset";
+        try {
+            TaskCompletionSource gate = new( TaskCreationOptions.RunContinuationsAsynchronously );
+            TaskCompletionSource replacementCommitted = new( TaskCreationOptions.RunContinuationsAsynchronously );
+            BridgeBeatsIdentityStore.BeforeCorruptCleanupDelete = async ( ) => {
+                await AddReplacementCredentialsAsync( store, DateTime.UtcNow.AddHours( 2 ), "replacement-grant-2" );
+                replacementBlob = await StoredBlobAsync( );
+                replacementSession = (await StoredBrowserSessionIdAsync( ))!;
+                _ = replacementCommitted.TrySetResult( );
+                await gate.Task.WaitAsync( TimeSpan.FromSeconds( 10 ), TestContext.CancellationToken );
+            };
+            AuthenticationTicket ticket = BuildTicketForDid( DidValue, sessionId, userId, securityStamp );
+            _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+            _client.DefaultRequestHeaders.Add( "Cookie", BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket ) );
+
+            Task<HttpResponseMessage> request = _client.GetAsync( "/test/who", TestContext.CancellationToken );
+            await replacementCommitted.Task.WaitAsync( TimeSpan.FromSeconds( 10 ), TestContext.CancellationToken );
+            Assert.IsNotNull( replacementBlob );
+            Assert.AreNotEqual( Convert.ToHexString( corrupt ), Convert.ToHexString( replacementBlob ) );
+            gate.SetResult( );
+            using HttpResponseMessage who = await request;
+
+            Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ) );
+            Assert.AreEqual( concurrencyStamp, await CurrentStampAsync( "ConcurrencyStamp" ),
+                "A CAS miss must not rotate the concurrency stamp." );
+            Assert.IsTrue( who.Headers.TryGetValues( "Set-Cookie", out _ ) == false ||
+                           who.Headers.GetValues( "Set-Cookie" ).All( value =>
+                               !value.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=;", StringComparison.Ordinal ) ),
+                "A CAS miss must not delete the cookie." );
+        } finally {
+            BridgeBeatsIdentityStore.BeforeCorruptCleanupDelete = previousSeam;
+        }
+
+        // The replacement committed with exact bytes and a distinct session; it is still usable.
+        await AssertBlobEqualsAsync( replacementBlob! );
+        IReadOnlyList<string> surviving = await StoredBrowserSessionIdsAsync( );
+        Assert.IsTrue( surviving.Contains( sessionId ) && surviving.Contains( replacementSession ),
+            "The surviving browser rows must be the ticket's session and the replacement's distinct session." );
+        Assert.AreEqual( 2, await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" ) );
+    }
+
+    private AuthenticationTicket BuildTicketForDid( string did, string sessionId, string userId, string securityStamp ) {
+        AuthenticationProperties properties = new( ) {
+            IssuedUtc = DateTimeOffset.UtcNow.AddMinutes( -1 ),
+            ExpiresUtc = DateTimeOffset.UtcNow.AddDays( 7 )
+        };
+        properties.SetString( BlueskyAccountEvents.UserIdProperty, userId );
+        properties.SetString( BlueskyAccountEvents.SecurityStampProperty, securityStamp );
+        properties.SetString( BlueskyAccountEvents.BrowserSessionProperty, sessionId );
+        ClaimsIdentity identity = new( [new Claim( AtProtoClaims.Did, did )], "Bluesky" );
+        return new AuthenticationTicket( new ClaimsPrincipal( identity ), properties, s_scheme );
+    }
+
+    /// <summary>
+    /// Creates the local user linked to <see cref="DidValue"/> (if absent) and seeds the given browser session
+    /// rows, returning the user id and security stamp a valid reference ticket must carry. Used to build tickets
+    /// that pass <see cref="BlueskyAccountEvents.HasCurrentAccountBindingAsync"/> in the handler.
+    /// </summary>
+    private async Task<(string UserId, string SecurityStamp)> SeedLinkedAccountAndBrowserAsync( params string[] sessionIds ) {
+        string userId;
+        string securityStamp;
+        await using (AsyncServiceScope scope = _app.Services.CreateAsyncScope( )) {
+            UserManager<ApplicationUser> users = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>( );
+            ApplicationUser? user = await users.Users.SingleOrDefaultAsync( u => u.AtProtoDid == DidValue, TestContext.CancellationToken );
+            if (user is null) {
+                user = new ApplicationUser { UserName = $"bluesky_{Guid.NewGuid( ):N}", AtProtoDid = DidValue, CreatedAt = DateTime.UtcNow };
+                Assert.IsTrue( (await users.CreateAsync( user )).Succeeded );
+            }
+            userId = user.Id;
+            securityStamp = (await users.GetSecurityStampAsync( user ))!;
+        }
+        if (sessionIds.Length > 0) {
+            string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+            await using SqliteConnection connection = new( connectionString );
+            await connection.OpenAsync( TestContext.CancellationToken );
+            await using SqliteCommand seed = connection.CreateCommand( );
+            seed.CommandText = "INSERT INTO \"bridgebeats_bluesky_sessions\" (\"SessionId\", \"Did\", \"ExpiresAtUtcTicks\") VALUES (@session, @did, @expires);";
+            _ = seed.Parameters.Add( "@session", SqliteType.Text );
+            _ = seed.Parameters.AddWithValue( "@did", DidValue );
+            _ = seed.Parameters.AddWithValue( "@expires", DateTime.UtcNow.AddDays( 7 ).Ticks );
+            foreach (string sessionId in sessionIds) {
+                seed.Parameters["@session"].Value = sessionId;
+                _ = await seed.ExecuteNonQueryAsync( TestContext.CancellationToken );
+            }
+        }
+        return (userId, securityStamp);
+    }
+
+    private async Task<string?> CurrentStampAsync( string column ) {
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        await using SqliteConnection connection = new( connectionString );
+        await connection.OpenAsync( TestContext.CancellationToken );
+        await using SqliteCommand read = connection.CreateCommand( );
+        read.CommandText = $"SELECT {column} FROM AspNetUsers WHERE AtProtoDid = @did;";
+        _ = read.Parameters.AddWithValue( "@did", DidValue );
+        return await read.ExecuteScalarAsync( TestContext.CancellationToken ) as string;
+    }
+
+    private async Task<long> StoredExpiryTicksAsync( ) {
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        await using SqliteConnection connection = new( connectionString );
+        await connection.OpenAsync( TestContext.CancellationToken );
+        await using SqliteCommand read = connection.CreateCommand( );
+        read.CommandText = "SELECT \"ExpiresAtUtcTicks\" FROM \"idunno_bluesky_identities\" WHERE \"Did\" = @did;";
+        _ = read.Parameters.AddWithValue( "@did", DidValue );
+        return Convert.ToInt64( await read.ExecuteScalarAsync( TestContext.CancellationToken ), CultureInfo.InvariantCulture );
+    }
+
+    private sealed class PassThroughEvents : IdentityStoreEvents {
+        internal int _storedLength = -1;
+        internal int _retrievedLength = -1;
+        internal bool _preStoringRan;
+        internal bool _postRetrievalRan;
+
+        public override async Task PreStoring( IdentityStoreSettingContext context ) {
+            await base.PreStoring( context );
+            _preStoringRan = true;
+            _storedLength = context.Identity.Length;
+            // ReplaceIdentity is honoured without altering the payload (a pass-through copy keeps the stored
+            // data readable by the same events instance).
+            context.ReplaceIdentity( context.Identity.ToArray( ) );
+        }
+
+        public override async Task PostRetrieval( IdentityStoreRetrievedContext context ) {
+            await base.PostRetrieval( context );
+            _postRetrievalRan = true;
+            _retrievedLength = context.Identity.Length;
+        }
     }
 
     private sealed class ActionExceptionObserver : IAsyncActionFilter {

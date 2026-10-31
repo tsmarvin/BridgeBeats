@@ -195,6 +195,20 @@ public sealed partial class BlueskyAccountEvents(
     internal static AuthenticationTicket? GetVerifiedTicket( HttpContext context ) =>
         context.Items.TryGetValue( s_verifiedTicket, out object? ticket ) ? ticket as AuthenticationTicket : null;
 
+    /// <summary>
+    /// Clears the cached verified account and the prepared sign-in state after a cleanup removed the browser's
+    /// stored rows, so a same-request fresh sign-in starts from a clean slate instead of relying on the deleted
+    /// orphan row or the invalidated ticket.
+    /// </summary>
+    internal Task ClearVerifiedSignInAsync( HttpContext context ) {
+        _ = context.Items.Remove( s_verifiedUser );
+        _ = context.Items.Remove( s_verifiedTicket );
+        _ = context.Items.Remove( BridgeBeatsIdentityStore.ExpectedStampKey );
+        _ = context.Items.Remove( BridgeBeatsIdentityStore.ExpectedBrowserSessionKey );
+        _ = context.Items.Remove( BridgeBeatsIdentityStore.PendingBrowserSessionKey );
+        return Task.CompletedTask;
+    }
+
     private async Task<bool> HasCurrentAccountBindingAsync( ApplicationUser user, AuthenticationProperties properties ) {
         if (properties.GetString( UserIdProperty ) != user.Id ||
             properties.GetString( SecurityStampProperty ) is not { Length: > 0 } stamp ||

@@ -279,7 +279,7 @@ docker compose up -d
 
 The archive contains credentials and personal data. Keep it on private storage, encrypt it before moving it off the host, and store the decryption key separately from the backups. When restoring a full archive, extract it and then restore the ownership the installer requires — `./data/app` and `./data/dp-keys` to UID `1654`, and `./data/pds`, `./data/redis`, and `./logs/caddy` to root (see [What the Installation Script Does](#what-the-installation-script-does)) — and give the restored databases and sidecars a private writable mode, for example `600`.
 
-Do not copy a WAL-mode database by raw file copy while it is in use: copying the file together with its `-wal` and `-shm` sidecars while writers are active is not a guaranteed consistent snapshot. Use the archive procedure above with the stack stopped. If you need a backup without stopping the stack, use the SQLite backup API instead of a raw copy: under `umask 077`, create a new, unused private destination — `test ! -e ../backup-dir || { echo "refusing: ../backup-dir already exists" >&2; exit 1; }` followed by `mkdir -m 700 ../backup-dir` — and never reuse or empty an existing directory for a new backup. Then run `sqlite3 data/app/bridgebeats.db ".backup ../backup-dir/bridgebeats.db"`, which writes a consistent, self-contained copy of the database while the app keeps running. A `.backup` failure is reported through `sqlite3`'s nonzero exit status; success is often silent, so do not rely on output. After the command exits `0`, verify the result instead: the destination file exists and is mode `600` (`[ "$(stat -c '%a' ../backup-dir/bridgebeats.db)" = "600" ]`), the directory is mode `700`, and `sqlite3 ../backup-dir/bridgebeats.db 'PRAGMA integrity_check;'` prints exactly `ok`. Abort and investigate instead of upgrading if any of these checks fails. This needs a host `sqlite3` binary (the installer installs one only when it registers the PDS trim cron job, so provide it yourself if that step did not run or could not install it). Every command in this paragraph and the archive procedure must complete successfully before you upgrade.
+Do not copy a WAL-mode database by raw file copy while it is in use: copying the file together with its `-wal` and `-shm` sidecars while writers are active is not a guaranteed consistent snapshot. Use the archive procedure above with the stack stopped; every command in it must complete successfully before you upgrade.
 
 ### Configuration
 
@@ -331,7 +331,7 @@ Check:
 
 ### Bluesky OAuth upgrade
 
-Back up the Identity database before upgrading. The startup migration rewrites `./data/app/bridgebeats.db` and cannot be reversed, and the installation script does not back up this file (it backs up only `docker-compose.yml`, `Caddyfile`, and `secrets/`). Stop the stack before copying the database — a raw live copy of the WAL-mode file is not a consistent snapshot; see [Backup and Recovery](#backup-and-recovery) for the archive recipe and the no-downtime SQLite alternative. To roll back, stop the stack and every other process using the database, move the current `./data/app/` database aside together with its own `-wal` and `-shm` files as one set, restore your pre-upgrade copy into the cleared destination, set the restored files' owner to the container UID `1654` with a private writable mode (`600`), and confirm `PRAGMA integrity_check` passes before running the previous image — the concrete commands are in [Rollback](#rollback). Rolling back the image alone is not viable for this upgrade.
+Back up the Identity database before upgrading. The startup migration rewrites `./data/app/bridgebeats.db` and cannot be reversed, and the installation script does not back up this file (it backs up only `docker-compose.yml`, `Caddyfile`, and `secrets/`). Stop the stack before copying the database — a raw live copy of the WAL-mode file is not a consistent snapshot; see [Backup and Recovery](#backup-and-recovery) for the archive recipe. To roll back, stop the stack and every other process using the database, move the current `./data/app/` database aside together with its own `-wal` and `-shm` files as one set, restore your pre-upgrade copy into the cleared destination, set the restored files' owner to the container UID `1654` with a private writable mode (`600`), and confirm `PRAGMA integrity_check` passes before running the previous image — the concrete commands are in [Rollback](#rollback). Rolling back the image alone is not viable for this upgrade.
 
 The migration from custom Bluesky OAuth to the SDK-managed stores is a forward-only deployment change. On first startup, the new image removes the legacy OAuth credential columns and pending-login table and creates a per-browser Bluesky session table. The previous application image is incompatible with that database, so the image-only rollback steps below do not apply to this upgrade. Users must sign in to Bluesky again, and logins already in progress must be restarted. Bluesky sign-in now requires a valid OAuth signing key; replace any empty or `{}` key secret before upgrading. Non-default public HTTPS ports are no longer accepted as `BridgeBeats:Domain`. For deployments with a dotted DNS host configured as an HTTPS origin or with a trailing slash, password users must also sign in once: the Identity cookie name changes to invalidate old host-only cookies on alternate hosts. Local user accounts, DIDs, API keys, playlists, and Apple Music credentials remain intact. See [Bluesky sign-in configuration](CONFIGURATION.md#bluesky-sign-in) for persistence requirements and signing-key rotation.
 
@@ -372,28 +372,62 @@ These image-only steps do not apply to the [Bluesky OAuth upgrade](#bluesky-oaut
 set -eu
 ts=$(date +%Y%m%d-%H%M%S)
 
+# Directory where you extracted the pre-upgrade archive created by the
+# [Backup and Recovery](#backup-and-recovery) recipe. The archive holds the
+# deployment tree, so its Identity database is at data/app/bridgebeats.db
+# inside the extraction.
+src=../pre-upgrade/data/app
+
 # Stop everything that uses the database before touching any file
 docker compose down
 
 # Move the current database aside as one set, into a fresh private location.
-# Sidecars are optional: move each file only if it exists, never overwrite anything.
+# Preflight: capture one privileged listing per directory, classify every
+# known file in both listings, and require the backup database — all before
+# anything is moved or copied. A failed listing or a classification status
+# other than 0 (match) or 1 (no match) aborts here.
 mkdir -m 700 "../bridgebeats-db-aside.$ts"
-for f in ./data/app/bridgebeats.db ./data/app/bridgebeats.db-wal ./data/app/bridgebeats.db-shm; do
-    [ -e "$f" ] || continue
-    sudo mv "$f" "../bridgebeats-db-aside.$ts/"
+live=$(sudo ls -A ./data/app) || { echo "cannot inspect ./data/app under sudo; aborting" >&2; exit 1; }
+avail=$(sudo ls -A "$src") || { echo "cannot inspect $src under sudo; aborting" >&2; exit 1; }
+live_files=
+backup_files=
+for f in bridgebeats.db bridgebeats.db-wal bridgebeats.db-shm; do
+    st=0
+    printf '%s\n' "$live" | grep -Fqx "$f" || st=$?
+    case $st in
+    0) live_files="$live_files $f" ;;
+    1) : ;;
+    *) echo "cannot read the ./data/app listing to check $f; aborting" >&2; exit 1 ;;
+    esac
+    st=0
+    printf '%s\n' "$avail" | grep -Fqx "$f" || st=$?
+    case $st in
+    0) backup_files="$backup_files $f" ;;
+    1) : ;;
+    *) echo "cannot read the $src listing to check $f; aborting" >&2; exit 1 ;;
+    esac
+done
+case " $backup_files " in
+*" bridgebeats.db "*) ;;
+*) echo "$src has no bridgebeats.db; aborting" >&2; exit 1 ;;
+esac
+
+# Move every live file aside (database plus sidecars). All moves complete
+# before the first copy; mv failure aborts.
+for f in $live_files; do
+    sudo mv "./data/app/$f" "../bridgebeats-db-aside.$ts/"
 done
 
-# Restore the pre-upgrade copy into the cleared destination, preserving the
-# backup's ownership and private mode. If the backup holds matching -wal/-shm
-# files, copy them the same way (cp -a for each, after the same existence check).
-sudo cp -a ../backup-dir/bridgebeats.db ./data/app/bridgebeats.db
-
-# The app container runs as UID 1654 and its databases are private to it.
-# Fix ownership and mode regardless of what cp -a preserved.
-sudo chown 1654:1654 ./data/app/bridgebeats.db*
-sudo chmod 600 ./data/app/bridgebeats.db*
-[ "$(sudo stat -c '%u' ./data/app/bridgebeats.db)" = "1654" ]
-[ "$(sudo stat -c '%a' ./data/app/bridgebeats.db)" = "600" ]
+# Restore each recorded backup file into the cleared destination. The app
+# container runs as UID 1654 and its databases are private to it, so fix
+# ownership and mode regardless of what cp -a preserved.
+for f in $backup_files; do
+    sudo cp -a "$src/$f" "./data/app/$f"
+    sudo chown 1654:1654 "./data/app/$f"
+    sudo chmod 600 "./data/app/$f"
+    [ "$(sudo stat -c '%u' "./data/app/$f")" = "1654" ]
+    [ "$(sudo stat -c '%a' "./data/app/$f")" = "600" ]
+done
 
 # Verify integrity as the container UID, not as root, so the check does not
 # create root-owned WAL/SHM files the container cannot write. Compare the

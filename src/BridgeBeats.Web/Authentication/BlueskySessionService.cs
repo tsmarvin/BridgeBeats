@@ -28,8 +28,13 @@ public sealed partial class BlueskySessionService(
             if (context is null) { return; }
             AuthenticationTicket? ticket = BlueskyAccountEvents.GetVerifiedTicket( context );
             if (ticket is null && context.Request.Cookies.ContainsKey( options.Cookie.Name! )) {
-                AuthenticateResult result = await context.AuthenticateAsync( BlueskyAuthenticationDefaults.AuthenticationScheme );
-                ticket = result.Succeeded ? BlueskyAccountEvents.GetVerifiedTicket( context ) : null;
+                // A logout can arrive authenticated by another scheme (API key or the local Identity cookie),
+                // so the Bluesky scheme is not authenticated by this request. Authenticate it explicitly: the
+                // SDK hydrates the stored identity, and only an independently verified ticket may authorize
+                // browser removal. The ticket is read regardless of AuthenticateAsync's result so a provider
+                // discovery failure cannot turn an explicit logout into a no-op that leaves the session rows.
+                _ = await context.AuthenticateAsync( BlueskyAuthenticationDefaults.AuthenticationScheme );
+                ticket = BlueskyAccountEvents.GetVerifiedTicket( context );
             }
             if (ticket is not null) { await EndBrowserSessionAsync( options, ticket ); }
         } finally {

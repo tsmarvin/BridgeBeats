@@ -113,11 +113,11 @@
       },
       "MSTest.TestFramework": {
         "type": "Direct",
-        "requested": "[4.5.1, )",
-        "resolved": "4.5.1",
-        "contentHash": "mdYgQYAtDGq/IixJq7oD6VvIYAz+mRniGMxyhlZ2wQOpIeFe6oFQ/RniT3i7c3ZfCTKykhI6AB0wqRYVEWZDgQ==",
+        "requested": "[4.5.2, )",
+        "resolved": "4.5.2",
+        "contentHash": "9U+a6ZcsIEXnC2Q8D2RRBpvo3ro83RfGLfeCJC+NomPhiCD6gi9ehpk00A1TC0Za+nB7j5sn6V1VbDanqoohsA==",
         "dependencies": {
-          "MSTest.Analyzers": "4.5.1"
+          "MSTest.Analyzers": "4.5.2"
         }
       },
       "SSH.NET": {
@@ -139,10 +139,10 @@
           "Testcontainers": "4.16.0"
         }
       },
-      "Aspire.Dashboard.Sdk.osx-arm64": {
+      "Aspire.Dashboard.Sdk.linux-x64": {
         "type": "Transitive",
         "resolved": "13.6.3",
-        "contentHash": "512UoSTvgL1Ig5lpEkHJeOnBTzIe6SvIFAvxADHzH7PzBdhguLcqQm4av8/g/efw5QjXV3nvqMCbsE2mK6t49A=="
+        "contentHash": "Q7hcoww2r6w7UyuPccgAbPZy27YAyQQbxaAnMQQzVsyJBVOAOLqrwN88pdcJ5gWKL2ZTaB0XKdDKFkbAxOzBHw=="
       },
       "Aspire.Hosting": {
         "type": "Transitive",
@@ -219,10 +219,10 @@
           "YamlDotNet": "18.1.0"
         }
       },
-      "Aspire.Hosting.Orchestration.osx-arm64": {
+      "Aspire.Hosting.Orchestration.linux-x64": {
         "type": "Transitive",
         "resolved": "13.6.3",
-        "contentHash": "HMFdYvr/5nX6IJs27GuHHfgJkFqYu0sNn4PCC2DE8KW/O+FqRhZXnvQmrb0Mfe7OwHFplVOtOoFitrZyyQGHMQ=="
+        "contentHash": "rHwee2QgN1rCfIHAZVX1LOfHexZB5eEEZSCNVxpbt9EvIlxmUaOwncxMcamOGvGyThdf1qLHLEoAPwtOqPME9g=="
       },
       "Aspire.Hosting.Redis": {
         "type": "Transitive",
@@ -1306,8 +1306,8 @@
       },
       "MSTest.Analyzers": {
         "type": "Transitive",
-        "resolved": "4.5.1",
-        "contentHash": "oa0w2QC/T3U+ulUn38AmbWE/wnEMtqSFRb2z277z5SpswqNc/ySWcAVlG1qEWUxzm+NztCjkoeLAn/83gIx3ug=="
+        "resolved": "4.5.2",
+        "contentHash": "t6Dj9AmWO9IfkMBi3yYTf7bfgSTAetsi4LFA3xGdKbJ+gBbSDqbo41U5vYiW9puD8UGl2elsizNeJVYtwNim0Q=="
       },
       "Nerdbank.MessagePack": {
         "type": "Transitive",
@@ -1712,9 +1712,9 @@
       "bridgebeats.apphost": {
         "type": "Project",
         "dependencies": {
-          "Aspire.Dashboard.Sdk.osx-arm64": "[13.6.3, )",
+          "Aspire.Dashboard.Sdk.linux-x64": "[13.6.3, )",
           "Aspire.Hosting.AppHost": "[13.6.3, )",
-          "Aspire.Hosting.Orchestration.osx-arm64": "[13.6.3, )",
+          "Aspire.Hosting.Orchestration.linux-x64": "[13.6.3, )",
           "Aspire.Hosting.Redis": "[13.6.3, )",
           "MessagePack": "[3.1.12, )"
         }

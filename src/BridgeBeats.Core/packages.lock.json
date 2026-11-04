@@ -4,9 +4,9 @@
     "net10.0": {
       "Aspire.StackExchange.Redis": {
         "type": "Direct",
-        "requested": "[13.6.3, )",
-        "resolved": "13.6.3",
-        "contentHash": "bo+my2TjEu1mAcGmepDqIcg+5PnU/qalQQoc5TI48Vzpq+EXxoZ5CyJ2tS/e04I6RktVZIddYUGB3t9DRerMvw==",
+        "requested": "[13.6.4, )",
+        "resolved": "13.6.4",
+        "contentHash": "DvCqdDJxkQWsMxSWklp4d0b8DvcZtNj0d+Bt+h6mqrS2pB887V+ZeX3fUKA3EuSW/ghpC9yrNMa93ZxBqGHzvA==",
         "dependencies": {
           "AspNetCore.HealthChecks.Redis": "9.0.0",
           "Microsoft.Extensions.DependencyInjection.AutoActivation": "10.10.0",

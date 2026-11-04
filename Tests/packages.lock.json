@@ -4,13 +4,13 @@
     "net10.0": {
       "Aspire.Hosting.Testing": {
         "type": "Direct",
-        "requested": "[13.6.3, )",
-        "resolved": "13.6.3",
-        "contentHash": "97THsqcXxSsWZOBhscGrFrnL6uKjiEUooJ2OYlIQXdpqmV70DaNGV+QlSdnUMbXowF4/9W3drsKcwQPwtGaEfw==",
+        "requested": "[13.6.4, )",
+        "resolved": "13.6.4",
+        "contentHash": "9uRiuuhVYZw6FC86fm/aDlDubZM/+kFi4ij3pcm9E4mEFcv+sm2EVB2x6HRy0xi7ZJB4+tA9LBswHsjzYaep2g==",
         "dependencies": {
           "AspNetCore.HealthChecks.Uris": "9.0.0",
-          "Aspire.Hosting": "13.6.3",
-          "Aspire.Hosting.AppHost": "13.6.3",
+          "Aspire.Hosting": "13.6.4",
+          "Aspire.Hosting.AppHost": "13.6.4",
           "Google.Protobuf": "3.36.1",
           "Grpc.AspNetCore": "2.83.0",
           "Grpc.Net.ClientFactory": "2.83.0",
@@ -139,15 +139,15 @@
           "Testcontainers": "4.16.0"
         }
       },
-      "Aspire.Dashboard.Sdk.osx-arm64": {
+      "Aspire.Dashboard.Sdk.linux-x64": {
         "type": "Transitive",
-        "resolved": "13.6.3",
-        "contentHash": "512UoSTvgL1Ig5lpEkHJeOnBTzIe6SvIFAvxADHzH7PzBdhguLcqQm4av8/g/efw5QjXV3nvqMCbsE2mK6t49A=="
+        "resolved": "13.6.4",
+        "contentHash": "BjJNFnK20CVhdI6DBOsrdeCzW9TkzwS1gkohWRDdzZVuSrIjA9vV556n9q0n/W0NlWZnwv2ncTLqL+DOYUqYHA=="
       },
       "Aspire.Hosting": {
         "type": "Transitive",
-        "resolved": "13.6.3",
-        "contentHash": "CKPYA+DScm85BbnADc9yVmdiBmfrYdbeXkWm5ooLZLPVYv3txAyuypNi9ExJVIskxdKBtkNX4hDGIkr7j4olkQ==",
+        "resolved": "13.6.4",
+        "contentHash": "B9H7ttsmjUB+6dbkPTZ6yck25+RRj7gAGWRlqPbeWnn1FtoENET3QFgx8NZ8McFzTzSyPcmgy7OmsaYepEJ3GQ==",
         "dependencies": {
           "AspNetCore.HealthChecks.Uris": "9.0.0",
           "Google.Protobuf": "3.36.1",
@@ -183,11 +183,11 @@
       },
       "Aspire.Hosting.AppHost": {
         "type": "Transitive",
-        "resolved": "13.6.3",
-        "contentHash": "93mUttjq+jQab2xKtgVFfdtZ18xx0sZGctWD/WzwJsdDntCfYQypzQgYy9aLAzB3T7/PLYzw4PxjH0th+StcXQ==",
+        "resolved": "13.6.4",
+        "contentHash": "bHDwJmvFRVsOTFhgaIUDIQO8Qqq22ZcnUfDflTiaq95rDBBiNjattsAATkwpHDp6/JuKHF0dBB/nF22V0/rUtA==",
         "dependencies": {
           "AspNetCore.HealthChecks.Uris": "9.0.0",
-          "Aspire.Hosting": "13.6.3",
+          "Aspire.Hosting": "13.6.4",
           "Google.Protobuf": "3.36.1",
           "Grpc.AspNetCore": "2.83.0",
           "Grpc.Net.ClientFactory": "2.83.0",
@@ -219,19 +219,19 @@
           "YamlDotNet": "18.1.0"
         }
       },
-      "Aspire.Hosting.Orchestration.osx-arm64": {
+      "Aspire.Hosting.Orchestration.linux-x64": {
         "type": "Transitive",
-        "resolved": "13.6.3",
-        "contentHash": "HMFdYvr/5nX6IJs27GuHHfgJkFqYu0sNn4PCC2DE8KW/O+FqRhZXnvQmrb0Mfe7OwHFplVOtOoFitrZyyQGHMQ=="
+        "resolved": "13.6.4",
+        "contentHash": "tAdGnGqpJ/rZUlPW6977cYOXhgfGhElOsZ6bIRNc1MAHsgOJoaZHZj/AwpgDuHNCmsrK17UjgL+GtmD8Lj5lCQ=="
       },
       "Aspire.Hosting.Redis": {
         "type": "Transitive",
-        "resolved": "13.6.3",
-        "contentHash": "QEOeHvY9YqcBWQKsojEib3NxiP4hIjVTH68jp/R5e4jnxBPyrpegu5cjrfJWH9BSEtBSfIRUgbPJ1gVrNRtd2g==",
+        "resolved": "13.6.4",
+        "contentHash": "KQ+8JaTulWTdIuUmEju3VQVTUeYb6Q5LzfC5NLGKuqvSh4orRX/vCH9kRGV66Y+YUwrui+Gf67KD1Ad0iYSaiw==",
         "dependencies": {
           "AspNetCore.HealthChecks.Redis": "9.0.0",
           "AspNetCore.HealthChecks.Uris": "9.0.0",
-          "Aspire.Hosting": "13.6.3",
+          "Aspire.Hosting": "13.6.4",
           "Google.Protobuf": "3.36.1",
           "Grpc.AspNetCore": "2.83.0",
           "Grpc.Net.ClientFactory": "2.83.0",
@@ -1712,10 +1712,10 @@
       "bridgebeats.apphost": {
         "type": "Project",
         "dependencies": {
-          "Aspire.Dashboard.Sdk.osx-arm64": "[13.6.3, )",
-          "Aspire.Hosting.AppHost": "[13.6.3, )",
-          "Aspire.Hosting.Orchestration.osx-arm64": "[13.6.3, )",
-          "Aspire.Hosting.Redis": "[13.6.3, )",
+          "Aspire.Dashboard.Sdk.linux-x64": "[13.6.4, )",
+          "Aspire.Hosting.AppHost": "[13.6.4, )",
+          "Aspire.Hosting.Orchestration.linux-x64": "[13.6.4, )",
+          "Aspire.Hosting.Redis": "[13.6.4, )",
           "MessagePack": "[3.1.12, )"
         }
       },

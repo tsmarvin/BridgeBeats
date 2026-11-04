@@ -21,8 +21,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Aspire.Hosting.AppHost" Version="13.6.3" />
-    <PackageReference Include="Aspire.Hosting.Redis" Version="13.6.3" />
+    <PackageReference Include="Aspire.Hosting.AppHost" Version="13.6.4" />
+    <PackageReference Include="Aspire.Hosting.Redis" Version="13.6.4" />
     <PackageReference Include="MessagePack" Version="3.1.12" />
 
     <ProjectReference Include="..\BridgeBeats.Web\BridgeBeats.Web.csproj" />

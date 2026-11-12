@@ -2,11 +2,11 @@
   "version": 1,
   "dependencies": {
     "net10.0": {
-      "Aspire.Dashboard.Sdk.osx-arm64": {
+      "Aspire.Dashboard.Sdk.linux-x64": {
         "type": "Direct",
-        "requested": "[13.6.3, )",
-        "resolved": "13.6.3",
-        "contentHash": "512UoSTvgL1Ig5lpEkHJeOnBTzIe6SvIFAvxADHzH7PzBdhguLcqQm4av8/g/efw5QjXV3nvqMCbsE2mK6t49A=="
+        "requested": "[13.6.5, )",
+        "resolved": "13.6.5",
+        "contentHash": "5AbO2pEYAqkC757VKj/89ie16jF3K8tpQHBYlNJKZBVLQTUQVd951/Q3VnU1x3UkXVyxb7zR7el/iRtQMyJXEw=="
       },
       "Aspire.Hosting.AppHost": {
         "type": "Direct",
@@ -47,11 +47,11 @@
           "YamlDotNet": "18.1.0"
         }
       },
-      "Aspire.Hosting.Orchestration.osx-arm64": {
+      "Aspire.Hosting.Orchestration.linux-x64": {
         "type": "Direct",
         "requested": "[13.6.3, )",
         "resolved": "13.6.3",
-        "contentHash": "HMFdYvr/5nX6IJs27GuHHfgJkFqYu0sNn4PCC2DE8KW/O+FqRhZXnvQmrb0Mfe7OwHFplVOtOoFitrZyyQGHMQ=="
+        "contentHash": "rHwee2QgN1rCfIHAZVX1LOfHexZB5eEEZSCNVxpbt9EvIlxmUaOwncxMcamOGvGyThdf1qLHLEoAPwtOqPME9g=="
       },
       "Aspire.Hosting.Redis": {
         "type": "Direct",
@@ -107,9 +107,9 @@
       },
       "Microsoft.NET.ILLink.Tasks": {
         "type": "Direct",
-        "requested": "[10.0.12, )",
-        "resolved": "10.0.12",
-        "contentHash": "rdn7VmM4sDDZz7tXO7/tPtvR+QByJrhPKT5F2CUcK7ECvXZEf4j0GxdvVpsiX6thBYnYmXOaZBDC2zPzq0S7nw=="
+        "requested": "[10.0.11, )",
+        "resolved": "10.0.11",
+        "contentHash": "IBf7lbovvjGWVWXZX5cJ/cO0WXbId0Zq4BuSeT94mGZuOAP66oMeH9PTBZ9Jpp3Jb6jtK0qm/NyUbPRo1gC/wQ=="
       },
       "Aspire.Hosting": {
         "type": "Transitive",
@@ -774,7 +774,7 @@
         "contentHash": "5K+9KFg2TdTl7VXv88Qzi/0lqK6JFoNP3lRuImPYGRV7K/QYklDyTrj4+A+KAki1JsQi6qKY+hDyY7d6WRqjrw=="
       }
     },
-    "net10.0/osx-arm64": {
+    "net10.0/linux-x64": {
       "Hex1b": {
         "type": "Transitive",
         "resolved": "0.168.0",

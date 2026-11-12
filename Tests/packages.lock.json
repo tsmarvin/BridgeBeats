@@ -139,10 +139,10 @@
           "Testcontainers": "4.16.0"
         }
       },
-      "Aspire.Dashboard.Sdk.osx-arm64": {
+      "Aspire.Dashboard.Sdk.linux-x64": {
         "type": "Transitive",
-        "resolved": "13.6.3",
-        "contentHash": "512UoSTvgL1Ig5lpEkHJeOnBTzIe6SvIFAvxADHzH7PzBdhguLcqQm4av8/g/efw5QjXV3nvqMCbsE2mK6t49A=="
+        "resolved": "13.6.5",
+        "contentHash": "5AbO2pEYAqkC757VKj/89ie16jF3K8tpQHBYlNJKZBVLQTUQVd951/Q3VnU1x3UkXVyxb7zR7el/iRtQMyJXEw=="
       },
       "Aspire.Hosting": {
         "type": "Transitive",
@@ -219,10 +219,10 @@
           "YamlDotNet": "18.1.0"
         }
       },
-      "Aspire.Hosting.Orchestration.osx-arm64": {
+      "Aspire.Hosting.Orchestration.linux-x64": {
         "type": "Transitive",
         "resolved": "13.6.3",
-        "contentHash": "HMFdYvr/5nX6IJs27GuHHfgJkFqYu0sNn4PCC2DE8KW/O+FqRhZXnvQmrb0Mfe7OwHFplVOtOoFitrZyyQGHMQ=="
+        "contentHash": "rHwee2QgN1rCfIHAZVX1LOfHexZB5eEEZSCNVxpbt9EvIlxmUaOwncxMcamOGvGyThdf1qLHLEoAPwtOqPME9g=="
       },
       "Aspire.Hosting.Redis": {
         "type": "Transitive",
@@ -1712,9 +1712,9 @@
       "bridgebeats.apphost": {
         "type": "Project",
         "dependencies": {
-          "Aspire.Dashboard.Sdk.osx-arm64": "[13.6.3, )",
+          "Aspire.Dashboard.Sdk.linux-x64": "[13.6.5, )",
           "Aspire.Hosting.AppHost": "[13.6.3, )",
-          "Aspire.Hosting.Orchestration.osx-arm64": "[13.6.3, )",
+          "Aspire.Hosting.Orchestration.linux-x64": "[13.6.3, )",
           "Aspire.Hosting.Redis": "[13.6.3, )",
           "MessagePack": "[3.1.12, )"
         }

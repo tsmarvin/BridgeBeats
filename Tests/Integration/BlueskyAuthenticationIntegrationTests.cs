@@ -3495,6 +3495,8 @@ public class BlueskyAuthenticationIntegrationTests {
             JsonElement body = await who.Content.ReadFromJsonAsync<JsonElement>( TestContext.CancellationToken );
             Assert.IsFalse( body.GetProperty( "authenticated" ).GetBoolean( ),
                 "The request that observed the corrupt row is unauthenticated, but must not have deleted the replacement." );
+            Assert.IsFalse( HasBlueskyCookieDeletion( who ),
+                "A CAS miss that leaves an active replacement must not delete the reference cookie while the response is still alive." );
         } finally {
             BridgeBeatsIdentityStore.BeforeCorruptCleanupDelete = previousSeam;
         }
@@ -3953,6 +3955,376 @@ public class BlueskyAuthenticationIntegrationTests {
             "The surviving browser rows must be the ticket's session and the replacement's distinct session." );
         Assert.AreEqual( 2, await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" ) );
     }
+
+    /// <summary>
+    /// Holds two cleanup paths at the corrupt-cleanup seam until the test body releases them one at a time.
+    ///
+    /// Nothing here decides which path proceeds: both park until <see cref="ReleaseWinner"/> or
+    /// <see cref="ReleaseLoser"/> is called from the test body, after it has started each request in turn.
+    /// That is what makes the two requests deterministic — the first request is released first and its
+    /// response, row, and stamp assertions complete before the second is released at all.
+    /// </summary>
+    private sealed class OverlappingCorruptCleanup {
+        private readonly TaskCompletionSource _firstObserved = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        private readonly TaskCompletionSource _secondObserved = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        private readonly TaskCompletionSource _winnerReleased = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        private readonly TaskCompletionSource _loserReleased = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        private int _observations;
+
+        /// <summary>Completes when the first cleanup path has read the corrupt blob and reached the seam.</summary>
+        internal Task FirstObserved => _firstObserved.Task;
+
+        /// <summary>Completes when the second cleanup path has read the corrupt blob and reached the seam.</summary>
+        internal Task SecondObserved => _secondObserved.Task;
+
+        /// <summary>The number of cleanup paths that read the corrupt blob and reached the seam.</summary>
+        internal int Observations => Volatile.Read( ref _observations );
+
+        /// <summary>Lets the first path run its delete, browser removal, stamp rotation, and commit.</summary>
+        internal void ReleaseWinner( ) => _winnerReleased.TrySetResult( );
+
+        /// <summary>Lets the second path run its delete attempt.</summary>
+        internal void ReleaseLoser( ) => _loserReleased.TrySetResult( );
+
+        /// <summary>Releases both paths, for a <c>finally</c> where no order matters any more.</summary>
+        internal void ReleaseAll( ) {
+            _ = _winnerReleased.TrySetResult( );
+            _ = _loserReleased.TrySetResult( );
+        }
+
+        /// <summary>
+        /// The hook body. Each invocation records that it reached the seam and then parks, in invocation order,
+        /// until the test body releases it; the first invocation is the request the test starts first.
+        /// </summary>
+        internal Func<Task> Arm( CancellationToken cancellationToken ) => async ( ) => {
+            int observed = Interlocked.Increment( ref _observations );
+            if (observed == 1) {
+                _ = _firstObserved.TrySetResult( );
+                await _winnerReleased.Task.WaitAsync( TimeSpan.FromSeconds( 15 ), cancellationToken );
+            } else if (observed == 2) {
+                _ = _secondObserved.TrySetResult( );
+                await _loserReleased.Task.WaitAsync( TimeSpan.FromSeconds( 15 ), cancellationToken );
+            }
+        };
+    }
+
+    [TestMethod]
+    public async Task OverlappingCorruptCleanup_LoserDeletesItsStaleCookieWithoutRotatingStampAgainOrRevoking( ) {
+        // A valid browser ticket and an active corrupt blob are observed by two independent requests. The
+        // request started first is released first and its cleanup removes the credential and this browser's
+        // rows. Only then is the second request released, so its cleanup meets a committed removal: it must
+        // clear its own stale cookie and must not rotate the concurrency stamp again or revoke anything.
+        string sessionId = Guid.NewGuid( ).ToString( "N" );
+        (string userId, string securityStamp) = await SeedLinkedAccountAndBrowserAsync( sessionId );
+        string? securityStampBefore = await CurrentStampAsync( "SecurityStamp" );
+        string? stampBeforeCleanup = await CurrentStampAsync( "ConcurrencyStamp" );
+        await SeedCorruptCredentialAsync( [0xAA, 0xBB, 0xCC, 0xDD, 0xEE] );
+
+        AuthenticationTicket ticket = BuildTicketForDid( DidValue, sessionId, userId, securityStamp );
+        // Each request carries its own copy of the reference cookie: the client's default headers are shared,
+        // so it must not be mutated while both requests are in flight.
+        string cookie = BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket );
+        Func<Task>? previousSeam = BridgeBeatsIdentityStore.BeforeCorruptCleanupDelete;
+        OverlappingCorruptCleanup? overlap = null;
+        Task<HttpResponseMessage>? winnerRequest = null;
+        Task<HttpResponseMessage>? loserRequest = null;
+        HttpResponseMessage? winner = null;
+        HttpResponseMessage? loser = null;
+        try {
+            overlap = new OverlappingCorruptCleanup( );
+            BridgeBeatsIdentityStore.BeforeCorruptCleanupDelete = overlap.Arm( TestContext.CancellationToken );
+            using HttpRequestMessage winnerMessage = new( HttpMethod.Get, "/test/who" );
+            winnerMessage.Headers.Add( "Cookie", cookie );
+            winnerRequest = _client.SendAsync( winnerMessage, TestContext.CancellationToken );
+            await overlap.FirstObserved.WaitAsync( TimeSpan.FromSeconds( 15 ), TestContext.CancellationToken );
+            using HttpRequestMessage loserMessage = new( HttpMethod.Get, "/test/who" );
+            loserMessage.Headers.Add( "Cookie", cookie );
+            loserRequest = _client.SendAsync( loserMessage, TestContext.CancellationToken );
+            await overlap.SecondObserved.WaitAsync( TimeSpan.FromSeconds( 15 ), TestContext.CancellationToken );
+            Assert.AreEqual( 2, overlap.Observations,
+                "Both requests must have read the corrupt blob before either cleanup deleted it." );
+
+            // The first request's cleanup was held before it opened its writer, so the row is still there and the
+            // stamp it captured is the stamp the loser would have to rotate if it did not find the removal.
+            Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+                "Neither cleanup may have deleted the corrupt row yet." );
+            Assert.AreEqual( stampBeforeCleanup, await CurrentStampAsync( "ConcurrencyStamp" ),
+                "Neither cleanup may have rotated the stamp yet." );
+
+            overlap.ReleaseWinner( );
+            winner = await winnerRequest.WaitAsync( TimeSpan.FromSeconds( 15 ), TestContext.CancellationToken );
+            JsonElement winnerBody = await winner.Content.ReadFromJsonAsync<JsonElement>( TestContext.CancellationToken );
+            Assert.IsFalse( winnerBody.GetProperty( "authenticated" ).GetBoolean( ) );
+            Assert.IsTrue( HasBlueskyCookieDeletion( winner ),
+                "The winning cleanup must delete the reference cookie." );
+            Assert.AreEqual( 0, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+                "The winning cleanup must commit the corrupt row removal." );
+            Assert.AreEqual( 0, await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" ) );
+            string? stampAfterWinner = await CurrentStampAsync( "ConcurrencyStamp" );
+            Assert.AreNotEqual( stampBeforeCleanup, stampAfterWinner,
+                "The winner deleted the row, so it must rotate the concurrency stamp." );
+
+            // Released only now, after the winner's removal is committed: the loser's delete can only miss.
+            overlap.ReleaseLoser( );
+            loser = await loserRequest.WaitAsync( TimeSpan.FromSeconds( 15 ), TestContext.CancellationToken );
+            JsonElement loserBody = await loser.Content.ReadFromJsonAsync<JsonElement>( TestContext.CancellationToken );
+            Assert.IsFalse( loserBody.GetProperty( "authenticated" ).GetBoolean( ) );
+            Assert.IsTrue( HasBlueskyCookieDeletion( loser ),
+                "An overlapping cleanup that found no active credential must delete its own stale reference cookie." );
+            Assert.AreEqual( stampAfterWinner, await CurrentStampAsync( "ConcurrencyStamp" ),
+                "The loser's delete missed, so it must not rotate the concurrency stamp a second time." );
+            Assert.AreEqual( 0, _oauth.Revocations, "No cleanup path may revoke a corrupt credential." );
+            Assert.AreEqual( securityStampBefore, await CurrentStampAsync( "SecurityStamp" ),
+                "Cleanup must not rotate the security stamp." );
+        } finally {
+            overlap?.ReleaseAll( );
+            BridgeBeatsIdentityStore.BeforeCorruptCleanupDelete = previousSeam;
+            await ReleaseOutstandingRequestsAsync( winnerRequest, loserRequest, winner, loser );
+        }
+    }
+
+    [TestMethod]
+    public async Task OverlappingCorruptCleanup_LoserFreshSignInKeepsOneUsableCookieAndReplacementRows( ) {
+        // The same overlap, but the second request finishes by signing in again in the same response. It is
+        // released only after the first request's removal has committed, so its cleanup can only miss. The
+        // cleanup's deletion must not survive next to the fresh cookie, and the replacement rows it stores must
+        // survive.
+        string sessionId = Guid.NewGuid( ).ToString( "N" );
+        (string userId, string securityStamp) = await SeedLinkedAccountAndBrowserAsync( sessionId );
+        await SeedCorruptCredentialAsync( [0x91, 0x92, 0x93] );
+
+        AuthenticationTicket ticket = BuildTicketForDid( DidValue, sessionId, userId, securityStamp );
+        string cookie = BlueskyAuthenticationConfiguration.CookieName + "=" + Options( ).TicketDataFormat.Protect( ticket );
+        Func<Task>? previousSeam = BridgeBeatsIdentityStore.BeforeCorruptCleanupDelete;
+        OverlappingCorruptCleanup? overlap = null;
+        Task<HttpResponseMessage>? winnerRequest = null;
+        Task<HttpResponseMessage>? loserRequest = null;
+        HttpResponseMessage? winner = null;
+        HttpResponseMessage? loser = null;
+        string freshCookie = "unset";
+        try {
+            overlap = new OverlappingCorruptCleanup( );
+            BridgeBeatsIdentityStore.BeforeCorruptCleanupDelete = overlap.Arm( TestContext.CancellationToken );
+            using HttpRequestMessage winnerMessage = new( HttpMethod.Get, "/test/who" );
+            winnerMessage.Headers.Add( "Cookie", cookie );
+            winnerRequest = _client.SendAsync( winnerMessage, TestContext.CancellationToken );
+            await overlap.FirstObserved.WaitAsync( TimeSpan.FromSeconds( 15 ), TestContext.CancellationToken );
+            using HttpRequestMessage loserMessage = new( HttpMethod.Post, "/test/signin" );
+            loserMessage.Headers.Add( "Cookie", cookie );
+            loserRequest = _client.SendAsync( loserMessage, TestContext.CancellationToken );
+            await overlap.SecondObserved.WaitAsync( TimeSpan.FromSeconds( 15 ), TestContext.CancellationToken );
+            Assert.AreEqual( 2, overlap.Observations,
+                "Both requests must have read the corrupt blob before either cleanup deleted it." );
+
+            overlap.ReleaseWinner( );
+            winner = await winnerRequest.WaitAsync( TimeSpan.FromSeconds( 15 ), TestContext.CancellationToken );
+            Assert.AreEqual( 0, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+                "The first request's cleanup must remove the corrupt credential and commit before the second is released." );
+
+            overlap.ReleaseLoser( );
+            loser = await loserRequest.WaitAsync( TimeSpan.FromSeconds( 15 ), TestContext.CancellationToken );
+            Assert.AreEqual( HttpStatusCode.OK, loser.StatusCode,
+                await loser.Content.ReadAsStringAsync( TestContext.CancellationToken ) );
+            string[] blueskyCookies = [.. loser.Headers.GetValues( "Set-Cookie" )
+                .Where( value => value.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=", StringComparison.Ordinal ) )];
+            Assert.HasCount( 1, blueskyCookies,
+                "The fresh sign-in must produce exactly one nondeleted Bluesky cookie." );
+            Assert.IsFalse( blueskyCookies.Single( ).StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=;", StringComparison.Ordinal ) );
+            freshCookie = blueskyCookies.Single( ).Split( ';' )[0];
+
+            Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ),
+                "The fresh sign-in's credential row must survive the overlapping cleanup." );
+            Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "bridgebeats_bluesky_sessions" ),
+                "The fresh sign-in's browser row must survive the overlapping cleanup." );
+        } finally {
+            overlap?.ReleaseAll( );
+            BridgeBeatsIdentityStore.BeforeCorruptCleanupDelete = previousSeam;
+            await ReleaseOutstandingRequestsAsync( winnerRequest, loserRequest, winner, loser );
+        }
+
+        // The replacement cookie is usable on its own, after the response that issued it has been disposed.
+        _ = _client.DefaultRequestHeaders.Remove( "Cookie" );
+        _client.DefaultRequestHeaders.Add( "Cookie", freshCookie );
+        JsonElement who = await _client.GetFromJsonAsync<JsonElement>( "/test/who", TestContext.CancellationToken );
+        Assert.IsTrue( who.GetProperty( "authenticated" ).GetBoolean( ),
+            "The cookie the fresh sign-in issued must authenticate a later request." );
+        Assert.AreEqual( 1, await LinkedBlueskyRowCountAsync( "idunno_bluesky_identities" ) );
+    }
+
+    [TestMethod]
+    public async Task HealthyRead_DoesNotLowerAnExpiryExtendedByAPrecedingBrowserSessionExtension( ) {
+        // A browser-session extension (sliding renewal) raises the credential row's expiry above the plain
+        // entry lifetime. A credential read that runs after that must not write its own shorter expiry back
+        // over it: the read is a floor, never a ceiling.
+        _ = await SignInAsync( );
+        Did did = new( DidValue );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        string sessionId = SessionIdOf( _client.DefaultRequestHeaders.GetValues( "Cookie" ).Single( ) );
+        DateTimeOffset extendedTo = DateTimeOffset.UtcNow.AddDays( 10 );
+        long extendedTicks = extendedTo.UtcTicks;
+
+        Func<IdentityStoreRetrievedContext, Task>? previousOnRetrieved = store.Events.OnRetrieved;
+        long expiryAtRead = 0;
+        byte[] blobAtRead = [ ];
+        bool extended = false;
+        bool callbackRan = false;
+        store.Events.OnRetrieved = async _ => {
+            callbackRan = true;
+            if (extended) { return; }
+            extended = true;
+            // Both snapshots are taken before the extension writes, so the read that completes afterwards is
+            // the only writer that can move either of them.
+            expiryAtRead = await StoredExpiryTicksAsync( );
+            blobAtRead = await StoredBlobAsync( );
+            Assert.IsTrue( await store.ExtendBrowserSessionAsync( did, sessionId, extendedTo, TestContext.CancellationToken ),
+                "The extension must apply to the signed-in browser session." );
+        };
+        try {
+            ClaimsIdentity? identity = await store.GetIdentity( did, TestContext.CancellationToken );
+            Assert.IsTrue( callbackRan, "The retrieval callback must have run for the read to be meaningful." );
+            Assert.IsNotNull( identity, "The credential row is healthy and must be readable." );
+        } finally {
+            store.Events.OnRetrieved = previousOnRetrieved;
+        }
+
+        await AssertBlobEqualsAsync( blobAtRead );
+        Assert.AreEqual( extendedTicks.ToString( CultureInfo.InvariantCulture ),
+            (await StoredExpiryTicksAsync( )).ToString( CultureInfo.InvariantCulture ),
+            "A credential read must not lower the expiry a browser-session extension already raised." );
+        Assert.IsGreaterThan( expiryAtRead, extendedTicks - 1,
+            "The extension must have been the later of the two expiries." );
+    }
+
+    [TestMethod]
+    public async Task HealthyRead_LeavesAConcurrentReplacementRowAndItsExpiryUntouched( ) {
+        // The read observed one active row. Two independent writers can move that row between its read and its
+        // expiry update: different active credentials carrying an earlier expiry, or the row itself expiring.
+        // Its update must leave both alone: the observation it names is gone either way.
+        _ = await SignInAsync( );
+        Did did = new( DidValue );
+        BridgeBeatsIdentityStore store = (BridgeBeatsIdentityStore)Options( ).IdentityStore!;
+        byte[] observedBlob = await StoredBlobAsync( );
+        const string ReplacementRefresh = "concurrent-replacement-refresh";
+        long replacementExpiry = DateTime.UtcNow.AddDays( 3 ).Ticks;
+        byte[] replacementBlob = [ ];
+        bool replaced = false;
+
+        Func<IdentityStoreRetrievedContext, Task>? previousOnRetrieved = store.Events.OnRetrieved;
+        store.Events.OnRetrieved = async _ => {
+            if (replaced) { return; }
+            replaced = true;
+            // Raised between the read of the row and that read's expiry update, so the replacement is fully
+            // committed before the update runs.
+            replacementBlob = SerializeProtectedIdentity(
+                IIdentityStore.BuildClaimsIdentity( CreateCredentials( DateTime.UtcNow.AddHours( 2 ), ReplacementRefresh ) ) );
+            await ReplaceStoredCredentialAsync( replacementBlob, replacementExpiry );
+        };
+        try {
+            ClaimsIdentity? identity = await store.GetIdentity( did, TestContext.CancellationToken );
+            Assert.IsNotNull( identity, "The row observed by the read was healthy and must be readable." );
+        } finally {
+            store.Events.OnRetrieved = previousOnRetrieved;
+        }
+
+        Assert.IsTrue( replaced, "The replacement must have committed while the read was between its read and its write." );
+        Assert.AreNotEqual( Convert.ToHexString( observedBlob ), Convert.ToHexString( replacementBlob ),
+            "The replacement must store different bytes than the read observed." );
+        await AssertBlobEqualsAsync( replacementBlob );
+        Assert.AreEqual( replacementExpiry.ToString( CultureInfo.InvariantCulture ),
+            (await StoredExpiryTicksAsync( )).ToString( CultureInfo.InvariantCulture ),
+            "The read's extension must not write its own expiry over the replacement's." );
+
+        // The same read path, with the observed row expired before its update runs: the update records a
+        // lifetime extension for a live credential only, so the expired row must not be revived by a read.
+        long expiredTicks = DateTime.UtcNow.AddMinutes( -5 ).Ticks;
+        bool expired = false;
+        previousOnRetrieved = store.Events.OnRetrieved;
+        store.Events.OnRetrieved = async _ => {
+            if (expired) { return; }
+            expired = true;
+            await ReplaceStoredCredentialAsync( replacementBlob, expiredTicks );
+        };
+        try {
+            ClaimsIdentity? identity = await store.GetIdentity( did, TestContext.CancellationToken );
+            Assert.IsNotNull( identity, "The read observed the row while it was still active." );
+        } finally {
+            store.Events.OnRetrieved = previousOnRetrieved;
+        }
+
+        Assert.IsTrue( expired, "The row must have expired while the read was between its read and its write." );
+        await AssertBlobEqualsAsync( replacementBlob );
+        Assert.AreEqual( expiredTicks.ToString( CultureInfo.InvariantCulture ),
+            (await StoredExpiryTicksAsync( )).ToString( CultureInfo.InvariantCulture ),
+            "A read must not revive a row that expired before its expiry update ran." );
+    }
+
+    /// <summary>Protects <paramref name="identity"/> exactly as the store stores it.</summary>
+    private byte[] SerializeProtectedIdentity( ClaimsIdentity identity ) {
+        using MemoryStream stream = new( );
+        using (BinaryWriter writer = new( stream, Encoding.UTF8, leaveOpen: true )) {
+            identity.WriteTo( writer );
+        }
+        return Options( ).DataProtectionProvider!
+            .CreateProtector( idunno.Bluesky.AspNet.Authentication.Events.DataProtectingIdentityStoreEvents.ProtectorPurpose )
+            .Protect( stream.ToArray( ) );
+    }
+
+    /// <summary>
+    /// Releases the seam and settles any request still in flight, so a failed assertion cannot leak a request
+    /// (or a parked cleanup) into the rest of the test run.
+    /// </summary>
+    private static async Task ReleaseOutstandingRequestsAsync( Task<HttpResponseMessage>? first,
+        Task<HttpResponseMessage>? second, HttpResponseMessage? firstResponse, HttpResponseMessage? secondResponse ) {
+        firstResponse?.Dispose( );
+        secondResponse?.Dispose( );
+        foreach (Task<HttpResponseMessage>? request in new[] { first, second }) {
+            if (request is null) { continue; }
+            try {
+                using HttpResponseMessage response = await request.WaitAsync( TimeSpan.FromSeconds( 15 ) );
+            } catch (Exception exception) when (exception is OperationCanceledException or TimeoutException or HttpRequestException) {
+            }
+        }
+    }
+
+    /// <summary>
+    /// Seeds <paramref name="corrupt"/> as the active credential row for the linked DID, the shape a
+    /// damaged row has when a read observes it.
+    /// </summary>
+    private async Task SeedCorruptCredentialAsync( byte[] corrupt ) {
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        await using SqliteConnection connection = new( connectionString );
+        await connection.OpenAsync( TestContext.CancellationToken );
+        await using SqliteCommand seed = connection.CreateCommand( );
+        seed.CommandText = """
+                           INSERT INTO "idunno_bluesky_identities" ("Did", "Identity", "ExpiresAtUtcTicks", "ProofKeyHash")
+                           VALUES (@did, @identity, @expires, 'corrupt-proof');
+                           """;
+        _ = seed.Parameters.AddWithValue( "@did", DidValue );
+        _ = seed.Parameters.AddWithValue( "@identity", corrupt );
+        _ = seed.Parameters.AddWithValue( "@expires", DateTime.UtcNow.AddDays( 7 ).Ticks );
+        _ = await seed.ExecuteNonQueryAsync( TestContext.CancellationToken );
+    }
+
+    /// <summary>Overwrites the stored credential row's blob and expiry without going through the store.</summary>
+    private async Task ReplaceStoredCredentialAsync( byte[] identity, long expiresAtUtcTicks ) {
+        string connectionString = $"Data Source={Path.Combine( _directory, "identity.db" )}";
+        await using SqliteConnection connection = new( connectionString );
+        await connection.OpenAsync( TestContext.CancellationToken );
+        await using SqliteCommand replace = connection.CreateCommand( );
+        replace.CommandText = """
+                              UPDATE "idunno_bluesky_identities"
+                              SET "Identity" = @identity, "ExpiresAtUtcTicks" = @expires
+                              WHERE "Did" = @did;
+                              """;
+        _ = replace.Parameters.AddWithValue( "@did", DidValue );
+        _ = replace.Parameters.AddWithValue( "@identity", identity );
+        _ = replace.Parameters.AddWithValue( "@expires", expiresAtUtcTicks );
+        _ = await replace.ExecuteNonQueryAsync( TestContext.CancellationToken );
+    }
+
+    private static bool HasBlueskyCookieDeletion( HttpResponseMessage response ) =>
+        response.Headers.TryGetValues( "Set-Cookie", out IEnumerable<string>? cookies ) &&
+        cookies.Any( value => value.StartsWith( BlueskyAuthenticationConfiguration.CookieName + "=;", StringComparison.Ordinal ) );
 
     private AuthenticationTicket BuildTicketForDid( string did, string sessionId, string userId, string securityStamp ) {
         AuthenticationProperties properties = new( ) {

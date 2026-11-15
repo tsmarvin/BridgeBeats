@@ -139,12 +139,14 @@ internal sealed partial class BridgeBeatsIdentityStore : IIdentityStore {
 
         // A healthy row is extended while it is still unexpired, and the extension is narrowed to the exact
         // blob this read observed so a replacement stored concurrently is never overwritten by an older read.
+        // It is also a floor, not a ceiling: a browser-session extension may already have raised the row's
+        // expiry past the read's own lifetime, and this write must not shorten what is already stored.
         await using (SqliteConnection connection = new( _connectionString )) {
             await connection.OpenAsync( cancellationToken );
             await using SqliteCommand extend = connection.CreateCommand( );
             extend.CommandText = """
                                  UPDATE "idunno_bluesky_identities"
-                                 SET "ExpiresAtUtcTicks" = @expires
+                                 SET "ExpiresAtUtcTicks" = MAX("ExpiresAtUtcTicks", @expires)
                                  WHERE "Did" = @did AND "Identity" = @observed AND "ExpiresAtUtcTicks" > @now;
                                  """;
             extend.Parameters.Add( "@did", SqliteType.Text ).Value = didValue;
@@ -222,7 +224,9 @@ internal sealed partial class BridgeBeatsIdentityStore : IIdentityStore {
     /// <summary>
     /// Deletes one corrupt credential row by the exact blob this read observed, then removes its browser rows
     /// and rotates the local account's concurrency stamp. A concurrent replacement committed before this write
-    /// leaves the CAS unmatched, so no other row, stamp, or cookie outcome is touched.
+    /// leaves the CAS unmatched, so no other row or stamp is touched. A request that arrives too late to delete
+    /// anything (an overlapping cleanup already removed the rows) still publishes the browser-bound outcome
+    /// while no active credential remains, so its stale reference cookie cannot outlive this request.
     /// </summary>
     private async Task CleanupCorruptAsync( Did did, string didValue, byte[] observed, CancellationToken cancellationToken ) {
         CleanupOutcome? outcome = null;
@@ -252,8 +256,12 @@ internal sealed partial class BridgeBeatsIdentityStore : IIdentityStore {
                 }
                 await UpdateConcurrencyStampAsync( connection, transaction, did, cancellationToken );
             }
+            // The corrupt row is gone for this request either because this delete matched it or because no
+            // active credential remains at all; a row a concurrent sign-in committed in the meantime is an
+            // active credential, and then this request publishes nothing.
+            bool stillNoActiveRow = casMatched || await ActiveRowExistsAsync( connection, transaction, didValue, cancellationToken ) == false;
             await transaction.CommitAsync( cancellationToken );
-            if (casMatched) { outcome = VerifiedCleanupOutcome( didValue ); }
+            if (stillNoActiveRow) { outcome = VerifiedCleanupOutcome( didValue ); }
         } catch (OperationCanceledException) {
             throw;
         } catch (Exception ex) {

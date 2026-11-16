@@ -1,3 +1,5 @@
+@model BridgeBeats.Web.Models.StatisticsPageViewModel
+@using BridgeBeats.Contracts.Constants
 @{
     ViewData["Title"] = "Statistics";
 }
@@ -5,6 +7,65 @@
 <meta http-equiv="refresh" content="30" />
 
 <div class="container py-4">
-    <h1 class="mb-3">Collection Statistics</h1>
-    <p class="text-muted mb-0">Statistics are being generated. This page will refresh automatically.</p>
+    @if (TempData["RefreshNotice"] is string notice)
+    {
+        <div class="alert alert-info alert-dismissible fade show" role="status">
+            @notice
+            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+        </div>
+    }
+
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h1 class="mb-0">Collection Statistics</h1>
+        @if (User.IsInRole( Roles.AspireDashboardAccess ))
+        {
+            <form asp-action="Refresh" method="post" class="d-inline">
+                @Html.AntiForgeryToken()
+                <button type="submit" class="btn btn-outline-secondary btn-sm" title="Refresh statistics">
+                    <i class="bi bi-arrow-clockwise" aria-hidden="true"></i> Refresh
+                </button>
+            </form>
+        }
+    </div>
+
+    @if (Model.LastError is not null)
+    {
+        <div class="alert alert-danger" role="alert">
+            <h4 class="alert-heading">
+                <i class="bi bi-exclamation-triangle-fill" aria-hidden="true"></i>
+                Statistics generation failed
+            </h4>
+            <p class="mb-2">@Model.LastError</p>
+            <p class="mb-0 text-muted">
+                @if (Model.LastErrorTime.HasValue)
+                {
+                    <text>Failed at @Model.LastErrorTime.Value.ToString("yyyy-MM-dd HH:mm:ss") UTC. </text>
+                }
+                Retrying automatically.
+            </p>
+        </div>
+    }
+    else
+    {
+        <p class="text-muted mb-2 d-flex align-items-center gap-2" role="status" aria-live="polite">
+            @if (Model.IsRefreshing)
+            {
+                <span>Statistics are being generated. This page refreshes automatically.</span>
+                <span class="badge bg-info">
+                    <i class="bi bi-arrow-repeat spin" aria-hidden="true"></i> Generating…
+                </span>
+            }
+            else
+            {
+                <span>Statistics have not been generated yet. This page refreshes automatically.</span>
+            }
+        </p>
+
+        @if (Model.NextScheduledRun.HasValue)
+        {
+            <p class="text-muted mb-0">
+                Next scheduled run: @Model.NextScheduledRun.Value.ToString("yyyy-MM-dd HH:mm:ss") UTC
+            </p>
+        }
+    }
 </div>

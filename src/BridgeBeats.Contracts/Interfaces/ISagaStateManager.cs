@@ -1,4 +1,5 @@
 using BridgeBeats.Contracts.Enums;
+using BridgeBeats.Contracts.Exceptions;
 using BridgeBeats.Contracts.Records;
 
 namespace BridgeBeats.Contracts.Interfaces;
@@ -15,6 +16,10 @@ namespace BridgeBeats.Contracts.Interfaces;
 /// id is deterministically derived from the lookup key (see <see cref="GenerateSagaId"/>), so
 /// identical lookups always map to the same saga. Saga state is the <see cref="LookupSagaState"/>
 /// record; result pointers are AT-URIs (<c>at://…</c>).
+/// Instance fencing intentionally remains an explicit string parameter in this pre-v0.1 contract:
+/// the token is a serialized wire/storage value shared by Redis hashes and queued request payloads,
+/// while validation belongs at every public mutation boundary. A wrapper would not remove those
+/// validation or serialization obligations and would substantially widen this interface.
 /// </remarks>
 public interface ISagaStateManager {
     /// <summary>
@@ -52,77 +57,66 @@ public interface ISagaStateManager {
     /// A task whose result is the <see cref="LookupSagaState"/>, or <see langword="null"/> when no
     /// saga exists with the given id or it has expired.
     /// </returns>
+    /// <exception cref="UnreadableSagaStateException">
+    /// Thrown when the saga hash exists but cannot be reconstructed safely, including a missing or
+    /// invalid instance token.
+    /// </exception>
     Task<LookupSagaState?> GetAsync( string sagaId, CancellationToken cancellationToken = default );
 
-    /// <summary>
-    /// Records the outcome of one provider's leg of the saga when a provider lookup completes.
-    /// Each provider's state is stored separately, and the saga's TTL is extended to prevent
-    /// expiration during active processing.
-    /// </summary>
-    /// <param name="sagaId">The saga id to update.</param>
-    /// <param name="state">The per-provider <see cref="ProviderLookupState"/> to store for this leg.</param>
-    /// <param name="cancellationToken">Token used to cancel the operation.</param>
-    /// <returns>A task that completes when the provider state has been stored.</returns>
-    Task UpdateProviderStateAsync(
-        string sagaId,
-        ProviderLookupState state,
-        CancellationToken cancellationToken = default
-    );
+    /// <summary>Updates a provider leg only when the saga instance token still matches.</summary>
+    Task<bool> TryUpdateProviderStateAsync( string sagaId, ProviderLookupState state, string expectedInstanceToken, CancellationToken cancellationToken = default );
 
     /// <summary>
-    /// Records the AT-URI of the saga's partial (in-progress) result record: the first ATProto
-    /// write, holding results from providers that completed before a rate limit, so users can see
-    /// available data while the remaining providers finish.
+    /// Promotes a background/bulk saga to interactive urgency once, fenced to its current instance.
     /// </summary>
+    /// <returns><see langword="true"/> only for the call that performed the promotion.</returns>
+    Task<bool> TryPromoteToInteractiveAsync(
+        string sagaId,
+        string expectedInstanceToken,
+        CancellationToken cancellationToken = default );
+
+    /// <summary>Stores the partial-result AT-URI when the saga instance token still matches.</summary>
     /// <param name="sagaId">The saga id to update.</param>
     /// <param name="uri">The AT-URI (<c>at://…</c>) of the partial result record.</param>
     /// <param name="cancellationToken">Token used to cancel the operation.</param>
-    /// <returns>A task that completes when the partial result URI has been stored.</returns>
-    Task SetPartialResultUriAsync(
-        string sagaId,
-        string uri,
-        CancellationToken cancellationToken = default
-    );
+    /// <param name="expectedInstanceToken">The required saga instance token.</param>
+    /// <returns><see langword="true"/> when the URI was stored; otherwise <see langword="false"/>.</returns>
+    Task<bool> TrySetPartialResultUriAsync( string sagaId, string uri, string expectedInstanceToken, CancellationToken cancellationToken = default );
 
-    /// <summary>
-    /// Records the AT-URI of the saga's final (completed) result record: the final write, which
-    /// replaces any partial result. The saga is fully complete once this URI is set.
-    /// </summary>
+    /// <summary>Stores the final-result AT-URI with token fencing and first-writer-wins semantics.</summary>
     /// <param name="sagaId">The saga id to update.</param>
     /// <param name="uri">The AT-URI (<c>at://…</c>) of the final result record.</param>
     /// <param name="cancellationToken">Token used to cancel the operation.</param>
-    /// <returns>A task that completes when the final result URI has been stored.</returns>
-    Task SetFinalResultUriAsync(
+    /// <param name="expectedInstanceToken">The required saga instance token.</param>
+    /// <returns>The applied, idempotent, conflicting, or instance-mismatch outcome.</returns>
+    Task<SagaFinalResultWriteOutcome> TrySetFinalResultUriAsync(
         string sagaId,
         string uri,
-        CancellationToken cancellationToken = default
-    );
+        string expectedInstanceToken,
+        CancellationToken cancellationToken = default );
 
-    /// <summary>
-    /// Deletes a saga and all its associated provider states, used for cleanup after the final
-    /// result is written and cached, or for manual intervention (for example removing a stuck
-    /// saga).
-    /// </summary>
+    /// <summary>Deletes a saga and its provider states only when its instance token matches.</summary>
     /// <param name="sagaId">The saga id to delete.</param>
     /// <param name="cancellationToken">Token used to cancel the operation.</param>
     /// <returns>
     /// A task whose result is <see langword="true"/> when a saga was deleted, or
     /// <see langword="false"/> when no saga existed with the given id.
     /// </returns>
-    Task<bool> DeleteAsync( string sagaId, CancellationToken cancellationToken = default );
+    /// <param name="expectedInstanceToken">The required saga instance token.</param>
+    Task<bool> TryDeleteAsync( string sagaId, string expectedInstanceToken, CancellationToken cancellationToken = default );
 
     /// <summary>
-    /// Finds sagas whose provider legs are all complete but which were never finalized (no final
-    /// result URI set), for a reconciliation sweep that finishes them. Used by the saga
-    /// coordinator's polling loop as a Pub/Sub fallback.
+    /// Finds completed sagas that still require reconciliation. This includes sagas without a
+    /// final URI and finalized sagas deliberately retained in the pending index until their
+    /// deduplication waiters have been notified.
     /// </summary>
     /// <param name="minimumAge">Only sagas at least this old are returned, to avoid racing in-flight Pub/Sub messages.</param>
     /// <param name="limit">The maximum number of sagas to return per call; defaults to 100.</param>
     /// <param name="cancellationToken">Token used to cancel the operation.</param>
     /// <returns>
-    /// A task whose result is the completed-but-unfinalized sagas; an empty list when none qualify.
+    /// A task whose result is the completed sagas still requiring reconciliation; an empty list when none qualify.
     /// </returns>
-    Task<IReadOnlyList<LookupSagaState>> GetCompletedButUnfinalizedAsync(
+    Task<IReadOnlyList<LookupSagaState>> GetPendingReconciliationAsync(
         TimeSpan minimumAge,
         int limit = 100,
         CancellationToken cancellationToken = default
@@ -146,77 +140,61 @@ public interface ISagaStateManager {
     /// <returns>A task that completes when the saga has been removed from the index.</returns>
     Task RemoveFromPendingIndexAsync( string sagaId, CancellationToken cancellationToken = default );
 
-    /// <summary>
-    /// Sets whether the saga's current result is partial (some providers still pending or
-    /// rate-limited).
-    /// </summary>
+    /// <summary>Sets whether a token-matched saga is partial.</summary>
     /// <param name="sagaId">The saga id to update.</param>
     /// <param name="isPartial"><see langword="true"/> when the result is still partial; <see langword="false"/> when complete.</param>
     /// <param name="cancellationToken">Token used to cancel the operation.</param>
-    /// <returns>A task that completes when the flag has been stored.</returns>
-    Task SetIsPartialAsync( string sagaId, bool isPartial, CancellationToken cancellationToken = default );
+    /// <param name="expectedInstanceToken">The required saga instance token.</param>
+    /// <returns><see langword="true"/> when the flag was stored; otherwise <see langword="false"/>.</returns>
+    Task<bool> TrySetIsPartialAsync( string sagaId, bool isPartial, string expectedInstanceToken, CancellationToken cancellationToken = default );
 
-    /// <summary>
-    /// Records which provider seeded the saga (the provider the originating lookup came from).
-    /// </summary>
+    /// <summary>Initializes provider legs only when the saga instance token still matches.</summary>
+    Task<bool> TryInitializeProviderStatesAsync( string sagaId, IEnumerable<SupportedProviders> providers, string expectedInstanceToken, CancellationToken cancellationToken = default );
+
+    /// <summary>Records the provider that seeded a token-matched saga.</summary>
     /// <param name="sagaId">The saga id to update.</param>
     /// <param name="provider">The initial provider for the saga.</param>
     /// <param name="cancellationToken">Token used to cancel the operation.</param>
-    /// <returns>A task that completes when the initial provider has been stored.</returns>
-    Task SetInitialProviderAsync( string sagaId, SupportedProviders provider, CancellationToken cancellationToken = default );
+    /// <param name="expectedInstanceToken">The required saga instance token.</param>
+    /// <returns><see langword="true"/> when the provider was stored; otherwise <see langword="false"/>.</returns>
+    Task<bool> TrySetInitialProviderAsync( string sagaId, SupportedProviders provider, string expectedInstanceToken, CancellationToken cancellationToken = default );
 
-    /// <summary>
-    /// Records the per-provider rate-limit information currently affecting the saga, for user
-    /// notification.
-    /// </summary>
+    /// <summary>Stores per-provider rate-limit information for a token-matched saga.</summary>
     /// <param name="sagaId">The saga id to update.</param>
     /// <param name="rateLimitInfo">The per-provider <see cref="ProviderRateLimitInfo"/> entries to store.</param>
     /// <param name="cancellationToken">Token used to cancel the operation.</param>
-    /// <returns>A task that completes when the rate-limit information has been stored.</returns>
-    Task SetRateLimitInfoAsync( string sagaId, List<ProviderRateLimitInfo> rateLimitInfo, CancellationToken cancellationToken = default );
+    /// <param name="expectedInstanceToken">The required saga instance token.</param>
+    /// <returns><see langword="true"/> when the information was stored; otherwise <see langword="false"/>.</returns>
+    Task<bool> TrySetRateLimitInfoAsync( string sagaId, List<ProviderRateLimitInfo> rateLimitInfo, string expectedInstanceToken, CancellationToken cancellationToken = default );
 
-    /// <summary>
-    /// Atomically marks the saga's secondary lookups as queued, succeeding only once (set-if-not-
-    /// exists) so the fan-out to secondary providers happens a single time even when both the
-    /// <c>saga:completed</c> and <c>complete:{key}</c> events arrive.
-    /// </summary>
+    /// <summary>Claims token-matched secondary fan-out once using a set-if-absent marker.</summary>
     /// <param name="sagaId">The saga id to mark.</param>
     /// <param name="cancellationToken">Token used to cancel the operation.</param>
     /// <returns>
     /// A task whose result is <see langword="true"/> when this caller set the marker (and should
     /// queue secondaries), or <see langword="false"/> when it was already set by an earlier caller.
     /// </returns>
-    Task<bool> TryMarkSecondariesQueuedAsync( string sagaId, CancellationToken cancellationToken = default );
+    /// <param name="expectedInstanceToken">The required saga instance token.</param>
+    Task<bool> TryMarkSecondariesQueuedAsync( string sagaId, string expectedInstanceToken, CancellationToken cancellationToken = default );
 
-    /// <summary>
-    /// Atomically claims the exclusive right to finalize a saga, succeeding only once
-    /// (set-if-not-exists) so exactly one of the overlapping finalization triggers
-    /// (<c>saga:completed</c>, <c>complete:{key}</c>, the polling sweep) performs the PDS write.
-    /// </summary>
+    /// <summary>Claims token-matched finalization once using a set-if-absent marker.</summary>
     /// <param name="sagaId">The saga id to claim finalization for.</param>
     /// <param name="cancellationToken">Token used to cancel the operation.</param>
     /// <returns>
     /// A task whose result is <see langword="true"/> when this caller acquired the claim (and must
     /// finalize), or <see langword="false"/> when another caller already holds it.
     /// </returns>
-    Task<bool> TryClaimFinalizeAsync( string sagaId, CancellationToken cancellationToken = default );
+    /// <param name="expectedInstanceToken">The required saga instance token.</param>
+    Task<bool> TryClaimFinalizeAsync( string sagaId, string expectedInstanceToken, CancellationToken cancellationToken = default );
 
-    /// <summary>
-    /// Releases a finalize claim previously acquired via <see cref="TryClaimFinalizeAsync"/>,
-    /// so a legitimate retry can re-finalize after a failed PDS write. Must be called only on
-    /// the failure path; a saga that finalized successfully keeps its claim until TTL expiry.
-    /// </summary>
+    /// <summary>Releases a token-matched finalize claim after a pre-durability failure.</summary>
     /// <param name="sagaId">The saga id whose finalize claim should be released.</param>
     /// <param name="cancellationToken">Token used to cancel the operation.</param>
-    /// <returns>A task that completes when the claim has been released.</returns>
-    Task ReleaseFinalizeClaimAsync( string sagaId, CancellationToken cancellationToken = default );
+    /// <param name="expectedInstanceToken">The required saga instance token.</param>
+    /// <returns><see langword="true"/> when the claim was released; otherwise <see langword="false"/>.</returns>
+    Task<bool> TryReleaseFinalizeClaimAsync( string sagaId, string expectedInstanceToken, CancellationToken cancellationToken = default );
 
-    /// <summary>
-    /// Atomically advances the saga's write generation to <paramref name="generation"/> only when
-    /// the stored generation is strictly less than <paramref name="generation"/>. Guards against
-    /// redundant PDS writes: exactly one concurrent handler wins per generation level, so the
-    /// total number of writes is bounded by the number of providers.
-    /// </summary>
+    /// <summary>Advances a token-matched saga's write generation using compare-and-set semantics.</summary>
     /// <param name="sagaId">The saga id to advance.</param>
     /// <param name="generation">The generation to advance to; typically the number of provider results in the combined result.</param>
     /// <param name="cancellationToken">Token used to cancel the operation.</param>
@@ -225,15 +203,12 @@ public interface ISagaStateManager {
     /// must perform the PDS write), or <see langword="false"/> when the stored generation was
     /// already at or above <paramref name="generation"/> and the write should be skipped.
     /// </returns>
-    Task<bool> TryAdvanceWriteGenerationAsync( string sagaId, int generation, CancellationToken cancellationToken = default );
+    /// <param name="expectedInstanceToken">The required saga instance token.</param>
+    Task<bool> TryAdvanceWriteGenerationAsync( string sagaId, int generation, string expectedInstanceToken, CancellationToken cancellationToken = default );
 
     /// <summary>
-    /// Conditionally resets the saga's write generation from <paramref name="advancedTo"/> back to
-    /// <paramref name="priorGeneration"/>, used exclusively on the non-terminal pre-durability PDS
-    /// write failure path so the next retry can re-advance and re-write. The reset is a conditional
-    /// compare-and-set: it only takes effect when the stored generation still equals
-    /// <paramref name="advancedTo"/>, so a concurrent handler that has already advanced further is
-    /// not regressed. Must not be called after a successful write.
+    /// Resets a token-matched saga's write generation after a pre-durability failure, but only when
+    /// the stored value still equals <paramref name="advancedTo"/>.
     /// </summary>
     /// <param name="sagaId">The saga id whose write generation should be reset.</param>
     /// <param name="advancedTo">
@@ -242,18 +217,9 @@ public interface ISagaStateManager {
     /// </param>
     /// <param name="priorGeneration">The generation to restore; typically <c>advancedTo - 1</c>.</param>
     /// <param name="cancellationToken">Token used to cancel the operation.</param>
-    /// <returns>A task that completes when the conditional reset attempt has been made.</returns>
-    Task ResetWriteGenerationAsync( string sagaId, int advancedTo, int priorGeneration, CancellationToken cancellationToken = default );
-
-    /// <summary>
-    /// Seeds the saga with an initial, not-yet-complete provider state for each of the given
-    /// providers at the start of a saga, so the set of providers that must complete is known.
-    /// </summary>
-    /// <param name="sagaId">The saga id to initialize.</param>
-    /// <param name="providers">The set of enabled providers to register provider states for.</param>
-    /// <param name="cancellationToken">Token used to cancel the operation.</param>
-    /// <returns>A task that completes when the provider states have been initialized.</returns>
-    Task InitializeProviderStatesAsync( string sagaId, IEnumerable<SupportedProviders> providers, CancellationToken cancellationToken = default );
+    /// <param name="expectedInstanceToken">The required saga instance token.</param>
+    /// <returns><see langword="true"/> when reset; otherwise <see langword="false"/>.</returns>
+    Task<bool> TryResetWriteGenerationAsync( string sagaId, int advancedTo, int priorGeneration, string expectedInstanceToken, CancellationToken cancellationToken = default );
 
     /// <summary>
     /// Derives a deterministic saga id from a lookup key. The key is upper-cased, hashed with

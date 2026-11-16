@@ -339,14 +339,15 @@ public class RedisMediaLinkCacheTests {
     }
 
     /// <summary>
-    /// Verifies a cached record flagged partial is reported as stale on retrieval even when recent.
+    /// Verifies a recent cached record that represents a provider subset is reported as FRESH.
+    /// Staleness is age-only; partiality is owned by the saga and does not drive cache freshness.
+    /// The sibling test above (aged record) remains the positive control for the stale path.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task CheckRecordFreshness_ReturnsStale_WhenResultIsPartial( ) {
-        // Arrange - a freshly looked-up but PARTIAL result
+    public async Task CheckRecordFreshness_ReturnsFresh_WhenResultIsRecentButSubset( ) {
+        // Arrange — a freshly looked-up result where only Spotify responded
         MediaLinkResult result = CreateTestResult( "PARTIALTEST123", false );
-        result.IsPartial = true;
 
         string recordUri = $"at://{UserDID}/link.bridgebeats.lookup/track:PARTIALTEST123";
 
@@ -360,9 +361,12 @@ public class RedisMediaLinkCacheTests {
         (MediaLinkResult cachedResult, string cachedUri, bool isStale)? lookupResult =
             await _cache.TryGetCachedResultByISRCAsync( "PARTIALTEST123" );
 
-        // Assert
+        // Assert — age-only freshness: a recent subset record must be fresh
         Assert.IsNotNull( lookupResult );
-        Assert.IsTrue( lookupResult.Value.isStale, "Partial results should always be stale-eligible" );
+        Assert.IsFalse(
+            lookupResult.Value.isStale,
+            "A recent subset record must be fresh. Staleness is age-only; partiality does not drive freshness."
+        );
     }
 
     /// <summary>

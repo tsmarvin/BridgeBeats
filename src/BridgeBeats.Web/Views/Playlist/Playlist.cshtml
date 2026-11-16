@@ -20,7 +20,7 @@
 
             <div class="share-dropdown">
                 <button class="share-button" type="button" aria-expanded="false" aria-haspopup="true" title="Share">
-                    <img src="/public/Share_arrow.png" alt="Share" class="share-arrow-icon" />
+                    <img src="~/public/Share_arrow.png" asp-append-version="true" alt="Share" class="share-arrow-icon" />
                 </button>
                 <ul class="dropdown-menu dropdown-menu-end">
                     <li>
@@ -29,7 +29,7 @@
                         </button>
                     </li>
                     <li>
-                        <button class="dropdown-item copy-embed-btn" type="button" data-url="/playlist/@Model.PlaylistId" data-title="@Html.Raw(System.Text.Json.JsonSerializer.Serialize(Model.Title))" data-items="@Model.Items.Count">
+                        <button class="dropdown-item copy-embed-btn" type="button" data-url="/playlist/@Model.PlaylistId" data-title='@Html.Raw(System.Text.Json.JsonSerializer.Serialize(Model.Title, ViewSecurityHelpers.HtmlSafeJsonOptions))' data-items="@Model.Items.Count">
                             <span class="dropdown-icon">🖼️</span> Copy Embed
                         </button>
                     </li>
@@ -57,7 +57,7 @@
                                     </a>
                                     <div class="share-dropdown">
                                         <button class="share-button" type="button" aria-expanded="false" aria-haspopup="true" title="Share">
-                                            <img src="/public/Share_arrow.png" alt="Share" class="share-arrow-icon" />
+                                            <img src="~/public/Share_arrow.png" asp-append-version="true" alt="Share" class="share-arrow-icon" />
                                         </button>
                                         <ul class="dropdown-menu dropdown-menu-end">
                                             <li>
@@ -66,7 +66,7 @@
                                                 </button>
                                             </li>
                                             <li>
-                                                <button class="dropdown-item copy-embed-btn" type="button" data-url="@item.CardUrl" data-title="@Html.Raw(System.Text.Json.JsonSerializer.Serialize(item.Title))">
+                                                <button class="dropdown-item copy-embed-btn" type="button" data-url="@item.CardUrl" data-title='@Html.Raw(System.Text.Json.JsonSerializer.Serialize(item.Title, ViewSecurityHelpers.HtmlSafeJsonOptions))'>
                                                     <span class="dropdown-icon">🖼️</span> Copy Embed
                                                 </button>
                                             </li>
@@ -95,8 +95,8 @@
                             </div>
                             <div class="embed-providers">
                                 @foreach (var provider in item.Result.Results.OrderBy(kv => kv.Key)) {
-                                    <a href="@provider.Value.URL" target="_blank" rel="noopener noreferrer" class="provider-button">
-                                        @provider.Key.GetProviderLogo()
+                                    <a href="@(ViewSecurityHelpers.IsHttpOrHttps(provider.Value.URL) ? provider.Value.URL : "#")" target="_blank" rel="noopener noreferrer" class="provider-button">
+                                        @provider.Key.GetProviderLogo(path => FileVersionProvider.AddFileVersionToPath(Context.Request.PathBase, Url.Content("~" + path)))
                                         <span class="visually-hidden">@provider.Key.GetDescription()</span>
                                     </a>
                                 }

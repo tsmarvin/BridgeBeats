@@ -21,12 +21,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2  # v5.3.0
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73  # v6.1.0
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: '11.0.x'
 
       - name: Restore dependencies
         run: |
@@ -62,7 +62,7 @@ jobs:
 
           # Create appsettings.json for tests (with empty DiscordToken to disable Discord bot in tests)
           # Tests look for src/BridgeBeats.Web/appsettings.json relative to test output dir, so create src/BridgeBeats.Web/ subdir there
-          mkdir -p Tests/bin/Release/net10.0/src/BridgeBeats.Web
+          mkdir -p Tests/bin/Release/net11.0/src/BridgeBeats.Web
           sed -e 's/{NodeNumber}/${{ vars.NODENUMBER || '0' }}/g' \
               -e 's/"{AppleTeamId}"/"${{ secrets.APPLETEAMID }}"/g' \
               -e 's/"{AppleKeyId}"/"${{ secrets.APPLEKEYID }}"/g' \
@@ -78,8 +78,8 @@ jobs:
               -e 's/"{Default_LogLevel}"/"Information"/g' \
               -e 's/"{Hosting_LogLevel}"/"Information"/g' \
               -e 's/"{Allowed_Hosts}"/"*"/g' \
-              src/BridgeBeats.Web/appsettings.transform.json > Tests/bin/Release/net10.0/src/BridgeBeats.Web/appsettings.json
-          cp -f Tests/bin/Release/net10.0/src/BridgeBeats.Web/appsettings.json src/BridgeBeats.Web/appsettings.json
+              src/BridgeBeats.Web/appsettings.transform.json > Tests/bin/Release/net11.0/src/BridgeBeats.Web/appsettings.json
+          cp -f Tests/bin/Release/net11.0/src/BridgeBeats.Web/appsettings.json src/BridgeBeats.Web/appsettings.json
 
       - name: Run Unit Tests
         run: dotnet test Tests/BridgeBeats.Tests.csproj --no-build --configuration Release --filter "FullyQualifiedName~Unit" --logger "trx;LogFileName=unit-test-results.trx" --logger "console;verbosity=detailed"
@@ -111,7 +111,7 @@ jobs:
         run: dotnet test Tests/BridgeBeats.Tests.csproj --no-build --configuration Release --filter "FullyQualifiedName~EndToEnd" --logger "trx;LogFileName=e2e-test-results.trx" --logger "console;verbosity=detailed"
 
       - name: Upload Test Results
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: always()
         with:
           name: test-results

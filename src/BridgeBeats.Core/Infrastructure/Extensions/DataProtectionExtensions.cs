@@ -4,7 +4,7 @@ namespace BridgeBeats.Core.Infrastructure.Extensions {
 
     /// <summary>
     /// Dependency-injection registration helper for the BridgeBeats shared Data Protection
-    /// foundation, used by all three host processes (Web, SagaCoordinator, CacheBootstrap) to
+    /// foundation, used by all three host processes (Web, SagaCoordinator, Maintenance) to
     /// ensure values encrypted in one process can be decrypted in another.
     /// </summary>
     public static class DataProtectionExtensions {
@@ -12,7 +12,7 @@ namespace BridgeBeats.Core.Infrastructure.Extensions {
         /// <summary>
         /// The default filesystem directory for the Data Protection key ring when no explicit path is
         /// configured. Defined once here so that the Web host (<c>AppSettings.DataProtectionKeyPath</c>),
-        /// the SagaCoordinator, and the CacheBootstrap worker all fall back to the same value and a
+        /// the SagaCoordinator, and the Maintenance worker all fall back to the same value and a
         /// future edit cannot desync the cross-process key path.
         /// </summary>
         public const string DefaultKeyPath = "./keys";

@@ -94,8 +94,8 @@ public sealed partial class CachingMediaLinkService(
     /// <see cref="MediaLinkResult"/>, attaching messages that explain a partial outcome. When the
     /// result has no payload but providers are rate-limited, a results-less placeholder carrying
     /// rate-limit messages is returned; when there is no payload and no rate limits, returns
-    /// <see langword="null"/>. When a payload exists and the lookup is partial, it is flagged partial
-    /// and annotated with either per-provider rate-limit messages or a generic "still fetching" note.
+    /// <see langword="null"/>. When a payload exists and the lookup is partial, it is annotated with
+    /// either per-provider rate-limit messages or a generic "still fetching" note.
     /// </summary>
     /// <param name="lookupResult">The orchestrator outcome to translate.</param>
     /// <returns>The annotated result, or <see langword="null"/> when there is nothing to return.</returns>
@@ -123,7 +123,8 @@ public sealed partial class CachingMediaLinkService(
         }
 
         if (lookupResult.IsPartial) {
-            // Keep the DTO honest for downstream consumers (web UI, bot, cache)
+            // IsPartial is API-only response metadata. ATProtoStorageService deliberately omits
+            // it when mapping MediaLinkResult to the persisted PDS record.
             lookupResult.Result.IsPartial = true;
             lookupResult.Result.Messages ??= [];
 

@@ -30,6 +30,7 @@ services:
       - MAX_RECORDS_PER_RUN=${MAX_RECORDS_PER_RUN:-100}
       - IDENTITY_CONNECTION_STRING=${IDENTITY_CONNECTION_STRING:-Data Source=/app/data/bridgebeats.db}
       - RATE_LIMIT_REQUESTS_PER_HOUR=${RATE_LIMIT_REQUESTS_PER_HOUR:-20}
+      - OAUTH_TRUSTED_PROXY_HOST=${OAUTH_TRUSTED_PROXY_HOST-bridgebeats-caddy}
     volumes:
       - ./data/app:/app/data # Persistent data directory (sqlite + Aspire store)
       - ./logs:/app/data/logs # Logs bind-mounted to host for easy access
@@ -60,7 +61,7 @@ services:
           memory: 256M
 
   redis:
-    image: redis:8-alpine
+    image: redis:8.10.3-alpine@sha256:7958cfbb9d152f87dadfbc89f1b0b15938f0b81ff8982feb327476f4911935c3
     container_name: bridgebeats-redis
     restart: unless-stopped
     networks:
@@ -103,7 +104,7 @@ services:
           memory: 64M
 
   bridgebeats-pds:
-    image: ghcr.io/bluesky-social/pds:latest
+    image: ghcr.io/bluesky-social/pds:latest@sha256:8e58b79746da8a0e85698aa7ba9b53e508b94db2021d963653b6d1bfc14889c6
     container_name: bridgebeats-pds
     restart: unless-stopped
     networks:

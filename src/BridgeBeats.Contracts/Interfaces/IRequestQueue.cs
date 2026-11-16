@@ -68,9 +68,8 @@ public interface IRequestQueue<T> where T : class, IQueueableRequest {
     /// </summary>
     /// <param name="messageId">The broker message id of the message to requeue.</param>
     /// <param name="delay">
-    /// Currently <b>ignored</b> by the implementation: the message is re-added to the stream
-    /// immediately regardless of the value supplied. The parameter is present for interface
-    /// compatibility but has no effect today.
+    /// An optional provider eligibility delay. When omitted, implementations may apply their
+    /// ordinary transient-retry schedule and increment retry bookkeeping.
     /// </param>
     /// <param name="cancellationToken">Token used to cancel the operation.</param>
     /// <returns>A task that completes when the message has been requeued.</returns>

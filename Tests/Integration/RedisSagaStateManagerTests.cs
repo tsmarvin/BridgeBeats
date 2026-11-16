@@ -22,6 +22,155 @@ namespace BridgeBeats.Tests.Integration;
 [DoNotParallelize] // Shares Redis saga:* keys with SagaPollingIntegrationTests
 public class RedisSagaStateManagerTests {
 
+    /// <summary>Concurrent first creation returns one authoritative token and core state.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ConcurrentFirstCreate_ReturnsOneAuthoritativeTokenAndCoreState( ) {
+        string sagaId = ISagaStateManager.GenerateSagaId( "isrc:CONCURRENT-FIRST-CREATE" );
+        LookupSagaState[] reads = await Task.WhenAll( Enumerable.Range( 0, 16 ).Select( index =>
+            _sagaManager.GetOrCreateAsync(
+                sagaId,
+                $"isrc:CONCURRENT-FIRST-CREATE-{index}",
+                LookupRequestType.IsrcLookup,
+                $"CONCURRENT-FIRST-CREATE-{index}",
+                index % 2 == 0 ? QueuePriority.Interactive : QueuePriority.Background,
+                TestContext.CancellationToken ) ) );
+
+        string token = reads[0].InstanceToken!;
+        Assert.IsFalse( string.IsNullOrWhiteSpace( token ) );
+        Assert.IsTrue( reads.All( read => read.InstanceToken == token ) );
+        Assert.IsTrue( reads.All( read => read.LookupKey == reads[0].LookupKey ) );
+        Assert.IsTrue( reads.All( read => read.LookupValue == reads[0].LookupValue ) );
+        LookupSagaState persisted = (await _sagaManager.GetAsync( sagaId, TestContext.CancellationToken ))!;
+        Assert.AreEqual( token, persisted.InstanceToken );
+        Assert.AreEqual( reads[0].LookupKey, persisted.LookupKey );
+        Assert.AreEqual( reads[0].LookupValue, persisted.LookupValue );
+    }
+
+    /// <summary>Verifies stale instance tokens cannot mutate a recreated saga.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task StaleInstanceToken_CannotClaimRecreatedSaga( ) {
+        string sagaId = ISagaStateManager.GenerateSagaId("isrc:STALE-TOKEN");
+        LookupSagaState first = await _sagaManager.GetOrCreateAsync(sagaId, "isrc:STALE-TOKEN", LookupRequestType.IsrcLookup, "STALE-TOKEN", cancellationToken: TestContext.CancellationToken);
+        Assert.IsNotNull( first.InstanceToken );
+        Assert.IsTrue( await _sagaManager.DeleteAsync( sagaId, TestContext.CancellationToken ) );
+        LookupSagaState second = await _sagaManager.GetOrCreateAsync(sagaId, "isrc:STALE-TOKEN", LookupRequestType.IsrcLookup, "STALE-TOKEN", cancellationToken: TestContext.CancellationToken);
+        Assert.AreNotEqual( first.InstanceToken, second.InstanceToken );
+        Assert.IsFalse( await _sagaManager.TryClaimFinalizeAsync( sagaId, first.InstanceToken!, TestContext.CancellationToken ) );
+        Assert.IsTrue( await _sagaManager.TryClaimFinalizeAsync( sagaId, second.InstanceToken!, TestContext.CancellationToken ) );
+    }
+
+    /// <summary>Initial-provider writes cannot recreate or mutate a saga after its instance is replaced.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task StaleInstanceToken_CannotSetInitialProviderOnRecreatedSaga( ) {
+        string sagaId = ISagaStateManager.GenerateSagaId( "isrc:STALE-INITIAL-PROVIDER" );
+        LookupSagaState first = await _sagaManager.GetOrCreateAsync(
+            sagaId, "isrc:STALE-INITIAL-PROVIDER", LookupRequestType.IsrcLookup,
+            "STALE-INITIAL-PROVIDER", cancellationToken: TestContext.CancellationToken );
+        Assert.IsNotNull( first.InstanceToken );
+        Assert.IsTrue( await _sagaManager.DeleteAsync( sagaId, TestContext.CancellationToken ) );
+        LookupSagaState second = await _sagaManager.GetOrCreateAsync(
+            sagaId, "isrc:STALE-INITIAL-PROVIDER", LookupRequestType.IsrcLookup,
+            "STALE-INITIAL-PROVIDER", cancellationToken: TestContext.CancellationToken );
+
+        Assert.IsFalse( await _sagaManager.TrySetInitialProviderAsync(
+            sagaId, SupportedProviders.Spotify, first.InstanceToken!, TestContext.CancellationToken ) );
+        Assert.IsTrue( await _sagaManager.TrySetInitialProviderAsync(
+            sagaId, SupportedProviders.AppleMusic, second.InstanceToken!, TestContext.CancellationToken ) );
+        LookupSagaState current = (await _sagaManager.GetAsync( sagaId, TestContext.CancellationToken ))!;
+        Assert.AreEqual( SupportedProviders.AppleMusic, current.InitialProvider );
+    }
+
+    /// <summary>An explicitly stale finalize lease is replaced with a fresh instance and clean provider state.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ExplicitlyStaleFinalizeClaim_IsReplacedWithoutProviderContamination( ) {
+        string sagaId = ISagaStateManager.GenerateSagaId( "isrc:STALE-FINALIZE" );
+        IDatabase db = s_redis!.GetDatabase( );
+        await db.HashSetAsync( $"saga:{sagaId}", [
+            new HashEntry( "lookupKey", "isrc:STALE-FINALIZE" ),
+            new HashEntry( "lookupType", "IsrcLookup" ),
+            new HashEntry( "lookupValue", "STALE-FINALIZE" ),
+            new HashEntry( "finalizeClaimed", "True" ),
+            new HashEntry( "finalizeClaimedAt", DateTimeOffset.UtcNow.AddHours( -1 ).ToUnixTimeMilliseconds( ) ),
+            new HashEntry( "instanceToken", "stale-instance" ) ] );
+        await db.HashSetAsync( $"saga:{sagaId}:provider:Spotify", [
+            new HashEntry( "isComplete", "True" ), new HashEntry( "isSuccess", "True" ),
+            new HashEntry( "resultJson", "stale-result" ), new HashEntry( "completedAt", "" ),
+            new HashEntry( "errorMessage", "" ) ] );
+
+        LookupSagaState replacement = await _sagaManager.GetOrCreateAsync(
+            sagaId, "isrc:STALE-FINALIZE", LookupRequestType.IsrcLookup, "STALE-FINALIZE",
+            cancellationToken: TestContext.CancellationToken );
+
+        Assert.AreNotEqual( "stale-instance", replacement.InstanceToken );
+        Assert.IsEmpty( replacement.ProviderStates );
+        Assert.IsNull( replacement.FinalResultUri );
+    }
+
+    /// <summary>A fresh finalize claim is not mistaken for a leftover during get-or-create.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task FreshFinalizeClaim_IsNotReplaced( ) {
+        string sagaId = ISagaStateManager.GenerateSagaId( "isrc:FRESH-FINALIZE" );
+        IDatabase db = s_redis!.GetDatabase( );
+        await db.HashSetAsync( $"saga:{sagaId}", [
+            new HashEntry( "lookupKey", "isrc:FRESH-FINALIZE" ),
+            new HashEntry( "lookupType", "IsrcLookup" ),
+            new HashEntry( "lookupValue", "FRESH-FINALIZE" ),
+            new HashEntry( "finalizeClaimed", "True" ),
+            new HashEntry( "finalizeClaimedAt", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds( ) ),
+            new HashEntry( "instanceToken", "fresh-instance" ) ] );
+
+        LookupSagaState current = await _sagaManager.GetOrCreateAsync(
+            sagaId, "isrc:FRESH-FINALIZE", LookupRequestType.IsrcLookup, "FRESH-FINALIZE",
+            cancellationToken: TestContext.CancellationToken );
+
+        Assert.AreEqual( "fresh-instance", current.InstanceToken );
+        Assert.AreEqual( "True", (await db.HashGetAsync( $"saga:{sagaId}", "finalizeClaimed" )).ToString( ) );
+    }
+
+    /// <summary>A malformed persisted timestamp follows the typed unreadable-saga path.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task GetAsync_MalformedCreatedAt_ThrowsUnreadableSagaState( ) {
+        string sagaId = ISagaStateManager.GenerateSagaId( "isrc:MALFORMED-TIMESTAMP" );
+        await s_redis!.GetDatabase( ).HashSetAsync( $"saga:{sagaId}", [
+            new HashEntry( "lookupKey", "isrc:MALFORMED-TIMESTAMP" ),
+            new HashEntry( "lookupType", "IsrcLookup" ),
+            new HashEntry( "lookupValue", "MALFORMED-TIMESTAMP" ),
+            new HashEntry( "createdAt", "not-a-timestamp" ),
+            new HashEntry( "instanceToken", "malformed-instance" ) ] );
+
+        _ = await Assert.ThrowsAsync<BridgeBeats.Contracts.Exceptions.UnreadableSagaStateException>(
+            ( ) => _sagaManager.GetAsync( sagaId, TestContext.CancellationToken ) );
+    }
+
+    /// <summary>A finalized saga's durable result URI is never replaced by a later get-or-create.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task FinalizedSaga_GetOrCreate_NeverReplacesFinalResultUri( ) {
+        string sagaId = ISagaStateManager.GenerateSagaId( "isrc:FINALIZED-URI" );
+        IDatabase db = s_redis!.GetDatabase( );
+        await db.HashSetAsync( $"saga:{sagaId}", [
+            new HashEntry( "lookupKey", "isrc:FINALIZED-URI" ),
+            new HashEntry( "lookupType", "IsrcLookup" ),
+            new HashEntry( "lookupValue", "FINALIZED-URI" ),
+            new HashEntry( "finalizeClaimed", "True" ),
+            new HashEntry( "finalizeClaimedAt", DateTimeOffset.UtcNow.AddHours( -1 ).ToUnixTimeMilliseconds( ) ),
+            new HashEntry( "finalResultUri", "at://durable/final" ),
+            new HashEntry( "instanceToken", "final-instance" ) ] );
+
+        LookupSagaState current = await _sagaManager.GetOrCreateAsync(
+            sagaId, "isrc:FINALIZED-URI", LookupRequestType.IsrcLookup, "FINALIZED-URI",
+            cancellationToken: TestContext.CancellationToken );
+
+        Assert.AreEqual( "at://durable/final", current.FinalResultUri );
+        Assert.AreEqual( "final-instance", current.InstanceToken );
+    }
+
     /// <summary>The shared Redis connection used by the saga manager under test.</summary>
     private static IConnectionMultiplexer? s_redis;
 
@@ -307,6 +456,93 @@ public class RedisSagaStateManagerTests {
         Assert.AreEqual( finalUri, saga.FinalResultUri );
     }
 
+    /// <summary>The fenced final URI remains first-writer-wins and is idempotent for the same URI.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task TrySetFinalResultUriAsync_PreservesFirstWriter( ) {
+        string lookupKey = "isrc:FIRSTWRITER0001";
+        string sagaId = ISagaStateManager.GenerateSagaId( lookupKey );
+        LookupSagaState saga = await _sagaManager.GetOrCreateAsync(
+            sagaId, lookupKey, LookupRequestType.IsrcLookup, "FIRSTWRITER0001",
+            cancellationToken: TestContext.CancellationToken );
+
+        SagaFinalResultWriteOutcome first = await _sagaManager.TrySetFinalResultUriAsync(
+            sagaId, "at://did:plc:test/link/first", saga.InstanceToken!, TestContext.CancellationToken );
+        SagaFinalResultWriteOutcome idempotentReplay = await _sagaManager.TrySetFinalResultUriAsync(
+            sagaId, "at://did:plc:test/link/first", saga.InstanceToken!, TestContext.CancellationToken );
+        SagaFinalResultWriteOutcome conflictingWriter = await _sagaManager.TrySetFinalResultUriAsync(
+            sagaId, "at://did:plc:test/link/second", saga.InstanceToken!, TestContext.CancellationToken );
+
+        Assert.AreEqual( SagaFinalResultWriteOutcome.Stored, first );
+        Assert.AreEqual( SagaFinalResultWriteOutcome.Idempotent, idempotentReplay );
+        Assert.AreEqual( SagaFinalResultWriteOutcome.Conflict, conflictingWriter );
+        Assert.AreEqual( "at://did:plc:test/link/first",
+            (await _sagaManager.GetAsync( sagaId, TestContext.CancellationToken ))!.FinalResultUri );
+    }
+
+    /// <summary>Partial-result mutations renew the core hash TTL just like other saga writes.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task PartialResultMutations_RefreshSagaTtl( ) {
+        const string SagaId = "partial-ttl-refresh";
+        LookupSagaState saga = await _sagaManager.GetOrCreateAsync(
+            SagaId, "isrc:PARTIALTTL001", LookupRequestType.IsrcLookup, "PARTIALTTL001",
+            cancellationToken: TestContext.CancellationToken );
+        IDatabase db = s_redis!.GetDatabase( );
+        _ = await db.KeyExpireAsync( $"saga:{SagaId}", TimeSpan.FromSeconds( 2 ) );
+
+        Assert.IsTrue( await _sagaManager.TrySetPartialResultUriAsync(
+            SagaId, "at://did:plc:test/link/partial", saga.InstanceToken!, TestContext.CancellationToken ) );
+        TimeSpan? afterUri = await db.KeyTimeToLiveAsync( $"saga:{SagaId}" );
+        Assert.IsNotNull( afterUri );
+        Assert.IsGreaterThan( TimeSpan.FromMinutes( 50 ), afterUri.Value );
+
+        _ = await db.KeyExpireAsync( $"saga:{SagaId}", TimeSpan.FromSeconds( 2 ) );
+        Assert.IsTrue( await _sagaManager.TrySetIsPartialAsync(
+            SagaId, true, saga.InstanceToken!, TestContext.CancellationToken ) );
+        TimeSpan? afterFlag = await db.KeyTimeToLiveAsync( $"saga:{SagaId}" );
+        Assert.IsNotNull( afterFlag );
+        Assert.IsGreaterThan( TimeSpan.FromMinutes( 50 ), afterFlag.Value );
+    }
+
+    /// <summary>Marker, claim-release, and generation-reset writes all renew the core saga TTL.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task GuardedControlMutations_RefreshSagaTtl( ) {
+        const string SagaId = "guarded-control-ttl-refresh";
+        LookupSagaState saga = await _sagaManager.GetOrCreateAsync(
+            SagaId, "isrc:CONTROLTTL001", LookupRequestType.IsrcLookup, "CONTROLTTL001",
+            cancellationToken: TestContext.CancellationToken );
+        string token = saga.InstanceToken!;
+        IDatabase db = s_redis!.GetDatabase( );
+        string key = $"saga:{SagaId}";
+
+        _ = await db.KeyExpireAsync( key, TimeSpan.FromSeconds( 2 ) );
+        Assert.IsTrue( await _sagaManager.TryMarkSecondariesQueuedAsync(
+            SagaId, token, TestContext.CancellationToken ) );
+        await AssertTtlRenewedAsync( db, key );
+
+        Assert.IsTrue( await _sagaManager.TryClaimFinalizeAsync(
+            SagaId, token, TestContext.CancellationToken ) );
+        _ = await db.KeyExpireAsync( key, TimeSpan.FromSeconds( 2 ) );
+        Assert.IsTrue( await _sagaManager.TryReleaseFinalizeClaimAsync(
+            SagaId, token, TestContext.CancellationToken ) );
+        await AssertTtlRenewedAsync( db, key );
+
+        Assert.IsTrue( await _sagaManager.TryAdvanceWriteGenerationAsync(
+            SagaId, 1, token, TestContext.CancellationToken ) );
+        _ = await db.KeyExpireAsync( key, TimeSpan.FromSeconds( 2 ) );
+        Assert.IsTrue( await _sagaManager.TryResetWriteGenerationAsync(
+            SagaId, 1, 0, token, TestContext.CancellationToken ) );
+        await AssertTtlRenewedAsync( db, key );
+    }
+
+    private static async Task AssertTtlRenewedAsync( IDatabase db, string key ) {
+        TimeSpan? ttl = await db.KeyTimeToLiveAsync( key );
+        Assert.IsNotNull( ttl );
+        Assert.IsGreaterThan( TimeSpan.FromMinutes( 50 ), ttl.Value );
+    }
+
     /// <summary>
     /// Verifies deleting a saga returns true and removes the saga and its provider states so a
     /// subsequent fetch returns null.
@@ -538,7 +774,7 @@ public class RedisSagaStateManagerTests {
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task InitializeProviderStatesAsync_PreservesExistingProviderState( ) {
+    public async Task TryInitializeProviderStatesAsync_PreservesExistingProviderState( ) {
         // Arrange
         string lookupKey = "isrc:USRC12345678";
         string sagaId = ISagaStateManager.GenerateSagaId( lookupKey );
@@ -563,7 +799,7 @@ public class RedisSagaStateManagerTests {
         await _sagaManager.UpdateProviderStateAsync( sagaId, completedState, TestContext.CancellationToken );
 
         // Act - re-initialize including the already-completed provider
-        await _sagaManager.InitializeProviderStatesAsync(
+        await _sagaManager.TryInitializeProviderStatesAsync(
             sagaId,
             [SupportedProviders.Spotify, SupportedProviders.AppleMusic],
             TestContext.CancellationToken

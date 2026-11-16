@@ -1,4 +1,7 @@
+using System.Collections.Concurrent;
+using System.Diagnostics.Metrics;
 using System.Text.Json;
+using BridgeBeats.Contracts.Constants;
 using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Exceptions;
@@ -6,6 +9,8 @@ using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
 using BridgeBeats.Core.Domain.Services.Queue;
 using BridgeBeats.Core.Infrastructure.Logging;
+using BridgeBeats.Core.Infrastructure.Queue;
+using BridgeBeats.Core.Infrastructure.Utilities;
 using Microsoft.Extensions.Logging;
 using Moq;
 using StackExchange.Redis;
@@ -23,6 +28,7 @@ namespace BridgeBeats.Tests.Unit;
 /// interactive-to-background deferral log; and generic-exception retry-then-DLQ semantics.
 /// </summary>
 [TestClass]
+[DoNotParallelize]
 public class QueueProcessorBackgroundServiceTests {
     /// <summary>Mocked Redis multiplexer; returns <see cref="_subscriberMock"/> for pub/sub.</summary>
     private Mock<IConnectionMultiplexer> _redisMock = null!;
@@ -51,6 +57,8 @@ public class QueueProcessorBackgroundServiceTests {
         WriteIndented = false
     };
 
+    private static readonly ConcurrentDictionary<string, (string LookupKey, LookupRequestType LookupType, string LookupValue)> s_requestIdentities = new( );
+
     /// <summary>Builds fresh dependency mocks and wires the subscriber before each test.</summary>
     [TestInitialize]
     public void Initialize( ) {
@@ -61,6 +69,47 @@ public class QueueProcessorBackgroundServiceTests {
         _sagaManagerMock = new Mock<ISagaStateManager>( );
         _lookupServiceMock = new Mock<IMusicLookupService>( );
         _loggerMock = new Mock<ILogger<QueueProcessorBackgroundService>>( );
+
+        _ = _sagaManagerMock.Setup( s => s.GetOrCreateAsync(
+                It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<LookupRequestType>( ), It.IsAny<string>( ),
+                It.IsAny<QueuePriority?>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( string sagaId, string lookupKey, LookupRequestType lookupType, string lookupValue, QueuePriority? priority, CancellationToken _ ) =>
+                new LookupSagaState {
+                    SagaId = sagaId,
+                    LookupKey = lookupKey,
+                    LookupType = lookupType,
+                    LookupValue = lookupValue,
+                    InstanceToken = "test-instance",
+                    OriginPriority = priority ?? QueuePriority.Background
+                } );
+        _ = _sagaManagerMock.Setup( s => s.GetAsync(
+                It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( string sagaId, CancellationToken _ ) => {
+                (string lookupKey, LookupRequestType lookupType, string lookupValue) = s_requestIdentities.GetValueOrDefault(
+                    sagaId, ($"{LookupRequestType.IsrcLookup}:test-value", LookupRequestType.IsrcLookup, "test-value") );
+                return new LookupSagaState {
+                    SagaId = sagaId,
+                    LookupKey = lookupKey,
+                    LookupType = lookupType,
+                    LookupValue = lookupValue,
+                    InstanceToken = "test-instance",
+                    ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                        [TestProvider] = new( TestProvider, false, false, null, null, null )
+                    }
+                };
+            } );
+        _ = _sagaManagerMock.Setup( s => s.TryInitializeProviderStatesAsync(
+                It.IsAny<string>( ), It.IsAny<IEnumerable<SupportedProviders>>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _sagaManagerMock.Setup( s => s.TryUpdateProviderStateAsync(
+                It.IsAny<string>( ), It.IsAny<ProviderLookupState>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _sagaManagerMock.Setup( s => s.TrySetIsPartialAsync(
+                It.IsAny<string>( ), It.IsAny<bool>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _sagaManagerMock.Setup( s => s.TrySetRateLimitInfoAsync(
+                It.IsAny<string>( ), It.IsAny<List<ProviderRateLimitInfo>>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
 
         _ = _redisMock.Setup( r => r.GetSubscriber( It.IsAny<object>( ) ) ).Returns( _subscriberMock.Object );
     }
@@ -218,6 +267,80 @@ public class QueueProcessorBackgroundServiceTests {
         );
     }
 
+    /// <summary>A missing native id falls back to the external id within the same provider leg.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_NativeIdNotFound_UsesExternalIdFallback( ) {
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.SongIdLookup, "stale-native-id" ) with {
+            FallbackLookupType = LookupRequestType.IsrcLookup,
+            FallbackLookupValue = "USRC12345678"
+        };
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+
+        SetupNotRateLimited( );
+        SetupSagaNotComplete( request.SagaId );
+        _ = _lookupServiceMock.Setup( service => service.GetInfoByIDAsync( "stale-native-id", false ) )
+            .ReturnsAsync( (MusicLookupResult?)null );
+        _ = _lookupServiceMock.Setup( service => service.GetInfoByISRCAsync( "USRC12345678" ) )
+            .ReturnsAsync( CreateLookupResult( ) );
+
+        int dequeueCount = 0;
+        _ = _queueMock.Setup( queue => queue.DequeueAsync(
+                It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => dequeueCount++ == 0 ? message : null );
+
+        QueueProcessorBackgroundService service = CreateService( );
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 1200, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        _lookupServiceMock.Verify( lookup => lookup.GetInfoByIDAsync( "stale-native-id", false ), Times.Once );
+        _lookupServiceMock.Verify( lookup => lookup.GetInfoByISRCAsync( "USRC12345678" ), Times.Once );
+        _sagaManagerMock.Verify( manager => manager.TryUpdateProviderStateAsync(
+            request.SagaId,
+            It.Is<ProviderLookupState>( state => state.IsComplete && state.IsSuccess ),
+            It.IsAny<string>( ),
+            It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
+    /// <summary>The stored storefront is applied to both the native attempt and its fallback.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_WithStorefront_UsesStorefrontCapabilityForBothAttempts( ) {
+        Mock<IStorefrontMusicLookupService> storefrontLookup = new( );
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.SongIdLookup, "old-id" ) with {
+            Storefront = "jp",
+            FallbackLookupType = LookupRequestType.IsrcLookup,
+            FallbackLookupValue = "JPABC1234567"
+        };
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+
+        SetupNotRateLimited( );
+        SetupSagaNotComplete( request.SagaId );
+        _ = storefrontLookup.Setup( lookup => lookup.GetInfoByIDAsync( "old-id", false, "jp" ) )
+            .ReturnsAsync( (MusicLookupResult?)null );
+        _ = storefrontLookup.Setup( lookup => lookup.GetInfoByISRCAsync( "JPABC1234567", "jp" ) )
+            .ReturnsAsync( CreateLookupResult( ) );
+
+        int dequeueCount = 0;
+        _ = _queueMock.Setup( queue => queue.DequeueAsync(
+                It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => dequeueCount++ == 0 ? message : null );
+
+        QueueProcessorBackgroundService service = CreateService( storefrontLookup.Object );
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 200, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        storefrontLookup.Verify( lookup => lookup.GetInfoByIDAsync( "old-id", false, "jp" ), Times.Once );
+        storefrontLookup.Verify( lookup => lookup.GetInfoByISRCAsync( "JPABC1234567", "jp" ), Times.Once );
+        storefrontLookup.Verify( lookup => lookup.GetInfoByIDAsync( It.IsAny<string>( ), It.IsAny<bool>( ) ), Times.Never );
+    }
+
     /// <summary>
     /// A request carrying <see cref="QueuePriority.Bulk"/> origin priority forwards that priority to
     /// <c>GetOrCreateAsync</c> so the saga records its origin lane.
@@ -248,17 +371,10 @@ public class QueueProcessorBackgroundServiceTests {
         await service.StopAsync( CancellationToken.None );
 
         // Assert
-        _sagaManagerMock.Verify(
-            s => s.GetOrCreateAsync(
-                request.SagaId,
-                It.IsAny<string>( ),
-                request.LookupType,
-                request.LookupValue,
-                It.Is<QueuePriority?>( p => p == QueuePriority.Bulk ),
-                It.IsAny<CancellationToken>( )
-            ),
-            Times.Once
-        );
+        _sagaManagerMock.Verify( s => s.GetAsync( request.SagaId, It.IsAny<CancellationToken>( ) ), Times.AtLeastOnce );
+        _sagaManagerMock.Verify( s => s.GetOrCreateAsync(
+            It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<LookupRequestType>( ), It.IsAny<string>( ),
+            It.IsAny<QueuePriority?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
     }
 
     /// <summary>
@@ -275,6 +391,7 @@ public class QueueProcessorBackgroundServiceTests {
 
         TimeSpan timeRemaining = TimeSpan.FromSeconds( 30 );
         SetupRateLimited( timeRemaining );
+        SetupSagaNotComplete( request.SagaId );
 
         int callCount = 0;
         _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
@@ -328,17 +445,76 @@ public class QueueProcessorBackgroundServiceTests {
 
         // Assert
         _sagaManagerMock.Verify(
-            s => s.UpdateProviderStateAsync(
+            s => s.TryUpdateProviderStateAsync(
                 request.SagaId,
                 It.Is<ProviderLookupState>( state =>
                     state.Provider == TestProvider &&
                     state.IsComplete &&
                     state.IsSuccess
                 ),
+                It.IsAny<string>( ),
                 It.IsAny<CancellationToken>( )
             ),
             Times.Once
         );
+    }
+
+    /// <summary>Enabling queue metrics changes observations only, never business Redis/queue calls.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task SuccessfulLeg_MetricsListenerOnAndOff_HasIdenticalBusinessCallCounts( ) {
+        SetupNotRateLimited( );
+        SetupLookupSuccess( );
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US1234567890" );
+        SetupSagaNotComplete( request.SagaId );
+        bool deliver = true;
+        _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => {
+                if (!deliver) return null;
+                deliver = false;
+                return CreateMessage( request );
+            } );
+
+        static int Count( Mock mock, string method ) => mock.Invocations.Count( invocation => invocation.Method.Name == method );
+        async Task<(int Gets, int Updates, int Acks, int Enqueues, int Publishes)> RunAsync( bool listen ) {
+            using MeterListener? listener = listen ? new MeterListener( ) : null;
+            if (listener is not null) {
+                listener.InstrumentPublished = ( instrument, consumer ) => {
+                    if (instrument.Meter.Name == QueueMetrics.MeterName
+                        && instrument.Name == "bridgebeats.queue.saga.leg.completed.total") {
+                        consumer.EnableMeasurementEvents( instrument );
+                    }
+                };
+                listener.Start( );
+            }
+            int gets = Count( _sagaManagerMock, nameof( ISagaStateManager.GetAsync ) );
+            int updates = Count( _sagaManagerMock, nameof( ISagaStateManager.TryUpdateProviderStateAsync ) );
+            int acks = Count( _queueMock, nameof( IRequestQueue<QueuedLookupRequest>.AcknowledgeAsync ) );
+            int enqueues = Count( _queueMock, nameof( IRequestQueue<QueuedLookupRequest>.EnqueueAsync ) );
+            int publishes = Count( _subscriberMock, nameof( ISubscriber.PublishAsync ) );
+            deliver = true;
+            QueueProcessorBackgroundService service = CreateService( );
+            using CancellationTokenSource cts = new( );
+            _ = service.StartAsync( cts.Token );
+            await Task.Delay( 200, TestContext.CancellationToken );
+            await cts.CancelAsync( );
+            await service.StopAsync( CancellationToken.None );
+            return (Count( _sagaManagerMock, nameof( ISagaStateManager.GetAsync ) ) - gets,
+                Count( _sagaManagerMock, nameof( ISagaStateManager.TryUpdateProviderStateAsync ) ) - updates,
+                Count( _queueMock, nameof( IRequestQueue<QueuedLookupRequest>.AcknowledgeAsync ) ) - acks,
+                Count( _queueMock, nameof( IRequestQueue<QueuedLookupRequest>.EnqueueAsync ) ) - enqueues,
+                Count( _subscriberMock, nameof( ISubscriber.PublishAsync ) ) - publishes);
+        }
+
+        (int Gets, int Updates, int Acks, int Enqueues, int Publishes) disabled = await RunAsync( false );
+        (int Gets, int Updates, int Acks, int Enqueues, int Publishes) enabled = await RunAsync( true );
+        Assert.AreEqual( disabled.Gets, enabled.Gets );
+        Assert.AreEqual( disabled.Acks, enabled.Acks );
+        Assert.AreEqual( disabled.Enqueues, enabled.Enqueues );
+        Assert.AreEqual( disabled.Publishes, enabled.Publishes );
+        Assert.AreEqual( 1, disabled.Gets );
+        Assert.AreEqual( 1, disabled.Updates );
+        Assert.AreEqual( 1, disabled.Acks );
     }
 
     /// <summary>A successful lookup acknowledges the originating message exactly once.</summary>
@@ -373,19 +549,206 @@ public class QueueProcessorBackgroundServiceTests {
     }
 
     /// <summary>
-    /// When the lookup completes the whole saga, the service publishes the saga id on the
-    /// <c>saga:completed</c> channel.
+    /// An ACK failure after a successful provider-state commit leaves the original delivery
+    /// pending, without retry mutation or DLQ promotion, even at the terminal attempt boundary.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task ProcessMessage_WhenSagaCompletes_ShouldPublishCompletionEvent( ) {
+    public async Task ProcessMessage_AckFailureAfterCommittedSuccess_LeavesPelPendingWithoutRetryMutation( ) {
+        QueueProcessorBackgroundService service = CreateService( );
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "ACK-AFTER-COMMIT" ) with {
+            AttemptCount = LookupConstants.MaxQueueRetryAttempts - 1
+        };
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        SetupNotRateLimited( );
+        SetupLookupSuccess( );
+        SetupSagaNotComplete( request.SagaId );
+        _ = _queueMock.Setup( q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new RedisServerException( "XACK unavailable" ) );
+
+        int dequeueCalls = 0;
+        _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => {
+                _ = Interlocked.Increment( ref dequeueCalls );
+                return message;
+            } );
+
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 250, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        Assert.AreEqual( 1, dequeueCalls, "ACK recovery must not re-run the committed delivery." );
+        _sagaManagerMock.Verify( s => s.TryUpdateProviderStateAsync(
+            request.SagaId,
+            It.Is<ProviderLookupState>( state => state.IsComplete && state.IsSuccess ),
+            It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( q => q.RequeueAsync(
+            message.MessageId, It.IsAny<TimeSpan?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _queueMock.Verify( q => q.EnqueueAsync(
+            It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _queueMock.Verify( q => q.MoveToDlqAsync(
+            message.MessageId, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>
+    /// After an ACK loss, the committed delivery is acknowledged by its control-plane recovery
+    /// loop without a second provider call or terminal retry mutation.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_AckLossThenCompletedChildRedelivery_AcknowledgesWithoutProviderRetry( ) {
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "ACK-CHILD-RECOVERY" ) with {
+            AttemptCount = LookupConstants.MaxQueueRetryAttempts - 1
+        };
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        SetupNotRateLimited( );
+        SetupLookupSuccess( );
+        LookupSagaState initialSaga = new( ) {
+            SagaId = request.SagaId,
+            LookupKey = $"{request.LookupType}:{request.LookupValue}",
+            LookupType = request.LookupType,
+            LookupValue = request.LookupValue,
+            InstanceToken = "test-instance",
+            ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                [TestProvider] = new( TestProvider, false, false, null, null, null )
+            }
+        };
+        LookupSagaState completedChildSaga = initialSaga with {
+            LookupKey = "different-child-root",
+            LookupType = LookupRequestType.UpcLookup,
+            LookupValue = "OTHER-CHILD",
+            ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                [TestProvider] = new( TestProvider, true, true, "{}", DateTimeOffset.UtcNow, null )
+            }
+        };
+        bool committed = false;
+        _ = _sagaManagerMock.Setup( manager => manager.GetAsync( request.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => committed ? completedChildSaga : initialSaga );
+        _ = _sagaManagerMock.Setup( manager => manager.TryUpdateProviderStateAsync(
+                request.SagaId, It.IsAny<ProviderLookupState>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Callback( ( ) => committed = true )
+            .ReturnsAsync( true );
+
+        int ackCalls = 0;
+        TaskCompletionSource<bool> recovered = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        _ = _queueMock.Setup( queue => queue.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ) )
+            .Returns( ( ) => {
+                if (Interlocked.Increment( ref ackCalls ) == 1) {
+                    return Task.FromException( new RedisServerException( "XACK unavailable" ) );
+                }
+                _ = recovered.TrySetResult( true );
+                return Task.CompletedTask;
+            } );
+        int dequeueCalls = 0;
+        _ = _queueMock.Setup( queue => queue.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => Interlocked.Increment( ref dequeueCalls ) == 1 ? message : null );
+
+        QueueProcessorBackgroundService service = CreateService( );
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        _ = await recovered.Task.WaitAsync( TimeSpan.FromSeconds( 5 ), TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        Assert.AreEqual( 2, ackCalls );
+        _lookupServiceMock.Verify( lookup => lookup.GetInfoByISRCAsync( request.LookupValue ), Times.Once );
+        _sagaManagerMock.Verify( manager => manager.TryUpdateProviderStateAsync(
+            request.SagaId, It.IsAny<ProviderLookupState>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( queue => queue.EnqueueAsync(
+            It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _queueMock.Verify( queue => queue.RequeueAsync(
+            message.MessageId, It.IsAny<TimeSpan?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _queueMock.Verify( queue => queue.MoveToDlqAsync(
+            message.MessageId, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>
+    /// If both the initial post-commit ACK and its first scheduled recovery ACK fail, the worker
+    /// retains the active delivery without dequeuing it again or applying retry mutation.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_AckLossThenCompletedChildRecoveryAckLoss_LeavesPelPending( ) {
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "ACK-CHILD-RECOVERY-FAIL" ) with {
+            AttemptCount = LookupConstants.MaxQueueRetryAttempts - 1
+        };
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        SetupNotRateLimited( );
+        SetupLookupSuccess( );
+        LookupSagaState initialSaga = new( ) {
+            SagaId = request.SagaId,
+            LookupKey = $"{request.LookupType}:{request.LookupValue}",
+            LookupType = request.LookupType,
+            LookupValue = request.LookupValue,
+            InstanceToken = "test-instance",
+            ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                [TestProvider] = new( TestProvider, false, false, null, null, null )
+            }
+        };
+        LookupSagaState completedChildSaga = initialSaga with {
+            LookupKey = "different-child-root",
+            LookupType = LookupRequestType.UpcLookup,
+            LookupValue = "OTHER-CHILD",
+            ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                [TestProvider] = new( TestProvider, true, true, "{}", DateTimeOffset.UtcNow, null )
+            }
+        };
+        bool committed = false;
+        _ = _sagaManagerMock.Setup( manager => manager.GetAsync( request.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => committed ? completedChildSaga : initialSaga );
+        _ = _sagaManagerMock.Setup( manager => manager.TryUpdateProviderStateAsync(
+                request.SagaId, It.IsAny<ProviderLookupState>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Callback( ( ) => committed = true )
+            .ReturnsAsync( true );
+
+        int ackCalls = 0;
+        TaskCompletionSource<bool> recoveryAttempted = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        _ = _queueMock.Setup( queue => queue.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ) )
+            .Returns( ( ) => {
+                if (Interlocked.Increment( ref ackCalls ) == 2) {
+                    _ = recoveryAttempted.TrySetResult( true );
+                }
+                return Task.FromException( new RedisServerException( "XACK unavailable" ) );
+            } );
+        int dequeueCalls = 0;
+        _ = _queueMock.Setup( queue => queue.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => Interlocked.Increment( ref dequeueCalls ) <= 2 ? message : null );
+
+        QueueProcessorBackgroundService service = CreateService( );
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        _ = await recoveryAttempted.Task.WaitAsync( TimeSpan.FromSeconds( 5 ), TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        Assert.AreEqual( 2, ackCalls );
+        Assert.AreEqual( 1, dequeueCalls, "ACK recovery must not re-run the committed delivery." );
+        _lookupServiceMock.Verify( lookup => lookup.GetInfoByISRCAsync( request.LookupValue ), Times.Once );
+        _sagaManagerMock.Verify( manager => manager.TryUpdateProviderStateAsync(
+            request.SagaId, It.IsAny<ProviderLookupState>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( queue => queue.EnqueueAsync(
+            It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _queueMock.Verify( queue => queue.RequeueAsync(
+            message.MessageId, It.IsAny<TimeSpan?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _queueMock.Verify( queue => queue.MoveToDlqAsync(
+            message.MessageId, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>
+    /// A redelivered message whose provider leg is already complete is acknowledged idempotently
+    /// without invoking the provider or publishing a duplicate completion event.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_WhenSagaCompletes_ShouldAcknowledgeWithoutDuplicateProcessing( ) {
         // Arrange
         QueueProcessorBackgroundService service = CreateService( );
         QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US1234567890" );
         QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
 
         SetupNotRateLimited( );
-        SetupLookupSuccess( );
         SetupSagaComplete( request.SagaId );
 
         int callCount = 0;
@@ -399,15 +762,12 @@ public class QueueProcessorBackgroundServiceTests {
         await cts.CancelAsync( );
         await service.StopAsync( CancellationToken.None );
 
-        // Assert - Should publish to saga:completed channel
-        _subscriberMock.Verify(
-            s => s.PublishAsync(
-                It.Is<RedisChannel>( c => c.ToString( ) == "saga:completed" ),
-                It.Is<RedisValue>( v => v.ToString( ) == request.SagaId ),
-                It.IsAny<CommandFlags>( )
-            ),
-            Times.Once
-        );
+        _queueMock.Verify( q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _lookupServiceMock.Verify( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ), Times.Never );
+        _sagaManagerMock.Verify( s => s.TryUpdateProviderStateAsync(
+            It.IsAny<string>( ), It.IsAny<ProviderLookupState>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _subscriberMock.Verify( s => s.PublishAsync(
+            It.IsAny<RedisChannel>( ), It.IsAny<RedisValue>( ), It.IsAny<CommandFlags>( ) ), Times.Never );
     }
 
     #endregion
@@ -654,9 +1014,10 @@ public class QueueProcessorBackgroundServiceTests {
         // Discriminator: single-arg URI overload must not be called (only title+artist overload is used)
         _lookupServiceMock.Verify( l => l.GetInfoAsync( It.IsAny<string>( ) ), Times.Never );
         _sagaManagerMock.Verify(
-            s => s.UpdateProviderStateAsync(
+            s => s.TryUpdateProviderStateAsync(
                 request.SagaId,
                 It.Is<ProviderLookupState>( state => state.IsSuccess ),
+                It.IsAny<string>( ),
                 It.IsAny<CancellationToken>( )
             ),
             Times.Once );
@@ -700,9 +1061,10 @@ public class QueueProcessorBackgroundServiceTests {
         // Discriminator: single-arg URI overload must not be called (only title+artist overload is used)
         _lookupServiceMock.Verify( l => l.GetInfoAsync( It.IsAny<string>( ) ), Times.Never );
         _sagaManagerMock.Verify(
-            s => s.UpdateProviderStateAsync(
+            s => s.TryUpdateProviderStateAsync(
                 request.SagaId,
                 It.Is<ProviderLookupState>( state => state.IsSuccess ),
+                It.IsAny<string>( ),
                 It.IsAny<CancellationToken>( )
             ),
             Times.Once );
@@ -733,23 +1095,26 @@ public class QueueProcessorBackgroundServiceTests {
         // Act
         using CancellationTokenSource cts = new( );
         Task serviceTask = service.StartAsync( cts.Token );
-        await Task.Delay( 200, TestContext.CancellationToken );
+        await Task.Delay( 2500, TestContext.CancellationToken );
         await cts.CancelAsync( );
         await service.StopAsync( CancellationToken.None );
 
         // Assert: falls through to error handling — IsSuccess == false, ErrorMessage != null
         _sagaManagerMock.Verify(
-            s => s.UpdateProviderStateAsync(
+            s => s.TryUpdateProviderStateAsync(
                 request.SagaId,
                 It.Is<ProviderLookupState>( state =>
                     !state.IsSuccess &&
                     state.ErrorMessage != null
                 ),
+                It.IsAny<string>( ),
                 It.IsAny<CancellationToken>( )
             ),
             Times.Once );
         // The lookup service is never called
         _lookupServiceMock.Verify( l => l.GetInfoAsync( It.IsAny<string>( ), It.IsAny<string>( ) ), Times.Never );
+        _queueMock.Verify( q => q.MoveToDlqAsync( message.MessageId, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( q => q.EnqueueAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
     }
 
     /// <summary>
@@ -776,18 +1141,19 @@ public class QueueProcessorBackgroundServiceTests {
         // Act
         using CancellationTokenSource cts = new( );
         Task serviceTask = service.StartAsync( cts.Token );
-        await Task.Delay( 200, TestContext.CancellationToken );
+        await Task.Delay( 2500, TestContext.CancellationToken );
         await cts.CancelAsync( );
         await service.StopAsync( CancellationToken.None );
 
         // Assert: falls through to error handling
         _sagaManagerMock.Verify(
-            s => s.UpdateProviderStateAsync(
+            s => s.TryUpdateProviderStateAsync(
                 request.SagaId,
                 It.Is<ProviderLookupState>( state =>
                     !state.IsSuccess &&
                     state.ErrorMessage != null
                 ),
+                It.IsAny<string>( ),
                 It.IsAny<CancellationToken>( )
             ),
             Times.Once );
@@ -812,6 +1178,7 @@ public class QueueProcessorBackgroundServiceTests {
         TimeSpan retryAfter = TimeSpan.FromSeconds( 60 );
 
         SetupNotRateLimited( );
+        SetupSagaNotComplete( request.SagaId );
         _ = _lookupServiceMock.Setup( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
             .ThrowsAsync( new RetryAfterExceededException(
                 retryAfter,
@@ -858,6 +1225,7 @@ public class QueueProcessorBackgroundServiceTests {
         TimeSpan retryAfter = TimeSpan.FromSeconds( 60 );
 
         SetupNotRateLimited( );
+        SetupSagaNotComplete( request.SagaId );
         _ = _lookupServiceMock.Setup( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
             .ThrowsAsync( new RetryAfterExceededException(
                 retryAfter,
@@ -910,6 +1278,7 @@ public class QueueProcessorBackgroundServiceTests {
         TimeSpan retryAfter = TimeSpan.FromSeconds( 60 );
 
         SetupNotRateLimited( );
+        SetupSagaNotComplete( request.SagaId );
         _ = _lookupServiceMock.Setup( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
             .ThrowsAsync( new RetryAfterExceededException(
                 retryAfter,
@@ -931,7 +1300,7 @@ public class QueueProcessorBackgroundServiceTests {
 
         // Assert - Should mark the saga as partial
         _sagaManagerMock.Verify(
-            s => s.SetIsPartialAsync( request.SagaId, true, It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetIsPartialAsync( request.SagaId, true, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
     }
@@ -950,6 +1319,7 @@ public class QueueProcessorBackgroundServiceTests {
         TimeSpan retryAfter = TimeSpan.FromSeconds( 60 );
 
         SetupNotRateLimited( );
+        SetupSagaNotComplete( request.SagaId );
         _ = _lookupServiceMock.Setup( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
             .ThrowsAsync( new RetryAfterExceededException(
                 retryAfter,
@@ -971,13 +1341,14 @@ public class QueueProcessorBackgroundServiceTests {
 
         // Assert - Should record rate limit info with correct provider
         _sagaManagerMock.Verify(
-            s => s.SetRateLimitInfoAsync(
+            s => s.TrySetRateLimitInfoAsync(
                 request.SagaId,
                 It.Is<List<ProviderRateLimitInfo>>( info =>
                     info.Count == 1 &&
                     info[0].Provider == TestProvider &&
                     !string.IsNullOrEmpty( info[0].Endpoint )
                 ),
+                It.IsAny<string>( ),
                 It.IsAny<CancellationToken>( )
             ),
             Times.Once
@@ -1006,9 +1377,10 @@ public class QueueProcessorBackgroundServiceTests {
         );
         LookupSagaState saga = new( ) {
             SagaId = request.SagaId,
-            LookupKey = "test-key",
+            LookupKey = $"{request.LookupType}:{request.LookupValue}",
             LookupType = LookupRequestType.IsrcLookup,
             LookupValue = "US1234567890",
+            InstanceToken = "test-instance",
             ProviderStates = [],
             RateLimitInfo = [existingInfo]
         };
@@ -1037,13 +1409,14 @@ public class QueueProcessorBackgroundServiceTests {
 
         // Assert - Both the existing AppleMusic entry and the new Spotify entry are present
         _sagaManagerMock.Verify(
-            s => s.SetRateLimitInfoAsync(
+            s => s.TrySetRateLimitInfoAsync(
                 request.SagaId,
                 It.Is<List<ProviderRateLimitInfo>>( info =>
                     info.Count == 2 &&
                     info.Any( r => r.Provider == SupportedProviders.AppleMusic ) &&
                     info.Any( r => r.Provider == TestProvider )
                 ),
+                It.IsAny<string>( ),
                 It.IsAny<CancellationToken>( )
             ),
             Times.Once
@@ -1106,7 +1479,7 @@ public class QueueProcessorBackgroundServiceTests {
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task ProcessMessage_WhenRateLimitAndInteractiveOrigin_ShouldStillRequeueAtBackground( ) {
+    public async Task ProcessMessage_WhenRateLimitAndInteractiveOrigin_PreservesInteractiveLane( ) {
         // Arrange
         // [LoggerMessage] source-generated code gates every call with IsEnabled().
         // Without this setup Moq returns false and Log() is never invoked, making
@@ -1117,10 +1490,11 @@ public class QueueProcessorBackgroundServiceTests {
         QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US1234567890" ) with {
             OriginPriority = QueuePriority.Interactive
         };
-        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request ) with { Priority = QueuePriority.Interactive };
         TimeSpan retryAfter = TimeSpan.FromSeconds( 60 );
 
         SetupNotRateLimited( );
+        SetupSagaNotComplete( request.SagaId );
         _ = _lookupServiceMock.Setup( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
             .ThrowsAsync( new RetryAfterExceededException(
                 retryAfter,
@@ -1133,6 +1507,18 @@ public class QueueProcessorBackgroundServiceTests {
         _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( ( ) => callCount++ == 0 ? message : null );
 
+        long interactiveDeferredMeasurements = 0;
+        using MeterListener interactiveMeterListener = new( );
+        interactiveMeterListener.InstrumentPublished = ( instrument, listener ) => {
+            if (instrument.Meter.Name == QueueMetrics.MeterName
+                && instrument.Name == "bridgebeats.ratelimit.interactive_retry.total") {
+                listener.EnableMeasurementEvents( instrument );
+            }
+        };
+        interactiveMeterListener.SetMeasurementEventCallback<long>(
+            ( _, measurement, _, _ ) => Interlocked.Add( ref interactiveDeferredMeasurements, measurement ) );
+        interactiveMeterListener.Start( );
+
         // Act
         using CancellationTokenSource cts = new( );
         Task serviceTask = service.StartAsync( cts.Token );
@@ -1140,7 +1526,7 @@ public class QueueProcessorBackgroundServiceTests {
         await cts.CancelAsync( );
         await service.StopAsync( CancellationToken.None );
 
-        // Assert — acknowledge then requeue at Background (routing unchanged by the observability gate)
+        // Assert — enqueue precedes acknowledgement at Background priority.
         _queueMock.Verify(
             q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ),
             Times.Once
@@ -1151,7 +1537,7 @@ public class QueueProcessorBackgroundServiceTests {
                     r.LookupType == request.LookupType &&
                     r.AttemptCount == request.AttemptCount + 1
                 ),
-                QueuePriority.Background,
+                QueuePriority.Interactive,
                 It.IsAny<CancellationToken>( )
             ),
             Times.Once
@@ -1167,8 +1553,55 @@ public class QueueProcessorBackgroundServiceTests {
                 It.IsAny<It.IsAnyType>( ),
                 It.IsAny<Exception?>( ),
                 It.IsAny<Func<It.IsAnyType, Exception?, string>>( ) ),
-            Times.Once,
-            "LogInteractiveDeferredToBackground (Warning, EventId 3018) must fire once for an Interactive-origin rate-limited request" );
+            Times.Never );
+        Assert.AreEqual( 1L, interactiveDeferredMeasurements );
+    }
+
+    /// <summary>A caught rate-limit replacement failure leaves the original delivery pending.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_WhenRateLimitReplacementEnqueueFails_DoesNotAcknowledge( ) {
+        _ = _loggerMock.Setup( l => l.IsEnabled( It.IsAny<LogLevel>( ) ) ).Returns( true );
+        QueueProcessorBackgroundService service = CreateService( );
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US429-ENQUEUE-FAIL" );
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request ) with { Priority = QueuePriority.Interactive };
+        SetupNotRateLimited( );
+        SetupSagaNotComplete( request.SagaId );
+        _ = _lookupServiceMock.Setup( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
+            .ThrowsAsync( new RetryAfterExceededException(
+                TimeSpan.FromSeconds( 60 ), TimeSpan.FromSeconds( 30 ),
+                new Uri( "https://api.spotify.com/v1/tracks" ), SupportedProviders.Spotify ) );
+        _ = _queueMock.Setup( q => q.EnqueueAsync(
+                It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new RedisServerException( "XADD failed" ) );
+        int calls = 0;
+        _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+
+        long deferredMeasurements = 0;
+        using MeterListener meterListener = new( );
+        meterListener.InstrumentPublished = ( instrument, listener ) => {
+            if (instrument.Meter.Name == QueueMetrics.MeterName
+                && instrument.Name == "bridgebeats.ratelimit.interactive_retry.total") {
+                listener.EnableMeasurementEvents( instrument );
+            }
+        };
+        meterListener.SetMeasurementEventCallback<long>( ( _, measurement, _, _ ) => Interlocked.Add( ref deferredMeasurements, measurement ) );
+        meterListener.Start( );
+
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 300, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        _queueMock.Verify( q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ), Times.Never );
+        _queueMock.Verify( q => q.EnqueueAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _loggerMock.Verify( l => l.Log(
+            LogLevel.Warning,
+            new EventId( LogEventIds.Services.Queue.InteractiveDeferredToBackground ),
+            It.IsAny<It.IsAnyType>( ), It.IsAny<Exception?>( ), It.IsAny<Func<It.IsAnyType, Exception?, string>>( ) ), Times.Never );
+        Assert.AreEqual( 0L, deferredMeasurements );
     }
 
     /// <summary>
@@ -1194,6 +1627,7 @@ public class QueueProcessorBackgroundServiceTests {
         TimeSpan retryAfter = TimeSpan.FromSeconds( 60 );
 
         SetupNotRateLimited( );
+        SetupSagaNotComplete( request.SagaId );
         _ = _lookupServiceMock.Setup( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
             .ThrowsAsync( new RetryAfterExceededException(
                 retryAfter,
@@ -1248,8 +1682,186 @@ public class QueueProcessorBackgroundServiceTests {
 
     #region General Exception Handling Tests
 
+    /// <summary>HTTP 500 remains incomplete and durably enqueues replacement before acknowledgement.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_Http500_RequeuesTransientFailure( ) {
+        QueueProcessorBackgroundService service = CreateService();
+        QueuedLookupRequest request = CreateRequest(LookupRequestType.IsrcLookup, "US500") with { AttemptCount = 1 };
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage(request);
+        SetupNotRateLimited( );
+        _ = _lookupServiceMock.Setup( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
+            .ThrowsAsync( new HttpRequestException( "server", null, System.Net.HttpStatusCode.InternalServerError ) );
+        SetupSagaNotComplete( request.SagaId );
+        int calls = 0;
+        _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) ).ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+        using CancellationTokenSource cts = new();
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 2500, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+        _sagaManagerMock.Verify( s => s.TryUpdateProviderStateAsync( request.SagaId, It.Is<ProviderLookupState>( state => !state.IsComplete ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( q => q.RequeueAsync(
+            message.MessageId, null, It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
+    /// <summary>HTTP 404 is a permanent refusal: fail the leg and move the delivery to the DLQ immediately.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_Http404_CompletesFailedAndMovesToDlqWithoutRequeue( ) {
+        QueueProcessorBackgroundService service = CreateService( );
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US404" ) with { AttemptCount = 0 };
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        SetupNotRateLimited( );
+        _ = _lookupServiceMock.Setup( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
+            .ThrowsAsync( new HttpRequestException( "not found", null, System.Net.HttpStatusCode.NotFound ) );
+        SetupSagaNotComplete( request.SagaId );
+        int calls = 0;
+        _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 250, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        _sagaManagerMock.Verify( s => s.TryUpdateProviderStateAsync(
+            request.SagaId,
+            It.Is<ProviderLookupState>( state => state.IsComplete && !state.IsSuccess && state.ErrorMessage != null ),
+            It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( q => q.MoveToDlqAsync( message.MessageId, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( q => q.EnqueueAsync(
+            It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>Ordinary transient retries preserve the delivered interactive or bulk lane.</summary>
+    [TestMethod]
+    [DataRow( QueuePriority.Interactive )]
+    [DataRow( QueuePriority.Bulk )]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_Http500_PreservesInteractiveAndBulkLane( QueuePriority priority ) {
+        QueueProcessorBackgroundService service = CreateService( );
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, $"US500-{priority}" );
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request ) with { Priority = priority };
+        SetupNotRateLimited( );
+        _ = _lookupServiceMock.Setup( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
+            .ThrowsAsync( new HttpRequestException( "server", null, System.Net.HttpStatusCode.InternalServerError ) );
+        SetupSagaNotComplete( request.SagaId );
+        int calls = 0;
+        _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 2500, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        _queueMock.Verify( q => q.RequeueAsync(
+            message.MessageId, null, It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
+    /// <summary>A transient retry is scheduled for later delivery without sleeping in the consumer loop.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_Http500_SchedulesReplacementAndAcknowledgesOriginal( ) {
+        QueueProcessorBackgroundService service = CreateService( );
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US500-CANCEL" );
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        SetupNotRateLimited( );
+        _ = _lookupServiceMock.Setup( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
+            .ThrowsAsync( new HttpRequestException( "server", null, System.Net.HttpStatusCode.InternalServerError ) );
+        SetupSagaNotComplete( request.SagaId );
+        int calls = 0;
+        _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 250, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        _queueMock.Verify( q => q.RequeueAsync(
+            message.MessageId, null, It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
+    /// <summary>Transient replacement failure leaves the original delivery pending.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_Http500_WhenReplacementEnqueueFails_DoesNotAcknowledge( ) {
+        QueueProcessorBackgroundService service = CreateService( );
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US500-ENQUEUE-FAIL" ) with { AttemptCount = 1 };
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        SetupNotRateLimited( );
+        _ = _lookupServiceMock.Setup( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
+            .ThrowsAsync( new HttpRequestException( "server", null, System.Net.HttpStatusCode.InternalServerError ) );
+        SetupSagaNotComplete( request.SagaId );
+        _ = _queueMock.Setup( q => q.RequeueAsync(
+                message.MessageId, null, It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new RedisServerException( "XADD failed" ) );
+        int calls = 0;
+        _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 2500, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        _queueMock.Verify( q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>Timeouts are transient and are requeued below the retry ceiling.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_Timeout_RequeuesTransientFailure( ) {
+        QueueProcessorBackgroundService service = CreateService();
+        QueuedLookupRequest request = CreateRequest(LookupRequestType.IsrcLookup, "USTIMEOUT") with { AttemptCount = 1 };
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage(request);
+        SetupNotRateLimited( );
+        _ = _lookupServiceMock.Setup( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ) ).ThrowsAsync( new TimeoutException( "timeout" ) );
+        SetupSagaNotComplete( request.SagaId );
+        int calls = 0;
+        _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) ).ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+        using CancellationTokenSource cts = new();
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 2500, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+        _sagaManagerMock.Verify( s => s.TryUpdateProviderStateAsync( request.SagaId, It.Is<ProviderLookupState>( state => !state.IsComplete ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( q => q.RequeueAsync(
+            message.MessageId, null, It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
+    /// <summary>Provider task cancellation without host cancellation is treated as transient.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_TaskCanceledWithoutHostCancellation_RequeuesTransientFailure( ) {
+        QueueProcessorBackgroundService service = CreateService( );
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "TASKCANCEL001" );
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        SetupNotRateLimited( );
+        SetupSagaNotComplete( request.SagaId );
+        _ = _lookupServiceMock.Setup( l => l.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
+            .ThrowsAsync( new TaskCanceledException( "provider timeout" ) );
+        int calls = 0;
+        _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 2500, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        _queueMock.Verify( q => q.RequeueAsync(
+            message.MessageId, null, It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
     /// <summary>
-    /// A non-rate-limit exception below the retry ceiling marks the provider state complete-and-failed
+    /// A statusless transport exception below the retry ceiling leaves the provider leg incomplete
     /// with an error message via <c>UpdateProviderStateAsync</c>.
     /// </summary>
     [TestMethod]
@@ -1274,20 +1886,21 @@ public class QueueProcessorBackgroundServiceTests {
         // Act
         using CancellationTokenSource cts = new( );
         Task serviceTask = service.StartAsync( cts.Token );
-        await Task.Delay( 200, TestContext.CancellationToken );
+        await Task.Delay( 2500, TestContext.CancellationToken );
         await cts.CancelAsync( );
         await service.StopAsync( CancellationToken.None );
 
         // Assert
         _sagaManagerMock.Verify(
-            s => s.UpdateProviderStateAsync(
+            s => s.TryUpdateProviderStateAsync(
                 request.SagaId,
                 It.Is<ProviderLookupState>( state =>
                     state.Provider == TestProvider &&
-                    state.IsComplete &&
+                    !state.IsComplete &&
                     !state.IsSuccess &&
                     state.ErrorMessage != null
                 ),
+                It.IsAny<string>( ),
                 It.IsAny<CancellationToken>( )
             ),
             Times.Once
@@ -1295,11 +1908,11 @@ public class QueueProcessorBackgroundServiceTests {
     }
 
     /// <summary>
-    /// A non-rate-limit exception below the retry ceiling acknowledges the message (no requeue, no DLQ).
+    /// A non-rate-limit transient exception below the retry ceiling re-enqueues the replacement before acknowledging the message.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task ProcessMessage_WhenExceptionThrown_BelowMaxRetries_ShouldAcknowledgeMessage( ) {
+    public async Task ProcessMessage_WhenExceptionThrown_BelowMaxRetries_ShouldRequeueThenAcknowledgeMessage( ) {
         // Arrange
         QueueProcessorBackgroundService service = CreateService( );
         QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US1234567890" ) with {
@@ -1319,15 +1932,13 @@ public class QueueProcessorBackgroundServiceTests {
         // Act
         using CancellationTokenSource cts = new( );
         Task serviceTask = service.StartAsync( cts.Token );
-        await Task.Delay( 200, TestContext.CancellationToken );
+        await Task.Delay( 2500, TestContext.CancellationToken );
         await cts.CancelAsync( );
         await service.StopAsync( CancellationToken.None );
 
         // Assert
-        _queueMock.Verify(
-            q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ),
-            Times.Once
-        );
+        _queueMock.Verify( q => q.RequeueAsync(
+            message.MessageId, null, It.IsAny<CancellationToken>( ) ), Times.Once );
     }
 
     /// <summary>
@@ -1339,7 +1950,7 @@ public class QueueProcessorBackgroundServiceTests {
         // Arrange
         QueueProcessorBackgroundService service = CreateService( );
         QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US1234567890" ) with {
-            AttemptCount = 5 // At max retries
+            AttemptCount = 4 // Fifth and terminal execution (initial attempt is zero)
         };
         QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
 
@@ -1376,7 +1987,7 @@ public class QueueProcessorBackgroundServiceTests {
         // Arrange
         QueueProcessorBackgroundService service = CreateService( );
         QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "US1234567890" ) with {
-            AttemptCount = 5
+            AttemptCount = 4
         };
         QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
 
@@ -1436,7 +2047,307 @@ public class QueueProcessorBackgroundServiceTests {
         Assert.IsTrue( reachedTarget, "Service did not poll at least 2 times within timeout" );
     }
 
+    /// <summary>Generic NOGROUP repair failure is delayed and retried without stopping the host.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ExecuteAsync_WhenGroupRepairFails_RetriesAndSurvives( ) {
+        int dequeueCalls = 0;
+        int ensureCalls = 0;
+        TaskCompletionSource<bool> resumed = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        AssuringQueue queue = new( ) {
+            DequeueRate = ct => {
+                int call = Interlocked.Increment( ref dequeueCalls );
+                if (call <= 2) return Task.FromException<QueuedMessage<QueuedLookupRequest>?>( new RedisServerException( "NOGROUP" ) );
+                _ = resumed.TrySetResult( true );
+                return Task.FromResult<QueuedMessage<QueuedLookupRequest>?>( null );
+            },
+            Ensure = _ => {
+                if (Interlocked.Increment( ref ensureCalls ) == 1) return Task.FromException( new InvalidOperationException( "repair failed" ) );
+                return Task.CompletedTask;
+            }
+        };
+        QueueProcessorBackgroundService service = new(
+            _redisMock.Object, queue, _rateLimitTrackerMock.Object, _sagaManagerMock.Object,
+            _lookupServiceMock.Object, TestProvider, _loggerMock.Object );
+
+        await service.StartAsync( TestContext.CancellationToken );
+        Task completed = await Task.WhenAny( resumed.Task, Task.Delay( TimeSpan.FromSeconds( 5 ), TestContext.CancellationToken ) );
+        await service.StopAsync( TestContext.CancellationToken );
+
+        Assert.AreSame( resumed.Task, completed );
+        Assert.IsGreaterThanOrEqualTo( 2, ensureCalls );
+    }
+
+    /// <summary>Provider calls overlap up to the configured bound while dequeue remains serialized.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ExecuteAsync_WithConcurrencyTwo_ProcessesTwoProviderCallsInParallel( ) {
+        QueuedMessage<QueuedLookupRequest>[] messages = [
+            CreateMessage( CreateRequest( LookupRequestType.IsrcLookup, "CONCURRENT-1" ) ),
+            CreateMessage( CreateRequest( LookupRequestType.IsrcLookup, "CONCURRENT-2" ) )
+        ];
+        SetupNotRateLimited( );
+        int nextMessage = -1;
+        _ = _queueMock.Setup( queue => queue.DequeueAsync(
+                It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => {
+                int index = Interlocked.Increment( ref nextMessage );
+                return index < messages.Length ? messages[index] : null;
+            } );
+
+        int activeCalls = 0;
+        int maximumActiveCalls = 0;
+        TaskCompletionSource<bool> bothStarted = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        TaskCompletionSource<bool> releaseCalls = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        _ = _lookupServiceMock.Setup( lookup => lookup.GetInfoByISRCAsync( It.IsAny<string>( ) ) )
+            .Returns( async ( string isrc ) => {
+                int active = Interlocked.Increment( ref activeCalls );
+                _ = Interlocked.Exchange( ref maximumActiveCalls, Math.Max( maximumActiveCalls, active ) );
+                if (active == 2) _ = bothStarted.TrySetResult( true );
+                _ = await releaseCalls.Task;
+                _ = Interlocked.Decrement( ref activeCalls );
+                return null;
+            } );
+
+        QueueProcessorBackgroundService service = CreateService( concurrency: 2 );
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        Task observed = await Task.WhenAny(
+            bothStarted.Task,
+            Task.Delay( TimeSpan.FromSeconds( 5 ), TestContext.CancellationToken ) );
+        Assert.AreSame( bothStarted.Task, observed, "The second provider call did not start while the first was in flight." );
+        _ = releaseCalls.TrySetResult( true );
+        await Task.Delay( 250, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        Assert.AreEqual( 2, maximumActiveCalls );
+        _queueMock.Verify( queue => queue.AcknowledgeAsync(
+            It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Exactly( 2 ) );
+    }
+
     #endregion
+
+    /// <summary>An absent saga is acknowledged as stale without worker-side recreation.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_AbsentSagaIdentityMismatch_AcknowledgesStaleWithoutProviderMutation( ) {
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "MISMATCH" ) with { SagaId = "not-the-canonical-saga" };
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        _ = _sagaManagerMock.Setup( s => s.GetAsync( request.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( (LookupSagaState?)null );
+        int calls = 0;
+        _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => {
+                _ = Interlocked.Increment( ref calls );
+                return calls == 1 ? message : null;
+            } );
+
+        QueueProcessorBackgroundService service = CreateService( );
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 250, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        _queueMock.Verify( q => q.MoveToDlqAsync( message.MessageId, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _queueMock.Verify( q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _sagaManagerMock.Verify( s => s.GetOrCreateAsync(
+            It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<LookupRequestType>( ), It.IsAny<string>( ),
+            It.IsAny<QueuePriority?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( s => s.TryUpdateProviderStateAsync(
+            It.IsAny<string>( ), It.IsAny<ProviderLookupState>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _queueMock.Verify( q => q.EnqueueAsync(
+            It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>An existing saga with an initialized incomplete provider leg is accepted as a legitimate child.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ProcessMessage_ExistingInitializedChild_AllowsProviderUpdate( ) {
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "CHILD" ) with {
+            SagaInstanceToken = "child-instance"
+        };
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        LookupSagaState child = new( ) {
+            SagaId = request.SagaId,
+            LookupKey = "different-root",
+            LookupType = LookupRequestType.UpcLookup,
+            LookupValue = "OTHER",
+            InstanceToken = "child-instance",
+            ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                [TestProvider] = new( TestProvider, false, false, null, null, null )
+            }
+        };
+        _ = _sagaManagerMock.Setup( s => s.GetAsync( request.SagaId, It.IsAny<CancellationToken>( ) ) ).ReturnsAsync( child );
+        SetupNotRateLimited( );
+        SetupLookupSuccess( );
+        int calls = 0;
+        _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+        QueueProcessorBackgroundService service = CreateService( );
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 250, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+        _sagaManagerMock.Verify( s => s.TryUpdateProviderStateAsync(
+            request.SagaId, It.Is<ProviderLookupState>( state => state.IsComplete && state.IsSuccess ),
+            "child-instance", It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( q => q.MoveToDlqAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>A delivery fenced to a replaced saga generation is acknowledged as stale.</summary>
+    [TestMethod]
+    public async Task ProcessMessage_ExistingMismatchedUninitializedSaga_AcknowledgesStale( ) {
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "MISMATCHED" );
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        _ = _sagaManagerMock.Setup( s => s.GetAsync( request.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( new LookupSagaState {
+                SagaId = request.SagaId,
+                LookupKey = "other-root",
+                LookupType = LookupRequestType.UpcLookup,
+                LookupValue = "OTHER",
+                InstanceToken = "other-instance",
+                ProviderStates = []
+            } );
+        int calls = 0;
+        _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+        QueueProcessorBackgroundService service = CreateService( );
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 200, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+        _queueMock.Verify( q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( q => q.MoveToDlqAsync( message.MessageId, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( s => s.TryUpdateProviderStateAsync(
+            It.IsAny<string>( ), It.IsAny<ProviderLookupState>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>An absent canonical saga is not recreated by a worker delivery.</summary>
+    [TestMethod]
+    public async Task ProcessMessage_AbsentCanonicalSaga_AcknowledgesStale( ) {
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "ABSENT-CANONICAL" );
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        _ = _sagaManagerMock.Setup( s => s.GetAsync( request.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( (LookupSagaState?)null );
+        int calls = 0;
+        _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+        QueueProcessorBackgroundService service = CreateService( );
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 200, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+        _sagaManagerMock.Verify( s => s.GetOrCreateAsync(
+            request.SagaId, It.IsAny<string>( ), request.LookupType, request.LookupValue,
+            It.IsAny<QueuePriority?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( s => s.TryInitializeProviderStatesAsync(
+            request.SagaId, It.IsAny<IEnumerable<SupportedProviders>>( ), "test-instance", It.IsAny<CancellationToken>( ) ), Times.Never );
+        _queueMock.Verify( q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( q => q.MoveToDlqAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>A matching deterministic delivery whose persisted saga is unreadable is quarantined once.</summary>
+    [TestMethod]
+    public async Task ProcessMessage_MatchingUnreadableSaga_MovesDeliveryToDlq( ) {
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "CORRUPT-MATCHING" );
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        _ = _sagaManagerMock.Setup( manager => manager.GetAsync(
+                request.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new UnreadableSagaStateException( request.SagaId ) );
+        int calls = 0;
+        _ = _queueMock.Setup( queue => queue.DequeueAsync(
+                It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+
+        QueueProcessorBackgroundService service = CreateService( );
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 200, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+
+        _queueMock.Verify( queue => queue.MoveToDlqAsync(
+            message.MessageId,
+            It.Is<string>( reason => reason.Contains( "unreadable", StringComparison.OrdinalIgnoreCase ) ),
+            It.IsAny<CancellationToken>( ) ), Times.Once );
+        _lookupServiceMock.VerifyNoOtherCalls( );
+        _sagaManagerMock.Verify( manager => manager.TryUpdateProviderStateAsync(
+            It.IsAny<string>( ), It.IsAny<ProviderLookupState>( ), It.IsAny<string>( ),
+            It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>A provider update that loses the instance CAS acknowledges the stale delivery without retry.</summary>
+    [TestMethod]
+    public async Task ProcessMessage_WhenInstanceReplacedDuringProviderUpdate_AcknowledgesAndDrops( ) {
+        QueuedLookupRequest request = CreateRequest( LookupRequestType.IsrcLookup, "REPLACED" );
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage( request );
+        SetupNotRateLimited( );
+        SetupLookupSuccess( );
+        SetupSagaNotComplete( request.SagaId );
+        _ = _sagaManagerMock.Setup( s => s.TryUpdateProviderStateAsync(
+                It.IsAny<string>( ), It.IsAny<ProviderLookupState>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( false );
+        int calls = 0;
+        _ = _queueMock.Setup( q => q.DequeueAsync( It.IsAny<IRateLimitTracker>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => calls++ == 0 ? message : null );
+        List<string> processingStatuses = [];
+        using MeterListener meterListener = new( );
+        meterListener.InstrumentPublished = ( instrument, listener ) => {
+            if (instrument.Name == "bridgebeats.queue.processing.duration") listener.EnableMeasurementEvents( instrument );
+        };
+        meterListener.SetMeasurementEventCallback<double>( ( _, _, tags, _ ) => {
+            foreach (KeyValuePair<string, object?> tag in tags) {
+                if (tag.Key == "status") processingStatuses.Add( tag.Value?.ToString( ) ?? string.Empty );
+            }
+        } );
+        meterListener.Start( );
+        QueueProcessorBackgroundService service = CreateService( );
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 200, TestContext.CancellationToken );
+        await cts.CancelAsync( );
+        await service.StopAsync( CancellationToken.None );
+        _queueMock.Verify( q => q.AcknowledgeAsync( message.MessageId, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _queueMock.Verify( q => q.EnqueueAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _subscriberMock.Verify( s => s.PublishAsync( It.IsAny<RedisChannel>( ), It.IsAny<RedisValue>( ), It.IsAny<CommandFlags>( ) ), Times.Never );
+        Assert.Contains( "stale", processingStatuses, "A provider-state CAS loss must not be reported as processing success." );
+    }
+
+    /// <summary>Post-commit acknowledgement recovery is capped and releases the local delivery fence.</summary>
+    [TestMethod]
+    public async Task RecoverCommittedAcknowledgement_WhenBrokerStaysUnavailable_IsBounded( ) {
+        Mock<IQueueDeliveryTracker> tracker = _queueMock.As<IQueueDeliveryTracker>( );
+        QueuedMessage<QueuedLookupRequest> message = CreateMessage(
+            CreateRequest( LookupRequestType.IsrcLookup, "USRC12345678" ) );
+        _ = _queueMock.Setup( queue => queue.AcknowledgeAsync(
+                message.MessageId, It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new RedisConnectionException(
+                ConnectionFailureType.UnableToConnect,
+                "ack unavailable" ) );
+        List<TimeSpan> delays = [];
+        QueueProcessorBackgroundService service = CreateService( );
+
+        await service.RecoverCommittedAcknowledgementAsync(
+            message,
+            TestContext.CancellationToken,
+            ( delay, _ ) => {
+                delays.Add( delay );
+                return Task.CompletedTask;
+            } );
+
+        CollectionAssert.AreEqual(
+            new[] { TimeSpan.FromSeconds( 1 ), TimeSpan.FromSeconds( 2 ),
+                TimeSpan.FromSeconds( 4 ), TimeSpan.FromSeconds( 8 ) },
+            delays );
+        _queueMock.Verify( queue => queue.AcknowledgeAsync(
+            message.MessageId, It.IsAny<CancellationToken>( ) ), Times.Exactly( 4 ) );
+        tracker.Verify( queue => queue.ReleaseDelivery( message.MessageId ), Times.Once );
+    }
 
     #region Helper Methods
 
@@ -1444,30 +2355,57 @@ public class QueueProcessorBackgroundServiceTests {
     /// Builds a <see cref="QueueProcessorBackgroundService"/> bound to <see cref="TestProvider"/> from
     /// the current dependency mocks.
     /// </summary>
-    private QueueProcessorBackgroundService CreateService( ) =>
+    private QueueProcessorBackgroundService CreateService( IMusicLookupService? lookupService = null, int concurrency = 1 ) =>
         new(
             _redisMock.Object,
             _queueMock.Object,
             _rateLimitTrackerMock.Object,
             _sagaManagerMock.Object,
-            _lookupServiceMock.Object,
+            lookupService ?? _lookupServiceMock.Object,
             TestProvider,
-            _loggerMock.Object
+            _loggerMock.Object,
+            new QueueSettings { DefaultProviderConcurrency = concurrency }
         );
+
+    /// <summary>Queue seam exposing consumer-group assurance for hosted-loop recovery tests.</summary>
+    private sealed class AssuringQueue : IRequestQueue<QueuedLookupRequest>, IConsumerGroupAssurance {
+        public Func<CancellationToken, Task<QueuedMessage<QueuedLookupRequest>?>> DequeueRate { get; init; } = _ => Task.FromResult<QueuedMessage<QueuedLookupRequest>?>( null );
+        public Func<CancellationToken, Task> Ensure { get; init; } = _ => Task.CompletedTask;
+        public Task EnsureConsumerGroupsAsync( CancellationToken cancellationToken = default ) => Ensure( cancellationToken );
+        public Task EnqueueAsync( QueuedLookupRequest request, QueuePriority priority, CancellationToken cancellationToken = default ) => Task.CompletedTask;
+        public Task<QueuedMessage<QueuedLookupRequest>?> DequeueAsync( CancellationToken cancellationToken = default ) => DequeueRate( cancellationToken );
+        public Task<QueuedMessage<QueuedLookupRequest>?> DequeueAsync( IRateLimitTracker tracker, CancellationToken cancellationToken = default ) => DequeueRate( cancellationToken );
+        public Task AcknowledgeAsync( string messageId, CancellationToken cancellationToken = default ) => Task.CompletedTask;
+        public Task RequeueAsync( string messageId, TimeSpan? delay = null, CancellationToken cancellationToken = default ) => Task.CompletedTask;
+        public Task<QueueDepth> GetDepthAsync( CancellationToken cancellationToken = default ) => Task.FromResult( new QueueDepth( 0, 0, 0, 0 ) );
+        public Task<IReadOnlyList<QueuedMessage<QueuedLookupRequest>>> GetDlqMessagesAsync( int limit, CancellationToken cancellationToken = default ) => Task.FromResult<IReadOnlyList<QueuedMessage<QueuedLookupRequest>>>( [] );
+        public Task RequeueFromDlqAsync( string messageId, QueuePriority priority, CancellationToken cancellationToken = default ) => Task.CompletedTask;
+        public Task MoveToDlqAsync( string messageId, string reason, CancellationToken cancellationToken = default ) => Task.CompletedTask;
+        public Task<bool> DeleteFromDlqAsync( string messageId, CancellationToken cancellationToken = default ) => Task.FromResult( false );
+    }
 
     /// <summary>
     /// Builds a <see cref="QueuedLookupRequest"/> for <see cref="TestProvider"/> with fresh request
     /// and saga ids, the given lookup type, and lookup value.
     /// </summary>
-    private static QueuedLookupRequest CreateRequest( LookupRequestType lookupType, string lookupValue ) =>
-        new( ) {
+    private static QueuedLookupRequest CreateRequest( LookupRequestType lookupType, string lookupValue ) {
+        string lookupKey = lookupType switch {
+            LookupRequestType.SongIdLookup or LookupRequestType.AlbumIdLookup => LookupKeyBuilder.TypedKey( lookupType, TestProvider, lookupValue ),
+            LookupRequestType.UriLookup => LookupKeyBuilder.UrlKey( lookupValue ),
+            _ => $"{lookupType}:{lookupValue}"
+        };
+        string sagaId = ISagaStateManager.GenerateSagaId( lookupKey );
+        s_requestIdentities[sagaId] = (lookupKey, lookupType, lookupValue);
+        return new( ) {
             RequestId = $"req-{Guid.NewGuid( ):N}",
             Provider = TestProvider,
             LookupType = lookupType,
             LookupValue = lookupValue,
-            SagaId = $"saga-{Guid.NewGuid( ):N}",
+            SagaId = sagaId,
+            SagaInstanceToken = "test-instance",
             CreatedAt = DateTimeOffset.UtcNow
         };
+    }
 
     /// <summary>
     /// Wraps a request in a <see cref="QueuedMessage{T}"/> with a fresh message id and the current
@@ -1533,19 +2471,22 @@ public class QueueProcessorBackgroundServiceTests {
     /// yet whole (no <c>saga:completed</c> publication is expected).
     /// </summary>
     private void SetupSagaNotComplete( string sagaId ) {
+        (string lookupKey, LookupRequestType lookupType, string lookupValue) = s_requestIdentities.GetValueOrDefault(
+            sagaId, ($"{LookupRequestType.IsrcLookup}:test-value", LookupRequestType.IsrcLookup, "test-value") );
         LookupSagaState saga = new( ) {
             SagaId = sagaId,
-            LookupKey = "test-key",
-            LookupType = LookupRequestType.IsrcLookup,
-            LookupValue = "test-value",
+            LookupKey = lookupKey,
+            LookupType = lookupType,
+            LookupValue = lookupValue,
+            InstanceToken = "test-instance",
             ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
-                // Only one provider complete, saga is not complete
+                // The provider leg is pending; the worker owns this delivery.
                 [SupportedProviders.Spotify] = new(
                     SupportedProviders.Spotify,
-                    IsComplete: true,
-                    IsSuccess: true,
-                    ResultJson: JsonSerializer.Serialize( CreateLookupResult( ), s_jsonOptions ),
-                    CompletedAt: DateTimeOffset.UtcNow,
+                    IsComplete: false,
+                    IsSuccess: false,
+                    ResultJson: null,
+                    CompletedAt: null,
                     ErrorMessage: null
                 )
             }
@@ -1559,11 +2500,14 @@ public class QueueProcessorBackgroundServiceTests {
     /// so the saga is whole (a <c>saga:completed</c> publication is expected).
     /// </summary>
     private void SetupSagaComplete( string sagaId ) {
+        (string lookupKey, LookupRequestType lookupType, string lookupValue) = s_requestIdentities.GetValueOrDefault(
+            sagaId, ($"{LookupRequestType.IsrcLookup}:test-value", LookupRequestType.IsrcLookup, "test-value") );
         LookupSagaState saga = new( ) {
             SagaId = sagaId,
-            LookupKey = "test-key",
-            LookupType = LookupRequestType.IsrcLookup,
-            LookupValue = "test-value",
+            LookupKey = lookupKey,
+            LookupType = lookupType,
+            LookupValue = lookupValue,
+            InstanceToken = "test-instance",
             ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
                 [SupportedProviders.Spotify] = new(
                     SupportedProviders.Spotify,

@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
+using BridgeBeats.Contracts.Exceptions;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Core.Domain.Providers.Common;
 using BridgeBeats.Core.Domain.Providers.Tidal.Models;
@@ -26,7 +27,7 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal {
     /// included resources: artist names are resolved by replacing <c>|artistId|</c>
     /// placeholders with the matching included artist's name, and album art for a track
     /// requires a secondary album lookup. Genre names found in a response are written
-    /// to the optional <see cref="IGenreCacheService"/> as a best-effort, non-blocking
+    /// to the <see cref="IGenreCacheService"/> as a best-effort
     /// side effect.
     /// </para>
     /// </remarks>
@@ -35,16 +36,15 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal {
     /// <param name="logger">Logger for lookup and parse diagnostics.</param>
     /// <param name="serializerOptions">JSON options used to deserialize Tidal responses.</param>
     /// <param name="genreCache">
-    /// Optional genre cache; when supplied, resolved genre names are cached
-    /// best-effort. When <see langword="null"/>, genre caching is skipped.
+    /// Genre cache used to store provider-native track genres.
     /// </param>
     public sealed partial class TidalLookupService(
         TidalTokenHandler handler,
         IHttpClientFactory factory,
         ILogger<TidalLookupService> logger,
         JsonSerializerOptions serializerOptions,
-        IGenreCacheService? genreCache = null
-    ) : MusicLookupServiceBase( logger, serializerOptions ), IMusicLookupService {
+        IGenreCacheService genreCache
+    ) : MusicLookupServiceBase( logger, serializerOptions ), IStorefrontMusicLookupService {
 
         /// <summary>
         /// The default Tidal storefront (country code) used to scope API requests.
@@ -62,13 +62,20 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal {
         /// The mapped <see cref="MusicLookupResult"/>, or <see langword="null"/> when
         /// no matching track is found or the response cannot be parsed.
         /// </returns>
-        public override async Task<MusicLookupResult?> GetInfoByISRCAsync( string isrc )
-            => await ParseTidalResponse(
-                await NewMusicApiRequest( TidalLinkParser.GetTracksIsrcURI( DefaultStorefront, isrc ), LookupRequestType.IsrcLookup ),
+        public override Task<MusicLookupResult?> GetInfoByISRCAsync( string isrc )
+            => GetInfoByISRCAsync( isrc, DefaultStorefront );
+
+        /// <inheritdoc/>
+        public async Task<MusicLookupResult?> GetInfoByISRCAsync( string isrc, string storefront ) {
+            storefront = NormalizeStorefront( storefront );
+            return await ParseTidalResponse(
+                await NewMusicApiRequest( TidalLinkParser.GetTracksIsrcURI( storefront, isrc ), LookupRequestType.IsrcLookup ),
                 LookupRequestType.IsrcLookup,
                 TidalEntity.Track,
-                null
+                null,
+                storefront
             );
+        }
 
         /// <summary>
         /// Resolves an album by its UPC via the Tidal UPC-filtered albums endpoint.
@@ -78,13 +85,20 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal {
         /// The mapped <see cref="MusicLookupResult"/>, or <see langword="null"/> when
         /// no matching album is found or the response cannot be parsed.
         /// </returns>
-        public override async Task<MusicLookupResult?> GetInfoByUPCAsync( string upc )
-            => await ParseTidalResponse(
-                await NewMusicApiRequest( TidalLinkParser.GetAlbumUpcURI( DefaultStorefront, upc ), LookupRequestType.UpcLookup ),
+        public override Task<MusicLookupResult?> GetInfoByUPCAsync( string upc )
+            => GetInfoByUPCAsync( upc, DefaultStorefront );
+
+        /// <inheritdoc/>
+        public async Task<MusicLookupResult?> GetInfoByUPCAsync( string upc, string storefront ) {
+            storefront = NormalizeStorefront( storefront );
+            return await ParseTidalResponse(
+                await NewMusicApiRequest( TidalLinkParser.GetAlbumUpcURI( storefront, upc ), LookupRequestType.UpcLookup ),
                 LookupRequestType.UpcLookup,
                 TidalEntity.Album,
-                null
+                null,
+                storefront
             );
+        }
 
         /// <summary>
         /// Resolves a track or album by title and artist.
@@ -158,10 +172,27 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal {
         /// The mapped <see cref="MusicLookupResult"/> marked as the primary result, or
         /// <see langword="null"/> when the entity is not found or cannot be parsed.
         /// </returns>
-        public override async Task<MusicLookupResult?> GetInfoByIDAsync( string providerId, bool isAlbum )
-            => isAlbum
-                ? await NewAlbumIdLookup( providerId, true )
-                : await NewTrackIdLookup( providerId, true );
+        public override Task<MusicLookupResult?> GetInfoByIDAsync( string providerId, bool isAlbum )
+            => GetInfoByIDAsync( providerId, isAlbum, DefaultStorefront );
+
+        /// <inheritdoc/>
+        public async Task<MusicLookupResult?> GetInfoByIDAsync( string providerId, bool isAlbum, string storefront ) {
+            storefront = NormalizeStorefront( storefront );
+            return isAlbum
+                ? await NewAlbumIdLookup( providerId, true, storefront )
+                : await NewTrackIdLookup( providerId, true, storefront );
+        }
+
+        private static string NormalizeStorefront( string storefront ) {
+            string normalized = string.IsNullOrWhiteSpace( storefront )
+                ? DefaultStorefront
+                : storefront.Trim( ).ToUpperInvariant( );
+            return normalized.Length == 2 && normalized.All( char.IsAsciiLetter )
+                ? normalized
+                : throw new ArgumentException(
+                    "Tidal storefront must be a two-letter ASCII country code.",
+                    nameof( storefront ) );
+        }
 
         /// <summary>
         /// Fetches an artist's albums and returns the first whose sanitized title
@@ -248,16 +279,21 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal {
         /// <param name="isPrimary">
         /// Whether the mapped result should be marked as the primary lookup result.
         /// </param>
+        /// <param name="storefront">The country code used to scope the catalog request.</param>
         /// <returns>
         /// The mapped <see cref="MusicLookupResult"/>, or <see langword="null"/> when
         /// the album is not found or cannot be parsed.
         /// </returns>
-        private async Task<MusicLookupResult?> NewAlbumIdLookup( string albumId, bool isPrimary ) {
-            string? body = await NewMusicApiRequest( TidalLinkParser.GetAlbumIdURI( DefaultStorefront, albumId ), LookupRequestType.AlbumLookup );
+        private async Task<MusicLookupResult?> NewAlbumIdLookup(
+            string albumId,
+            bool isPrimary,
+            string storefront = DefaultStorefront
+        ) {
+            string? body = await NewMusicApiRequest( TidalLinkParser.GetAlbumIdURI( storefront, albumId ), LookupRequestType.AlbumLookup );
             if (body != null) {
                 (TidalResource? data, List<TidalResource>? included) = ExtractSingleResource( body );
                 if (data != null && included != null) {
-                    return await ParseTidalResponse( data, included, LookupRequestType.AlbumLookup, TidalEntity.Album, isPrimary );
+                    return await ParseTidalResponse( data, included, LookupRequestType.AlbumLookup, TidalEntity.Album, isPrimary, storefront );
                 }
             }
             return null;
@@ -270,16 +306,21 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal {
         /// <param name="isPrimary">
         /// Whether the mapped result should be marked as the primary lookup result.
         /// </param>
+        /// <param name="storefront">The country code used to scope the catalog request.</param>
         /// <returns>
         /// The mapped <see cref="MusicLookupResult"/>, or <see langword="null"/> when
         /// the track is not found or cannot be parsed.
         /// </returns>
-        private async Task<MusicLookupResult?> NewTrackIdLookup( string trackId, bool isPrimary ) {
-            string? body = await NewMusicApiRequest( TidalLinkParser.GetTrackIdURI( DefaultStorefront, trackId ), LookupRequestType.SongLookup );
+        private async Task<MusicLookupResult?> NewTrackIdLookup(
+            string trackId,
+            bool isPrimary,
+            string storefront = DefaultStorefront
+        ) {
+            string? body = await NewMusicApiRequest( TidalLinkParser.GetTrackIdURI( storefront, trackId ), LookupRequestType.SongLookup );
             if (body != null) {
                 (TidalResource? data, List<TidalResource>? included) = ExtractSingleResource( body );
                 if (data != null && included != null) {
-                    return await ParseTidalResponse( data, included, LookupRequestType.SongLookup, TidalEntity.Track, isPrimary );
+                    return await ParseTidalResponse( data, included, LookupRequestType.SongLookup, TidalEntity.Track, isPrimary, storefront );
                 }
             }
             return null;
@@ -357,6 +398,7 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal {
         /// Whether the mapped result should be marked primary; <see langword="null"/>
         /// is treated as not primary.
         /// </param>
+        /// <param name="storefront">The country code used for the request and stored on the result.</param>
         /// <returns>
         /// The mapped <see cref="MusicLookupResult"/>, or <see langword="null"/> when
         /// the body is empty, lacks usable data, or fails to parse.
@@ -365,14 +407,17 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal {
             string? body,
             LookupRequestType lookupKey,
             TidalEntity kind,
-            bool? isPrimary
+            bool? isPrimary,
+            string storefront = DefaultStorefront
         ) {
             if (string.IsNullOrWhiteSpace( body )) { return null; }
             try {
                 (TidalResource? data, List<TidalResource>? included) = ExtractSingleResource( body );
                 if (data != null && included != null) {
-                    return await ParseTidalResponse( data, included, lookupKey, kind, isPrimary );
+                    return await ParseTidalResponse( data, included, lookupKey, kind, isPrimary, storefront );
                 }
+            } catch (ProviderRateLimitException) {
+                throw;
             } catch (Exception ex) {
                 LogParseResponseError( Logger, ex, lookupKey );
                 LogResponseBodySerialized( Logger, body, SerializerOptions );
@@ -399,6 +444,7 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal {
         /// Whether the result should be marked primary; <see langword="null"/> is
         /// treated as not primary.
         /// </param>
+        /// <param name="storefront">The country code stored on the mapped result.</param>
         /// <returns>
         /// The mapped <see cref="MusicLookupResult"/>, or <see langword="null"/> when
         /// mapping fails.
@@ -408,13 +454,14 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal {
             List<TidalResource> included,
             LookupRequestType lookupKey,
             TidalEntity kind,
-            bool? isPrimary
+            bool? isPrimary,
+            string storefront = DefaultStorefront
         ) {
             bool isAlbum = kind == TidalEntity.Album;
             MusicLookupResult result = new() {
                 IsAlbum = isAlbum,
                 IsPrimary = isPrimary ?? false,
-                MarketRegion = DefaultStorefront
+                MarketRegion = storefront
             };
 
             try {
@@ -434,12 +481,15 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal {
                     }
                 }
 
-                result.ArtUrl = await GetAlbumArtUrl( included, isAlbum );
+                result.ArtUrl = await GetAlbumArtUrl( included, isAlbum, storefront );
 
-                // Cache genres if available (fire and forget - don't block the response)
-                CacheGenresFromIncluded( data, included );
+                if (!isAlbum) {
+                    await CacheGenresFromIncludedAsync( data, included );
+                }
 
                 return result;
+            } catch (ProviderRateLimitException) {
+                throw;
             } catch (Exception ex) {
                 LogParseResponseError( Logger, ex, lookupKey );
                 LogDataSerialized( Logger, data, SerializerOptions );
@@ -529,16 +579,18 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal {
         /// <see langword="true"/> when resolving art for an album; <see langword="false"/>
         /// when resolving art for a track.
         /// </param>
+        /// <param name="storefront">The country code used for a track's secondary album lookup.</param>
         /// <returns>The album art URL, or an empty string when none is found.</returns>
         private async Task<string> GetAlbumArtUrl(
             List<TidalResource> included,
-            bool isAlbum
+            bool isAlbum,
+            string storefront = DefaultStorefront
         ) {
             if (!isAlbum) {
                 // Lookup album from album details and then return album art
                 foreach (TidalResource item in included) {
                     if (item.Type == "albums" && !string.IsNullOrWhiteSpace( item.Id )) {
-                        MusicLookupResult? album = await NewAlbumIdLookup( item.Id, false );
+                        MusicLookupResult? album = await NewAlbumIdLookup( item.Id, false, storefront );
                         if (!string.IsNullOrWhiteSpace( album?.ArtUrl )) {
                             return album.ArtUrl;
                         }
@@ -597,33 +649,30 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal {
 
         /// <summary>
         /// Resolves the genre names for a resource and writes them to the genre cache
-        /// as a best-effort, non-blocking side effect.
+        /// as an awaited, best-effort side effect.
         /// </summary>
         /// <remarks>
         /// Collects the genre ids from the resource's genres relationship, resolves
         /// their names from the side-loaded genre resources, and stores them via the
-        /// optional <see cref="IGenreCacheService"/>. The write runs on a background
-        /// task and swallows failures with a warning log. No-ops when no genre cache is
-        /// configured, the resource has no id, or no genres resolve.
+        /// <see cref="IGenreCacheService"/>. Cache failures are logged without failing
+        /// the provider lookup. No-ops when the resource has no id or its genre
+        /// relationship was not returned by Tidal.
         /// </remarks>
         /// <param name="data">The primary resource whose genres are cached.</param>
         /// <param name="included">The side-loaded resources containing genre details.</param>
-        private void CacheGenresFromIncluded( TidalResource data, List<TidalResource> included ) {
-            if (genreCache == null || string.IsNullOrWhiteSpace( data.Id )) {
+        private async Task CacheGenresFromIncludedAsync( TidalResource data, List<TidalResource> included ) {
+            List<TidalResourceIdentifier>? genreReferences = data.Relationships?.Genres?.Data;
+            if (string.IsNullOrWhiteSpace( data.Id ) || genreReferences == null) {
                 return;
             }
 
             // Get genre IDs from relationships
             HashSet<string> genreIds = [];
-            if (data.Relationships?.Genres?.Data != null) {
-                foreach (TidalResourceIdentifier genreRef in data.Relationships.Genres.Data) {
-                    if (genreRef.Type == "genres" && !string.IsNullOrWhiteSpace( genreRef.Id )) {
-                        _ = genreIds.Add( genreRef.Id );
-                    }
+            foreach (TidalResourceIdentifier genreRef in genreReferences) {
+                if (genreRef.Type == "genres" && !string.IsNullOrWhiteSpace( genreRef.Id )) {
+                    _ = genreIds.Add( genreRef.Id );
                 }
             }
-
-            if (genreIds.Count == 0) { return; }
 
             // Find matching genre names in included array
             List<string> genreNames = [];
@@ -632,22 +681,17 @@ namespace BridgeBeats.Core.Domain.Providers.Tidal {
                     && !string.IsNullOrWhiteSpace( item.Id )
                     && genreIds.Contains( item.Id )
                     && item.Attributes != null
-                    && !string.IsNullOrWhiteSpace( item.Attributes.Name )
+                    && !string.IsNullOrWhiteSpace( item.Attributes.GenreName )
                 ) {
-                    genreNames.Add( item.Attributes.Name );
+                    genreNames.Add( item.Attributes.GenreName );
                 }
             }
 
-            if (genreNames.Count == 0) { return; }
-
-            // Fire and forget - don't block the response
-            _ = Task.Run( async ( ) => {
-                try {
-                    await genreCache.SetGenresAsync( SupportedProviders.Tidal, data.Id, genreNames );
-                } catch (Exception ex) {
-                    LogCacheGenresFailed( Logger, ex, data.Id );
-                }
-            } );
+            try {
+                await genreCache.SetGenresAsync( SupportedProviders.Tidal, data.Id, genreNames );
+            } catch (Exception ex) {
+                LogCacheGenresFailed( Logger, ex, data.Id );
+            }
         }
 
         #region LoggerMessage Methods

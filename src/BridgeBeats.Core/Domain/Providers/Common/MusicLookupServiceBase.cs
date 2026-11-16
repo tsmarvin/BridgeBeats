@@ -107,6 +107,12 @@ namespace BridgeBeats.Core.Domain.Providers.Common {
             HttpResponseMessage resp = await http.GetAsync( requestUri );
             if (!resp.IsSuccessStatusCode) {
                 LogApiRequestError( Logger, lookupKey, Provider.ToString( ), (int)resp.StatusCode, resp.ReasonPhrase );
+                if (resp.StatusCode is System.Net.HttpStatusCode.Unauthorized
+                    or System.Net.HttpStatusCode.Forbidden
+                    or System.Net.HttpStatusCode.RequestTimeout
+                    || (int)resp.StatusCode >= 500) {
+                    throw new HttpRequestException( $"{Provider} returned {(int)resp.StatusCode}.", null, resp.StatusCode );
+                }
                 return null;
             }
             return await resp.Content.ReadAsStringAsync( );

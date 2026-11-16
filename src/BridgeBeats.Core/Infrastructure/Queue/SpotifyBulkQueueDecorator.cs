@@ -24,7 +24,14 @@ namespace BridgeBeats.Core.Infrastructure.Queue;
 /// Interactive-priority requests and every other lookup type pass straight through to the inner
 /// queue, and all queue operations other than enqueue delegate to the inner queue unchanged.
 /// </remarks>
-public sealed partial class SpotifyBulkQueueDecorator : IRequestQueue<QueuedLookupRequest> {
+public sealed partial class SpotifyBulkQueueDecorator : IRequestQueue<QueuedLookupRequest>, IConsumerGroupAssurance, IQueueDeliveryTracker, IQueueWorkSignal {
+
+    private const string EnqueueBulkDeliveryScript = """
+        local messageId = redis.call(
+            'XADD', KEYS[1], '*', ARGV[1], ARGV[2], ARGV[3], ARGV[4])
+        redis.call('PUBLISH', ARGV[5], messageId)
+        return messageId
+        """;
 
     /// <summary>The wrapped queue that handles normal (non-bulk-routed) operations.</summary>
     private readonly IRequestQueue<QueuedLookupRequest> _inner;
@@ -34,6 +41,9 @@ public sealed partial class SpotifyBulkQueueDecorator : IRequestQueue<QueuedLook
 
     /// <summary>Logger for bulk-routing diagnostics.</summary>
     private readonly ILogger<SpotifyBulkQueueDecorator> _logger;
+    private readonly string _bulkTrackStream;
+    private readonly string _bulkAlbumStream;
+    private readonly string _bulkWorkSignalChannel;
 
     /// <summary>Camel-case, non-indented options used to serialize the request payload.</summary>
     private readonly JsonSerializerOptions _jsonOptions;
@@ -45,15 +55,20 @@ public sealed partial class SpotifyBulkQueueDecorator : IRequestQueue<QueuedLook
     /// <param name="inner">The underlying Spotify request queue, which handles non-bulk operations.</param>
     /// <param name="redis">The Redis connection multiplexer, used to write bulk-stream entries.</param>
     /// <param name="logger">Logger for bulk-routing diagnostics.</param>
+    /// <param name="keyPrefix">Optional isolated queue-key prefix shared with the bulk consumer.</param>
     /// <exception cref="ArgumentNullException">Thrown when any argument is null.</exception>
     public SpotifyBulkQueueDecorator(
         IRequestQueue<QueuedLookupRequest> inner,
         IConnectionMultiplexer redis,
-        ILogger<SpotifyBulkQueueDecorator> logger
+        ILogger<SpotifyBulkQueueDecorator> logger,
+        string? keyPrefix = null
     ) {
         _inner = inner ?? throw new ArgumentNullException( nameof( inner ) );
         _redis = redis ?? throw new ArgumentNullException( nameof( redis ) );
         _logger = logger ?? throw new ArgumentNullException( nameof( logger ) );
+        _bulkTrackStream = QueueStreamKeys.SpotifyBulkFor( isTrack: true, keyPrefix );
+        _bulkAlbumStream = QueueStreamKeys.SpotifyBulkFor( isTrack: false, keyPrefix );
+        _bulkWorkSignalChannel = QueueStreamKeys.SpotifyBulkWorkSignal( keyPrefix );
 
         _jsonOptions = new JsonSerializerOptions {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -86,11 +101,12 @@ public sealed partial class SpotifyBulkQueueDecorator : IRequestQueue<QueuedLook
         CancellationToken cancellationToken = default
     ) {
         if (request.LookupType is LookupRequestType.SongIdLookup or LookupRequestType.AlbumIdLookup
-            && priority != QueuePriority.Interactive) {
+            && priority != QueuePriority.Interactive
+            && !request.BypassBulkRouting) {
 
             string stream = request.LookupType == LookupRequestType.SongIdLookup
-                ? SpotifyConstants.BulkTrackIdStream
-                : SpotifyConstants.BulkAlbumIdStream;
+                ? _bulkTrackStream
+                : _bulkAlbumStream;
 
             string payload = JsonSerializer.Serialize( request, _jsonOptions );
 
@@ -100,11 +116,24 @@ public sealed partial class SpotifyBulkQueueDecorator : IRequestQueue<QueuedLook
                 new NameValueEntry( QueueFieldNames.EnqueuedAt, DateTimeOffset.UtcNow.ToString( "O" ) )
             ];
 
-            _ = await db.StreamAddAsync( stream, fields );
+            RedisResult enqueueResult = await db.ScriptEvaluateAsync(
+                EnqueueBulkDeliveryScript,
+                [stream],
+                [
+                    QueueFieldNames.Payload,
+                    fields[0].Value,
+                    QueueFieldNames.EnqueuedAt,
+                    fields[1].Value,
+                    _bulkWorkSignalChannel
+                ] );
+            RedisValue messageId = (RedisValue)enqueueResult;
+            if (!messageId.HasValue) {
+                throw new InvalidOperationException( $"Redis did not return a message id for enqueue to '{stream}'." );
+            }
 
             // Record enqueue metric with QueuePriority.Bulk so dashboards can distinguish
             // bulk-stream enqueues from generic interactive/background ones.
-            QueueMetrics.RecordEnqueue( SupportedProviders.Spotify, QueuePriority.Bulk );
+            QueueMetrics.RecordEnqueue( SupportedProviders.Spotify, QueuePriority.Bulk, request.EnqueueOrigin );
 
             LogRoutedToBulkStream( _logger, request.LookupType, request.SagaId, stream );
 
@@ -179,6 +208,46 @@ public sealed partial class SpotifyBulkQueueDecorator : IRequestQueue<QueuedLook
     /// <returns>True if a message was deleted; otherwise false.</returns>
     public Task<bool> DeleteFromDlqAsync( string messageId, CancellationToken cancellationToken = default )
         => _inner.DeleteFromDlqAsync( messageId, cancellationToken );
+
+    /// <inheritdoc/>
+    public void ReleaseDelivery( string messageId ) {
+        if (_inner is IQueueDeliveryTracker tracker) tracker.ReleaseDelivery( messageId );
+    }
+
+    /// <inheritdoc/>
+    public Task InitializeWorkSignalAsync( CancellationToken cancellationToken = default ) =>
+        _inner is IQueueWorkSignal signal ? signal.InitializeWorkSignalAsync( cancellationToken ) : Task.CompletedTask;
+
+    /// <inheritdoc/>
+    public long CaptureWorkVersion( ) =>
+        _inner is IQueueWorkSignal signal ? signal.CaptureWorkVersion( ) : 0;
+
+    /// <inheritdoc/>
+    public Task WaitForWorkAsync(
+        long observedVersion,
+        DateTimeOffset? scheduledWake,
+        CancellationToken cancellationToken = default
+    ) => _inner is IQueueWorkSignal signal
+        ? signal.WaitForWorkAsync( observedVersion, scheduledWake, cancellationToken )
+        : Task.CompletedTask;
+
+    /// <summary>Repairs the generic queue groups and both bulk-stream groups.</summary>
+    public async Task EnsureConsumerGroupsAsync( CancellationToken cancellationToken = default ) {
+        if (_inner is IConsumerGroupAssurance innerAssurance) {
+            await innerAssurance.EnsureConsumerGroupsAsync( cancellationToken );
+        }
+
+        IDatabase db = _redis.GetDatabase( );
+        foreach (string stream in new[] { _bulkTrackStream, _bulkAlbumStream }) {
+            cancellationToken.ThrowIfCancellationRequested( );
+            try {
+                _ = await db.StreamCreateConsumerGroupAsync(
+                    stream, SpotifyConstants.ConsumerGroup, StreamPosition.Beginning, createStream: true );
+            } catch (RedisServerException ex) when (ex.Message.Contains( "BUSYGROUP", StringComparison.OrdinalIgnoreCase )) {
+                // Idempotent repair: the required group already exists.
+            }
+        }
+    }
 
     #region LoggerMessage Methods
 

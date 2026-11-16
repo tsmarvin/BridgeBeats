@@ -24,12 +24,15 @@ namespace BridgeBeats.Core.Domain.Services.Queue;
 /// Per message the loop: resolves or creates the saga and initializes this provider's state;
 /// pre-checks the endpoint rate limit and requeues if limited; performs the lookup; on success
 /// records the serialized result, checks/publishes saga completion, publishes the per-lookup
-/// completion, and acknowledges. A <see cref="RetryAfterExceededException"/> marks the saga partial,
-/// merges this provider's rate-limit window, publishes the rate-limited sentinel, and re-enqueues at
-/// background priority (interactive requests are explicitly deferred to the background lane). Other
-/// exceptions retry up to <see cref="LookupConstants.MaxQueueRetryAttempts"/>, then move to the DLQ.
+/// completion, and acknowledges. A <see cref="ProviderRateLimitException"/> (including its
+/// <see cref="RetryAfterExceededException"/> subtype) marks the saga partial,
+/// merges this provider's rate-limit window, publishes the rate-limited sentinel, and re-enqueues on
+/// the origin lane (interactive requests remain interactive). Other exceptions retry up to
+/// <see cref="LookupConstants.MaxQueueRetryAttempts"/>, then move to the DLQ.
 /// </remarks>
 public sealed partial class QueueProcessorBackgroundService : BackgroundService {
+    private sealed class PermanentRequestException( string message ) : Exception( message );
+
     /// <summary>The Redis connection used to publish saga and lookup completion events.</summary>
     private readonly IConnectionMultiplexer _redis;
     /// <summary>This provider's request queue, drained for work.</summary>
@@ -44,6 +47,8 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
     private readonly SupportedProviders _provider;
     /// <summary>The logger for processing lifecycle, rate-limit, and failure diagnostics.</summary>
     private readonly ILogger<QueueProcessorBackgroundService> _logger;
+    /// <summary>Bound on simultaneous provider calls made by this worker.</summary>
+    private readonly int _maxConcurrency;
     /// <summary>camelCase JSON options used to serialize provider results into saga state.</summary>
     private readonly JsonSerializerOptions _jsonOptions;
 
@@ -51,10 +56,9 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
     private const string SagaCompletedChannel = "saga:completed";
     /// <summary>Prefix for the per-lookup Redis channel (<c>complete:{lookupKey}</c>) that wakes orchestrator waiters.</summary>
     private const string LookupCompleteChannelPrefix = "complete:";
-    /// <summary>Idle-poll delay applied when the queue has no message ready (100 ms).</summary>
-    private static readonly TimeSpan s_noMessageDelay = TimeSpan.FromMilliseconds( 100 );
-    /// <summary>Backoff applied after an unexpected loop error before retrying (1 second).</summary>
+    /// <summary>Scheduled recovery event after an unexpected loop error (1 second).</summary>
     private static readonly TimeSpan s_errorDelay = TimeSpan.FromSeconds( 1 );
+    private const int MaxAcknowledgementRecoveryAttempts = 4;
 
     /// <summary>
     /// Initializes a processor for a single provider with its queue, rate-limit tracker, saga manager,
@@ -67,6 +71,7 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
     /// <param name="lookupService">The provider lookup service that performs the actual API call.</param>
     /// <param name="provider">The provider this processor serves.</param>
     /// <param name="logger">The logger for processing diagnostics.</param>
+    /// <param name="settings">Queue settings that bound per-provider concurrency.</param>
     /// <exception cref="ArgumentNullException">Thrown when any required dependency is null.</exception>
     public QueueProcessorBackgroundService(
         IConnectionMultiplexer redis,
@@ -75,7 +80,8 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
         ISagaStateManager sagaManager,
         IMusicLookupService lookupService,
         SupportedProviders provider,
-        ILogger<QueueProcessorBackgroundService> logger
+        ILogger<QueueProcessorBackgroundService> logger,
+        QueueSettings? settings = null
     ) {
         _redis = redis ?? throw new ArgumentNullException( nameof( redis ) );
         _queue = queue ?? throw new ArgumentNullException( nameof( queue ) );
@@ -84,6 +90,7 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
         _lookupService = lookupService ?? throw new ArgumentNullException( nameof( lookupService ) );
         _provider = provider;
         _logger = logger ?? throw new ArgumentNullException( nameof( logger ) );
+        _maxConcurrency = (settings ?? new QueueSettings( )).GetProviderConcurrency( provider );
 
         _jsonOptions = new JsonSerializerOptions {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -93,50 +100,224 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
 
     /// <summary>
     /// Runs the consume loop until the host stops. Ensures Redis Streams consumer groups exist, then
-    /// repeatedly dequeues (rate-limit aware), processing each message or idle-polling when none is
-    /// ready. Cancellation ends the loop; other loop-level errors are logged and followed by a short
-    /// backoff before continuing.
+    /// repeatedly dequeues (rate-limit aware) up to the configured concurrency. When no delivery is
+    /// eligible it waits for a Redis work notification, an in-flight completion, or the exact expiry
+    /// of a provider rate-limit window. Cancellation ends the loop; control-plane failures use a
+    /// scheduled recovery event rather than sleeping the consumer.
     /// </summary>
     /// <param name="stoppingToken">Signals that the host is shutting down.</param>
     /// <returns>A task that completes when the processor stops.</returns>
     protected override async Task ExecuteAsync( CancellationToken stoppingToken ) {
         LogQueueProcessorStarting( _logger, _provider );
 
-        // Ensure consumer groups exist before starting to consume
-        if (_queue is RedisRequestQueue<QueuedLookupRequest> redisQueue) {
-            await redisQueue.EnsureConsumerGroupsAsync( stoppingToken );
-        }
-
-        while (!stoppingToken.IsCancellationRequested) {
-            try {
-                // Use rate-limit-aware dequeue to skip messages for blocked endpoints
-                QueuedMessage<QueuedLookupRequest>? message = await _queue.DequeueAsync( _rateLimitTracker, stoppingToken );
-
-                if (message is null) {
-                    // No messages available, wait briefly before checking again
-                    await Task.Delay( s_noMessageDelay, stoppingToken );
-                    continue;
+        if (_queue is IQueueWorkSignal workSignal) {
+            while (!stoppingToken.IsCancellationRequested) {
+                try {
+                    await workSignal.InitializeWorkSignalAsync( stoppingToken );
+                    break;
+                } catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) {
+                    return;
+                } catch (Exception ex) {
+                    LogQueueProcessorLoopError( _logger, ex, _provider );
+                    await WaitForTimerEventAsync( s_errorDelay, stoppingToken );
                 }
-
-                await ProcessMessageAsync( message, stoppingToken );
-            } catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) {
-                // Normal shutdown
-                break;
-            } catch (Exception ex) {
-                LogQueueProcessorLoopError( _logger, ex, _provider );
-                await Task.Delay( s_errorDelay, stoppingToken );
             }
         }
 
+        // Ensure consumer groups exist before starting to consume. Decorated queues expose the
+        // same capability so the processor does not depend on a concrete queue implementation.
+        if (_queue is IConsumerGroupAssurance startupQueue) {
+            try {
+                await startupQueue.EnsureConsumerGroupsAsync( stoppingToken );
+            } catch (Exception ex) when (ex is not OperationCanceledException || !stoppingToken.IsCancellationRequested) {
+                LogQueueProcessorLoopError( _logger, ex, _provider );
+                await WaitForTimerEventAsync( s_errorDelay, stoppingToken );
+            }
+        }
+
+        Dictionary<Task, string> inFlight = [];
+        while (!stoppingToken.IsCancellationRequested) {
+            try {
+                if (inFlight.Count >= _maxConcurrency) {
+                    Task completed = await Task.WhenAny( inFlight.Keys );
+                    _ = inFlight.Remove( completed );
+                    await completed;
+                    continue;
+                }
+
+                long observedWorkVersion = _queue is IQueueWorkSignal versionedSignal
+                    ? versionedSignal.CaptureWorkVersion( )
+                    : 0;
+                QueuedMessage<QueuedLookupRequest>? message;
+                // Use rate-limit-aware dequeue to skip messages for blocked endpoints
+                message = await _queue.DequeueAsync( _rateLimitTracker, stoppingToken );
+
+                if (message is null) {
+                    foreach (Task completed in inFlight.Keys.Where( task => task.IsCompleted ).ToArray( )) {
+                        _ = inFlight.Remove( completed );
+                        await completed;
+                    }
+                    await WaitForQueueEventAsync( observedWorkVersion, inFlight, stoppingToken );
+                    continue;
+                }
+
+                if (inFlight.ContainsValue( message.MessageId )) {
+                    // Defensive second fence: a queue implementation must not hand out an active
+                    // PEL entry, but the processor still refuses concurrent work for one delivery.
+                    Task completed = await Task.WhenAny( inFlight.Keys );
+                    _ = inFlight.Remove( completed );
+                    await completed;
+                    continue;
+                }
+
+                Task processing = ProcessDequeuedMessageAsync( message, stoppingToken );
+                inFlight.Add( processing, message.MessageId );
+            } catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) {
+                // Normal shutdown
+                break;
+            } catch (RedisServerException ex) when (ex.Message.Contains( "NOGROUP", StringComparison.OrdinalIgnoreCase )
+                                                      && _queue is IConsumerGroupAssurance recoveryQueue) {
+                try {
+                    await recoveryQueue.EnsureConsumerGroupsAsync( stoppingToken );
+                } catch (Exception repairEx) when (repairEx is not OperationCanceledException || !stoppingToken.IsCancellationRequested) {
+                    LogQueueProcessorLoopError( _logger, repairEx, _provider );
+                    await WaitForTimerEventAsync( s_errorDelay, stoppingToken );
+                }
+            } catch (Exception ex) {
+                LogQueueProcessorLoopError( _logger, ex, _provider );
+                await WaitForTimerEventAsync( s_errorDelay, stoppingToken );
+            }
+        }
+
+        try {
+            await Task.WhenAll( inFlight.Keys );
+        } catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) {
+            // Normal shutdown of in-flight provider calls.
+        }
+
         LogQueueProcessorStopping( _logger, _provider );
+    }
+
+    private async Task WaitForQueueEventAsync(
+        long observedWorkVersion,
+        IReadOnlyDictionary<Task, string> inFlight,
+        CancellationToken cancellationToken
+    ) {
+        if (_queue is IQueueWorkSignal workSignal) {
+            IReadOnlyList<RateLimitedEndpoint> limits =
+                await _rateLimitTracker.GetAllRateLimitedAsync( _provider, cancellationToken );
+            DateTimeOffset? nextEligibility = limits.Count == 0
+                ? null
+                : limits.Min( limit => limit.RetryAfter );
+            Task wake = workSignal.WaitForWorkAsync( observedWorkVersion, nextEligibility, cancellationToken );
+            if (inFlight.Count == 0) {
+                await wake;
+            } else {
+                _ = await Task.WhenAny( inFlight.Keys.Append( wake ) );
+            }
+            return;
+        }
+
+        if (inFlight.Count > 0) {
+            _ = await Task.WhenAny( inFlight.Keys );
+            return;
+        }
+
+        // Alternate queue implementations without broker notifications receive a scheduled event;
+        // the production Redis queue never enters this fallback.
+        await WaitForTimerEventAsync( TimeSpan.FromMilliseconds( 100 ), cancellationToken );
+    }
+
+    private static async Task WaitForTimerEventAsync( TimeSpan dueTime, CancellationToken cancellationToken ) {
+        TaskCompletionSource elapsed = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        using Timer timer = new(
+            static state => ((TaskCompletionSource)state!).TrySetResult( ),
+            elapsed,
+            dueTime,
+            Timeout.InfiniteTimeSpan );
+        await elapsed.Task.WaitAsync( cancellationToken );
+    }
+
+    private async Task ProcessDequeuedMessageAsync(
+        QueuedMessage<QueuedLookupRequest> message,
+        CancellationToken stoppingToken
+    ) {
+        Stopwatch wallStopwatch = Stopwatch.StartNew( );
+        using Activity? wallActivity = QueueMetrics.ActivitySource.StartActivity( "queue.message.wall" );
+        _ = (wallActivity?.SetTag( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ));
+        _ = (wallActivity?.SetTag( QueueMetricTags.Priority, message.Priority.ToString( ).ToLowerInvariant( ) ));
+        try {
+            await ProcessMessageAsync( message, stoppingToken );
+        } catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) {
+            // The unacknowledged delivery remains in the PEL for recovery after restart.
+        } catch (PostCommitAcknowledgementException ex) {
+            LogQueueProcessorLoopError( _logger, ex, _provider );
+            // The provider result is committed. Broker recovery must not consume one of the
+            // bounded provider-work slots during a Redis outage.
+            Task recovery = RecoverCommittedAcknowledgementAsync( message, stoppingToken );
+            if (_queue is IQueueDeliveryTracker) {
+                _ = recovery;
+            } else {
+                // Alternate/test queues have no active-delivery fence, so they must keep this
+                // delivery attached to the loop until recovery finishes or shutdown cancels it.
+                await recovery;
+            }
+        } catch (Exception ex) {
+            LogQueueProcessorLoopError( _logger, ex, _provider );
+            // Control-plane recovery is scheduled independently of provider retries. Keeping the
+            // delivery active until the event fires prevents an immediate own-PEL hot loop.
+            try {
+                await WaitForTimerEventAsync( s_errorDelay, stoppingToken );
+            } catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) {
+                return;
+            }
+            if (_queue is IQueueDeliveryTracker tracker) tracker.ReleaseDelivery( message.MessageId );
+        } finally {
+            wallStopwatch.Stop( );
+            QueueMetrics.MessageWallDuration.Record( wallStopwatch.Elapsed.TotalSeconds,
+                new KeyValuePair<string, object?>( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ),
+                new KeyValuePair<string, object?>( QueueMetricTags.Priority, message.Priority.ToString( ).ToLowerInvariant( ) ) );
+        }
+    }
+
+    /// <summary>Retries a post-commit acknowledgement with bounded exponential backoff.</summary>
+    internal async Task RecoverCommittedAcknowledgementAsync(
+        QueuedMessage<QueuedLookupRequest> message,
+        CancellationToken cancellationToken,
+        Func<TimeSpan, CancellationToken, Task>? waitAsync = null
+    ) {
+        waitAsync ??= WaitForTimerEventAsync;
+        for (int attempt = 1; attempt <= MaxAcknowledgementRecoveryAttempts; attempt++) {
+            try {
+                await waitAsync(
+                    TimeSpan.FromSeconds( 1 << (attempt - 1) ), cancellationToken );
+            } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
+                return;
+            }
+            try {
+                await _queue.AcknowledgeAsync( message.MessageId, cancellationToken );
+                QueueMetrics.RecordTerminalOutcome( _provider, message.Priority, "ack_recovered" );
+                return;
+            } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
+                return;
+            } catch (Exception ackEx) {
+                LogQueueProcessorLoopError( _logger, ackEx, _provider );
+                QueueMetrics.RecordTerminalOutcome( _provider, message.Priority, "ack_recovery_failed" );
+            }
+        }
+
+        // The entry remains in Redis's PEL. Release only the local delivery fence so normal
+        // idempotent processing can recover it on a later work signal or reclaim wake.
+        if (_queue is IQueueDeliveryTracker tracker) tracker.ReleaseDelivery( message.MessageId );
     }
 
     /// <summary>
     /// Processes one dequeued message end to end: rebuilds the lookup key, ensures the saga and this
     /// provider's state, pre-checks the endpoint rate limit (requeuing if limited), performs the
     /// lookup, records the result in saga state, publishes saga and lookup completion, and
-    /// acknowledges. Rate-limit and other failures are routed to their handlers; processing duration
-    /// is always recorded as a metric.
+    /// acknowledges. Rate-limit and other failures are routed to their handlers. The processing
+    /// duration recorded here is deliberately post-dequeue only (it excludes <c>DequeueAsync</c>);
+    /// the end-to-end dequeue-to-completion metric is <c>queue.message.wall.duration</c>.
     /// </summary>
     /// <param name="message">The dequeued message carrying the lookup request.</param>
     /// <param name="ct">Cancels processing.</param>
@@ -144,96 +325,200 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
     private async Task ProcessMessageAsync( QueuedMessage<QueuedLookupRequest> message, CancellationToken ct ) {
         QueuedLookupRequest request = message.Payload;
         Stopwatch stopwatch = Stopwatch.StartNew( );
+        Stopwatch? httpTimer = null;
         string status = "success";
+        string? instanceToken = null;
 
         LogProcessingMessage( _logger, message.MessageId, request.SagaId, request.LookupType );
 
-        // Ensure saga exists before processing. This handles JetStream bulk lookups where
-        // the saga ID is set but the saga hasn't been created yet (fire-and-forget pattern).
-        // For web lookups, this will return the existing saga.
-        // The lookupKey MUST use the same canonical format as LookupOrchestrator so that
-        // orchestrator-produced and worker-produced saga IDs agree for the same entity.
-        // Use LookupKeyBuilder to derive the key from the request's own fields.
-        string lookupKey = request.LookupType is LookupRequestType.SongIdLookup or LookupRequestType.AlbumIdLookup
+        try {
+
+            // Every producer creates and fences the saga before publishing its delivery. A missing
+            // saga therefore identifies an expired or stale delivery and must never be recreated
+            // here, because doing so would attach old work to a new generation.
+            // The lookupKey MUST use the same canonical format as LookupOrchestrator so that
+            // orchestrator-produced and worker-produced saga IDs agree for the same entity.
+            // Use LookupKeyBuilder to derive the key from the request's own fields.
+            string lookupKey = request.LookupType is LookupRequestType.SongIdLookup or LookupRequestType.AlbumIdLookup
             ? LookupKeyBuilder.TypedKey( request.LookupType, _provider, request.LookupValue )
             : request.LookupType == LookupRequestType.UriLookup
                 ? LookupKeyBuilder.UrlKey( request.LookupValue )
                 : $"{request.LookupType}:{request.LookupValue}";
-        _ = await _sagaManager.GetOrCreateAsync(
-            request.SagaId,
-            lookupKey,
-            request.LookupType,
-            request.LookupValue,
-            request.OriginPriority,
-            ct
-        );
-
-        // Initialize provider state for this provider if not already done
-        await _sagaManager.InitializeProviderStatesAsync( request.SagaId, [_provider], ct );
-
-        // Check if the endpoint for this lookup type is rate-limited
-        string endpoint = request.LookupType.ToString( );
-        RateLimitState rateLimitState = await _rateLimitTracker.GetStateAsync( _provider, endpoint, ct );
-
-        if (rateLimitState.IsRateLimited) {
-            if (_logger.IsEnabled( LogLevel.Debug )) {
-                DateTimeOffset retryAfter = rateLimitState.RetryAfter.GetValueOrDefault( );
-                LogEndpointRateLimited( _logger, endpoint, retryAfter, message.MessageId );
+            LookupSagaState? authoritativeSaga = await _sagaManager.GetAsync( request.SagaId, ct );
+            if (authoritativeSaga is null) {
+                // Producers create and fence the saga before publishing a delivery. Recreating it
+                // here would let a delivery from an expired generation attach to a new instance.
+                status = "stale";
+                await AcknowledgeStaleDeliveryAsync( message, ct );
+                return;
             }
 
-            // Requeue with delay until rate limit expires
-            await _queue.RequeueAsync( message.MessageId, rateLimitState.TimeRemaining, ct );
+            bool rootIdentityMatches = string.Equals( authoritativeSaga.LookupKey, lookupKey, StringComparison.Ordinal )
+                && authoritativeSaga.LookupType == request.LookupType
+                && string.Equals( authoritativeSaga.LookupValue, request.LookupValue, StringComparison.Ordinal );
+            instanceToken = authoritativeSaga.InstanceToken;
+            if (string.IsNullOrWhiteSpace( instanceToken )) {
+                status = "stale";
+                await AcknowledgeStaleDeliveryAsync( message, ct );
+                return;
+            }
+            if (string.IsNullOrWhiteSpace( request.SagaInstanceToken )
+                || !string.Equals( request.SagaInstanceToken, instanceToken, StringComparison.Ordinal )) {
+                status = "stale";
+                await AcknowledgeStaleDeliveryAsync( message, ct );
+                return;
+            }
+            bool legitimateChild = authoritativeSaga.ProviderStates.TryGetValue( _provider, out ProviderLookupState? existingProviderState )
+                && !existingProviderState.IsComplete;
+            if (authoritativeSaga.ProviderStates.TryGetValue( _provider, out ProviderLookupState? completedProviderState )
+                && completedProviderState.IsComplete) {
+                if (completedProviderState.ErrorMessage is not null) {
+                    try {
+                        await _queue.MoveToDlqAsync( message.MessageId, completedProviderState.ErrorMessage, ct );
+                    } catch (OperationCanceledException) when (ct.IsCancellationRequested) {
+                        throw;
+                    } catch (Exception ex) {
+                        throw new TerminalDlqRecoveryException( message.MessageId, ex );
+                    }
+                    QueueMetrics.RecordTerminalOutcome( _provider, message.Priority, "dlq_recovery" );
+                    status = "failure";
+                    return;
+                }
+                // A redelivered delivery can follow a successful provider commit whose ACK was
+                // lost. It is already represented by the active saga leg, so clear only this stale
+                // delivery and never invoke the provider, mutate state, or quarantine it.
+                status = "stale";
+                await AcknowledgeStaleDeliveryAsync( message, ct );
+                return;
+            }
+            if (!rootIdentityMatches
+                && !legitimateChild) {
+                status = "failure";
+                await QuarantineIdentityMismatchAsync( message, request, lookupKey, authoritativeSaga, ct );
+                return;
+            }
+            if (!await _sagaManager.TryInitializeProviderStatesAsync( request.SagaId, [_provider], instanceToken, ct )) {
+                status = "stale";
+                await AcknowledgeStaleDeliveryAsync( message, ct );
+                return;
+            }
 
-            // Record processing duration with rate_limited status
-            stopwatch.Stop( );
-            QueueMetrics.RecordProcessingDuration( _provider, request.LookupType, "rate_limited", stopwatch.Elapsed.TotalSeconds );
-            return;
-        }
+            // Check if the endpoint for this lookup type is rate-limited
+            string endpoint = request.LookupType.ToString( );
+            RateLimitState rateLimitState = await _rateLimitTracker.GetStateAsync( _provider, endpoint, ct );
 
-        try {
+            if (rateLimitState.IsRateLimited) {
+                status = "rate_limited";
+                if (_logger.IsEnabled( LogLevel.Debug )) {
+                    DateTimeOffset retryAfter = rateLimitState.RetryAfter.GetValueOrDefault( );
+                    LogEndpointRateLimited( _logger, endpoint, retryAfter, message.MessageId );
+                }
+
+                // Requeue with delay until rate limit expires
+                await _queue.RequeueAsync( message.MessageId, rateLimitState.TimeRemaining, ct );
+
+                return;
+            }
+
             // Perform the lookup
-            MusicLookupResult? result = await PerformLookupAsync( request, ct );
+            using Activity? httpActivity = QueueMetrics.ActivitySource.StartActivity( "queue.provider_http" );
+            _ = (httpActivity?.SetTag( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ));
+            _ = (httpActivity?.SetTag( QueueMetricTags.Priority, message.Priority.ToString( ).ToLowerInvariant( ) ));
+            httpTimer = Stopwatch.StartNew( );
+            MusicLookupResult? result;
+            try {
+                result = await PerformLookupAsync( request, ct );
+            } finally {
+                httpTimer.Stop( );
+                httpActivity?.Stop( );
+            }
 
-            // Update saga state with successful result
-            await _sagaManager.UpdateProviderStateAsync(
-                request.SagaId,
-                new ProviderLookupState(
-                    Provider: _provider,
-                    IsComplete: true,
-                    IsSuccess: result is not null,
-                    ResultJson: result is not null ? JsonSerializer.Serialize( result, _jsonOptions ) : null,
-                    CompletedAt: DateTimeOffset.UtcNow,
-                    ErrorMessage: null
-                ),
-                ct
-            );
-
+            Stopwatch sagaTimer = Stopwatch.StartNew( );
+            using Activity? sagaActivity = QueueMetrics.ActivitySource.StartActivity( "queue.saga.update" );
+            _ = (sagaActivity?.SetTag( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ));
+            _ = (sagaActivity?.SetTag( QueueMetricTags.Priority, message.Priority.ToString( ).ToLowerInvariant( ) ));
+            try {
+                if (!await _sagaManager.TryUpdateProviderStateAsync( request.SagaId,
+                        new ProviderLookupState( _provider, true, result is not null,
+                            result is not null ? JsonSerializer.Serialize( result, _jsonOptions ) : null,
+                            DateTimeOffset.UtcNow, null ), instanceToken, ct )) {
+                    status = "stale";
+                    await AcknowledgeStaleDeliveryAsync( message, ct );
+                    return;
+                }
+            } finally {
+                sagaTimer.Stop( );
+                sagaActivity?.Stop( );
+                QueueMetrics.SagaUpdateDuration.Record( sagaTimer.Elapsed.TotalSeconds,
+                    new KeyValuePair<string, object?>( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ),
+                    new KeyValuePair<string, object?>( QueueMetricTags.Priority, message.Priority.ToString( ).ToLowerInvariant( ) ) );
+            }
             // Acknowledge the message before publishing completion events so that a crash
             // between the two does not leave the message in the PEL and re-publish both
             // completion channels on redelivery. If the publish calls are lost, the 30-second
             // polling sweep re-finalizes within one cycle.
-            await _queue.AcknowledgeAsync( message.MessageId, ct );
+            try {
+                await _queue.AcknowledgeAsync( message.MessageId, ct );
+                QueueMetrics.RecordTerminalOutcome( _provider, message.Priority, "success" );
+            } catch (OperationCanceledException) when (ct.IsCancellationRequested) {
+                throw;
+            } catch (Exception ex) {
+                // Provider state is already committed. Keep the PEL delivery pending for the
+                // worker loop's recovery/backoff path; do not feed an ACK failure into the
+                // ordinary provider-failure handler, which could overwrite or DLQ the result.
+                throw new PostCommitAcknowledgementException( message.MessageId, ex );
+            }
 
-            // Check if saga is complete and publish saga completion event for coordinator
-            await CheckAndPublishSagaCompletionAsync( request.SagaId, ct );
-
-            // Publish lookup completion so the SagaCoordinator can process via pattern subscription
-            await PublishLookupCompletionAsync( request.SagaId, ct );
+            // Provider state is already durable. Publish an idempotent progress event without a
+            // second saga read; a transient read failure here must not suppress finalization after
+            // the delivery has been acknowledged.
+            await PublishSagaProgressAsync( request.SagaId );
+            QueueMetrics.RecordSagaLegCompleted( _provider, message.Priority, "committed" );
 
             LogMessageProcessed( _logger, message.MessageId, request.SagaId );
-        } catch (OperationCanceledException) {
-            // Host is shutting down; do not publish completion events.
-            // The message will be redelivered after restart, or the polling sweep will finalize.
+        } catch (OperationCanceledException) when (ct.IsCancellationRequested) {
+            // Host shutdown is not a retryable provider failure; leave the message pending for
+            // redelivery after restart.
             throw;
-        } catch (RetryAfterExceededException ex) {
+        } catch (UnreadableSagaStateException ex) {
+            status = "failure";
+            await QuarantineUnreadableSagaAsync( message, request, ex, ct );
+        } catch (PostCommitAcknowledgementException) {
+            status = "failure";
+            throw;
+        } catch (TerminalDlqRecoveryException) {
+            status = "failure";
+            throw;
+        } catch (QueueDeliveryIdentityQuarantineException) {
+            status = "failure";
+            throw;
+        } catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound) {
+            status = "failure";
+            await HandlePermanentRequestExceptionAsync(
+                message,
+                request,
+                new PermanentRequestException( "Provider returned HTTP 404 (not found)." ),
+                instanceToken,
+                ct );
+        } catch (PermanentRequestException ex) {
+            status = "failure";
+            await HandlePermanentRequestExceptionAsync( message, request, ex, instanceToken, ct );
+        } catch (ProviderRateLimitException ex) {
             status = "rate_limited";
-            await HandleRateLimitExceptionAsync( message, request, ex, ct );
+            if (string.IsNullOrWhiteSpace( instanceToken )) throw;
+            await HandleRateLimitExceptionAsync( message, request, ex, instanceToken, ct );
         } catch (Exception ex) {
             status = "failure";
-            await HandleProcessingExceptionAsync( message, request, ex, ct );
+            if (string.IsNullOrWhiteSpace( instanceToken )) throw;
+            await HandleProcessingExceptionAsync( message, request, ex, instanceToken, ct );
         } finally {
             stopwatch.Stop( );
-            QueueMetrics.RecordProcessingDuration( _provider, request.LookupType, status, stopwatch.Elapsed.TotalSeconds );
+            if (httpTimer is not null) {
+                QueueMetrics.ProviderHttpDuration.Record( httpTimer.Elapsed.TotalSeconds,
+                    new KeyValuePair<string, object?>( QueueMetricTags.Provider, _provider.ToString( ).ToLowerInvariant( ) ),
+                    new KeyValuePair<string, object?>( QueueMetricTags.Priority, message.Priority.ToString( ).ToLowerInvariant( ) ) );
+            }
+            QueueMetrics.RecordProcessingDuration( _provider, request.LookupType, status, stopwatch.Elapsed.TotalSeconds, message.Priority );
         }
     }
 
@@ -260,46 +545,116 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
         // Check for cancellation before performing the lookup
         ct.ThrowIfCancellationRequested( );
 
+        MusicLookupResult? result = await PerformSingleLookupAsync(
+            request.LookupType,
+            request.LookupValue,
+            request.Title,
+            request.Artist,
+            request.Storefront
+        );
+
+        if (result is not null
+            || request.FallbackLookupType is null
+            || string.IsNullOrWhiteSpace( request.FallbackLookupValue )) {
+            return result;
+        }
+
+        return await PerformSingleLookupAsync(
+            request.FallbackLookupType.Value,
+            request.FallbackLookupValue,
+            request.Title,
+            request.Artist,
+            request.Storefront
+        );
+    }
+
+    private async Task<MusicLookupResult?> PerformSingleLookupAsync(
+        LookupRequestType lookupType,
+        string lookupValue,
+        string? title,
+        string? artist,
+        string? storefront
+    ) {
+        IStorefrontMusicLookupService? storefrontService = !string.IsNullOrWhiteSpace( storefront )
+            ? _lookupService as IStorefrontMusicLookupService
+            : null;
+
         // Map LookupRequestType to the appropriate lookup method
-        return request.LookupType switch {
-            LookupRequestType.UriLookup => await _lookupService.GetInfoAsync( request.LookupValue ),
-            LookupRequestType.IsrcLookup => await _lookupService.GetInfoByISRCAsync( request.LookupValue ),
-            LookupRequestType.UpcLookup => await _lookupService.GetInfoByUPCAsync( request.LookupValue ),
-            LookupRequestType.SongIdLookup => await _lookupService.GetInfoByIDAsync( request.LookupValue, false ),
-            LookupRequestType.AlbumIdLookup => await _lookupService.GetInfoByIDAsync( request.LookupValue, true ),
-            LookupRequestType.ArtistLookup when request is { Title: not null, Artist: not null } =>
-                await _lookupService.GetInfoAsync( request.Title, request.Artist ),
-            LookupRequestType.SongLookup when request is { Title: not null, Artist: not null } =>
-                await _lookupService.GetInfoAsync( request.Title, request.Artist ),
-            LookupRequestType.AlbumLookup when request is { Title: not null, Artist: not null } =>
-                await _lookupService.GetInfoAsync( request.Title, request.Artist ),
-            LookupRequestType.ArtistAlbumLookup when request is { Title: not null, Artist: not null } =>
-                await _lookupService.GetInfoAsync( request.Title, request.Artist ),
-            LookupRequestType.AlbumTrackLookup when request is { Title: not null, Artist: not null } =>
-                await _lookupService.GetInfoAsync( request.Title, request.Artist ),
-            _ => throw new InvalidOperationException(
-                            $"Unsupported lookup type {request.LookupType} or missing required parameters"
+        return lookupType switch {
+            LookupRequestType.UriLookup => await _lookupService.GetInfoAsync( lookupValue ),
+            LookupRequestType.IsrcLookup when storefrontService is not null =>
+                await storefrontService.GetInfoByISRCAsync( lookupValue, storefront! ),
+            LookupRequestType.IsrcLookup => await _lookupService.GetInfoByISRCAsync( lookupValue ),
+            LookupRequestType.UpcLookup when storefrontService is not null =>
+                await storefrontService.GetInfoByUPCAsync( lookupValue, storefront! ),
+            LookupRequestType.UpcLookup => await _lookupService.GetInfoByUPCAsync( lookupValue ),
+            LookupRequestType.SongIdLookup when storefrontService is not null =>
+                await storefrontService.GetInfoByIDAsync( lookupValue, false, storefront! ),
+            LookupRequestType.SongIdLookup => await _lookupService.GetInfoByIDAsync( lookupValue, false ),
+            LookupRequestType.AlbumIdLookup when storefrontService is not null =>
+                await storefrontService.GetInfoByIDAsync( lookupValue, true, storefront! ),
+            LookupRequestType.AlbumIdLookup => await _lookupService.GetInfoByIDAsync( lookupValue, true ),
+            LookupRequestType.ArtistLookup when title is not null && artist is not null =>
+                await _lookupService.GetInfoAsync( title, artist ),
+            LookupRequestType.SongLookup when title is not null && artist is not null =>
+                await _lookupService.GetInfoAsync( title, artist ),
+            LookupRequestType.AlbumLookup when title is not null && artist is not null =>
+                await _lookupService.GetInfoAsync( title, artist ),
+            LookupRequestType.ArtistAlbumLookup when title is not null && artist is not null =>
+                await _lookupService.GetInfoAsync( title, artist ),
+            LookupRequestType.AlbumTrackLookup when title is not null && artist is not null =>
+                await _lookupService.GetInfoAsync( title, artist ),
+            _ => throw new PermanentRequestException(
+                            $"Unsupported lookup type {lookupType} or missing required parameters"
                         )
         };
+    }
+
+    private async Task HandlePermanentRequestExceptionAsync(
+        QueuedMessage<QueuedLookupRequest> message,
+        QueuedLookupRequest request,
+        PermanentRequestException ex,
+        string? instanceToken,
+        CancellationToken ct
+    ) {
+        LogProcessingFailed( _logger, ex, request.RequestId, request.SagaId );
+        if (string.IsNullOrWhiteSpace( instanceToken ) || !await _sagaManager.TryUpdateProviderStateAsync(
+            request.SagaId,
+            new ProviderLookupState(
+                _provider,
+                IsComplete: true,
+                IsSuccess: false,
+                ResultJson: null,
+                CompletedAt: DateTimeOffset.UtcNow,
+                ErrorMessage: ex.Message ),
+            instanceToken, ct )) {
+            await AcknowledgeStaleDeliveryAsync( message, ct );
+            return;
+        }
+        await _queue.MoveToDlqAsync( message.MessageId, ex.Message, ct );
+        QueueMetrics.RecordTerminalOutcome( _provider, message.Priority, "permanent_failure" );
+        await PublishSagaProgressAsync( request.SagaId );
+        QueueMetrics.RecordSagaLegCompleted( _provider, message.Priority, "committed_failure" );
     }
 
     /// <summary>
     /// Handles a provider rate-limit hit: records the endpoint's retry window, marks the saga partial,
     /// merges this provider's rate-limit info into the saga (replacing any prior entry for it),
-    /// publishes the rate-limited sentinel to wake waiters with a partial, then acknowledges the
-    /// current message and re-enqueues the request at <see cref="QueuePriority.Background"/> with an
-    /// incremented attempt count. An interactive-origin request that hits a limit is explicitly logged
-    /// and metered as deferred to the background lane.
+    /// publishes the rate-limited sentinel to wake waiters with a partial, then re-enqueues the
+    /// request before acknowledging the current message. Interactive-origin work remains on the
+    /// interactive single-item lane across the rate-limit window.
     /// </summary>
     /// <param name="message">The message being processed when the limit was hit.</param>
     /// <param name="request">The lookup request that hit the rate limit.</param>
     /// <param name="ex">The rate-limit exception carrying the retry-after window.</param>
+    /// <param name="instanceToken">The saga instance fence captured before provider work.</param>
     /// <param name="ct">Cancels the saga and queue operations.</param>
     /// <returns>A task that completes once the saga is updated and the request re-enqueued.</returns>
     private async Task HandleRateLimitExceptionAsync(
         QueuedMessage<QueuedLookupRequest> message,
         QueuedLookupRequest request,
-        RetryAfterExceededException ex,
+        ProviderRateLimitException ex,
+        string instanceToken,
         CancellationToken ct
     ) {
         // Use the LookupRequestType as the endpoint identifier
@@ -308,11 +663,16 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
         LogRateLimitEncountered( _logger, _provider, endpoint, ex.RetryAfterValue );
 
         // Record the rate limit state
-        DateTimeOffset retryAfter = DateTimeOffset.UtcNow.Add( ex.RetryAfterValue );
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        TimeSpan boundedRetry = TimeSpan.FromTicks( Math.Min( ex.RetryAfterValue.Ticks, (DateTimeOffset.MaxValue - now).Ticks ) );
+        DateTimeOffset retryAfter = now.Add( boundedRetry );
         await _rateLimitTracker.SetRateLimitedAsync( _provider, endpoint, retryAfter, ct );
 
         // Mark saga as partial and record rate limit info for user notification
-        await _sagaManager.SetIsPartialAsync( request.SagaId, true, ct );
+        if (!await _sagaManager.TrySetIsPartialAsync( request.SagaId, true, instanceToken, ct )) {
+            await AcknowledgeStaleDeliveryAsync( message, ct );
+            return;
+        }
 
         // Merge with rate limit info recorded by other providers so no entry is lost -
         // the orchestrator's all-pending-providers-rate-limited escape hatch depends on
@@ -325,25 +685,32 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
             : [];
         mergedRateLimitInfo.Add( new ProviderRateLimitInfo( _provider, retryAfter, endpoint ) );
 
-        await _sagaManager.SetRateLimitInfoAsync( request.SagaId, mergedRateLimitInfo, ct );
+        if (!await _sagaManager.TrySetRateLimitInfoAsync( request.SagaId, mergedRateLimitInfo, instanceToken, ct )) {
+            await AcknowledgeStaleDeliveryAsync( message, ct );
+            return;
+        }
 
         // Publish rate-limited sentinel so waiting clients know this is a partial result
-        await PublishRateLimitSentinelAsync( request.SagaId, ct );
+        await PublishRateLimitSentinelAsync( request.SagaId, instanceToken, ct );
 
         // Requeue request - it will be skipped by rate-limit-aware dequeue until rate limit expires
         // The RateLimitedEndpoint field helps track which endpoint triggered the limit
         QueuedLookupRequest requeuedRequest = request with {
             AttemptCount = request.AttemptCount + 1,
-            RateLimitedEndpoint = endpoint
+            RateLimitedEndpoint = endpoint,
+            EnqueueOrigin = QueueEnqueueOrigin.Requeue,
+            // Interactive typed-id work must remain on the single-item lane rather than being
+            // intercepted by Spotify's bulk decorator after the rate-limit window.
+            BypassBulkRouting = request.BypassBulkRouting
+                || request.OriginPriority == QueuePriority.Interactive
         };
 
-        if (request.OriginPriority == QueuePriority.Interactive) {
-            LogInteractiveDeferredToBackground( _logger, request.SagaId, request.LookupType, endpoint, retryAfter );
-            QueueMetrics.RecordInteractiveDeferral( _provider, endpoint );
+        QueuePriority requeuePriority = request.OriginPriority;
+        await _queue.EnqueueAsync( requeuedRequest, requeuePriority, ct );
+        if (requeuePriority == QueuePriority.Interactive) {
+            QueueMetrics.RecordInteractiveRetry( _provider, endpoint );
         }
-
         await _queue.AcknowledgeAsync( message.MessageId, ct );
-        await _queue.EnqueueAsync( requeuedRequest, QueuePriority.Background, ct );
 
         LogSagaMarkedPartial( _logger, request.SagaId, endpoint, _provider, retryAfter );
     }
@@ -352,28 +719,29 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
     /// Handles a non-rate-limit processing failure. When the request has reached
     /// <see cref="LookupConstants.MaxQueueRetryAttempts"/>, marks this provider's saga state failed,
     /// moves the message to the dead-letter queue, and checks/publishes saga completion. Otherwise
-    /// records the provider failure, checks/publishes saga completion, and acknowledges the message so
-    /// it can be retried.
+    /// records the provider failure as incomplete and atomically replaces the delivery for another
+    /// event-driven attempt.
     /// </summary>
     /// <param name="message">The message being processed when the failure occurred.</param>
     /// <param name="request">The lookup request that failed.</param>
     /// <param name="ex">The exception that caused the failure.</param>
+    /// <param name="instanceToken">The saga instance fence captured before provider work.</param>
     /// <param name="ct">Cancels the saga and queue operations.</param>
     /// <returns>A task that completes once the failure has been recorded and routed.</returns>
     private async Task HandleProcessingExceptionAsync(
         QueuedMessage<QueuedLookupRequest> message,
         QueuedLookupRequest request,
         Exception ex,
+        string instanceToken,
         CancellationToken ct
     ) {
         LogProcessingFailed( _logger, ex, request.RequestId, request.SagaId );
 
-        // Check if we've exceeded retry attempts
-        if (request.AttemptCount >= LookupConstants.MaxQueueRetryAttempts) {
+        if (request.AttemptCount >= LookupConstants.MaxQueueRetryAttempts - 1) {
             LogMaxRetriesExceeded( _logger, message.MessageId, LookupConstants.MaxQueueRetryAttempts );
 
             // Update saga with error state
-            await _sagaManager.UpdateProviderStateAsync(
+            if (!await _sagaManager.TryUpdateProviderStateAsync(
                 request.SagaId,
                 new ProviderLookupState(
                     Provider: _provider,
@@ -383,35 +751,72 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
                     CompletedAt: DateTimeOffset.UtcNow,
                     ErrorMessage: $"Failed after {LookupConstants.MaxQueueRetryAttempts} attempts: {ex.Message}"
                 ),
-                ct
-            );
+                instanceToken, ct )) {
+                await AcknowledgeStaleDeliveryAsync( message, ct );
+                return;
+            }
 
             // Move to Dead Letter Queue
             await _queue.MoveToDlqAsync( message.MessageId, ex.Message, ct );
-
-            // Check if saga is complete and publish completion event
-            await CheckAndPublishSagaCompletionAsync( request.SagaId, ct );
+            QueueMetrics.RecordTerminalOutcome( _provider, message.Priority, "retry_exhausted" );
+            await PublishSagaProgressAsync( request.SagaId );
+            QueueMetrics.RecordSagaLegCompleted( _provider, message.Priority, "committed_failure" );
         } else {
-            // Update saga with error state but don't mark as complete
-            await _sagaManager.UpdateProviderStateAsync(
+            if (!await _sagaManager.TryUpdateProviderStateAsync(
                 request.SagaId,
-                new ProviderLookupState(
-                    Provider: _provider,
-                    IsComplete: true,
-                    IsSuccess: false,
-                    ResultJson: null,
-                    CompletedAt: DateTimeOffset.UtcNow,
-                    ErrorMessage: ex.Message
-                ),
-                ct
-            );
+                new ProviderLookupState( _provider, false, false, null, null, ex.Message ), instanceToken, ct )) {
+                await AcknowledgeStaleDeliveryAsync( message, ct );
+                return;
+            }
+            await _queue.RequeueAsync( message.MessageId, cancellationToken: ct );
+        }
+    }
 
-            // Acknowledge before publishing so a crash between the two does not re-publish
-            // the completion event on redelivery.
+    private async Task QuarantineUnreadableSagaAsync(
+        QueuedMessage<QueuedLookupRequest> message,
+        QueuedLookupRequest request,
+        UnreadableSagaStateException exception,
+        CancellationToken ct
+    ) {
+        try {
+            await _queue.MoveToDlqAsync( message.MessageId, exception.Message, ct );
+            QueueMetrics.RecordTerminalOutcome( _provider, message.Priority, "corrupt_saga_quarantine" );
+        } catch (OperationCanceledException) when (ct.IsCancellationRequested) {
+            throw;
+        } catch (Exception ex) {
+            LogIdentityQuarantineFailed( _logger, ex, message.MessageId, request.SagaId );
+            throw new QueueDeliveryIdentityQuarantineException( message.MessageId, request.SagaId, ex );
+        }
+    }
+
+    private async Task QuarantineIdentityMismatchAsync(
+        QueuedMessage<QueuedLookupRequest> message,
+        QueuedLookupRequest request,
+        string requestLookupKey,
+        LookupSagaState? authoritativeSaga,
+        CancellationToken ct
+    ) {
+        LogSagaIdentityMismatch( _logger, request.SagaId, message.MessageId, requestLookupKey,
+            authoritativeSaga?.LookupKey ?? "(missing)", request.LookupType,
+            authoritativeSaga?.LookupType ?? request.LookupType, request.LookupValue,
+            authoritativeSaga?.LookupValue ?? "(missing)" );
+        try {
+            await _queue.MoveToDlqAsync( message.MessageId, "Saga identity does not match queued request.", ct );
+            QueueMetrics.RecordTerminalOutcome( _provider, message.Priority, "identity_quarantine" );
+        } catch (Exception ex) {
+            LogIdentityQuarantineFailed( _logger, ex, message.MessageId, request.SagaId );
+            throw new QueueDeliveryIdentityQuarantineException( message.MessageId, request.SagaId, ex );
+        }
+    }
+
+    private async Task AcknowledgeStaleDeliveryAsync( QueuedMessage<QueuedLookupRequest> message, CancellationToken ct ) {
+        try {
             await _queue.AcknowledgeAsync( message.MessageId, ct );
-
-            // Check if saga is complete and publish completion event
-            await CheckAndPublishSagaCompletionAsync( request.SagaId, ct );
+            QueueMetrics.RecordTerminalOutcome( _provider, message.Priority, "stale_delivery" );
+        } catch (OperationCanceledException) when (ct.IsCancellationRequested) {
+            throw;
+        } catch (Exception ex) {
+            throw new PostCommitAcknowledgementException( message.MessageId, ex );
         }
     }
 
@@ -421,29 +826,45 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
     /// missing, incomplete, or already has a final result. Failures are logged and swallowed.
     /// </summary>
     /// <param name="sagaId">The saga to check and possibly announce.</param>
+    /// <param name="expectedInstanceToken">The saga instance fence.</param>
     /// <param name="ct">Cancels the saga read.</param>
     /// <returns>A task that completes once the check (and any publish) finishes.</returns>
-    private async Task CheckAndPublishSagaCompletionAsync( string sagaId, CancellationToken ct ) {
+    private async Task<LookupSagaState?> CheckAndPublishSagaCompletionAsync( string sagaId, string expectedInstanceToken, CancellationToken ct ) {
         try {
             LookupSagaState? saga = await _sagaManager.GetAsync( sagaId, ct );
 
-            if (saga is null) {
+            if (saga is null || saga.InstanceToken != expectedInstanceToken) {
                 LogSagaNotFoundForCompletion( _logger, sagaId );
-                return;
+                return null;
             }
 
             if (!saga.IsComplete) {
                 LogSagaNotYetComplete( _logger, sagaId );
-                return;
+                return saga;
             }
 
             if (!string.IsNullOrEmpty( saga.FinalResultUri )) {
                 LogSagaAlreadyHasFinalResult( _logger, sagaId );
-                return;
+                return saga;
             }
 
             // Saga is complete but doesn't have a final result - publish completion event
             LogSagaCompletePublishing( _logger, sagaId );
+            ISubscriber subscriber = _redis.GetSubscriber( );
+            _ = await subscriber.PublishAsync( RedisChannel.Literal( SagaCompletedChannel ), sagaId );
+            return saga;
+        } catch (Exception ex) {
+            LogSagaCompletionCheckFailed( _logger, ex, sagaId );
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Publishes an idempotent provider-leg progress hint. The coordinator owns the authoritative
+    /// completeness and instance-token checks; publishing does not depend on a post-commit read.
+    /// </summary>
+    private async Task PublishSagaProgressAsync( string sagaId ) {
+        try {
             ISubscriber subscriber = _redis.GetSubscriber( );
             _ = await subscriber.PublishAsync( RedisChannel.Literal( SagaCompletedChannel ), sagaId );
         } catch (Exception ex) {
@@ -457,14 +878,15 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
     /// (with a diagnostic log) when the saga is missing. Failures are logged and swallowed.
     /// </summary>
     /// <param name="sagaId">The saga whose lookup completion is announced.</param>
+    /// <param name="expectedInstanceToken">The saga instance fence.</param>
     /// <param name="ct">Cancels the saga read.</param>
     /// <returns>A task that completes once the publish (or no-op) finishes.</returns>
-    private async Task PublishLookupCompletionAsync( string sagaId, CancellationToken ct ) {
+    private async Task PublishLookupCompletionAsync( string sagaId, string expectedInstanceToken, CancellationToken ct ) {
         try {
             // Get the saga to retrieve the lookup key for the completion channel
             LookupSagaState? saga = await _sagaManager.GetAsync( sagaId, ct );
 
-            if (saga is null) {
+            if (saga is null || saga.InstanceToken != expectedInstanceToken) {
                 LogSagaNotFoundForLookupCompletion( _logger, sagaId );
                 return;
             }
@@ -489,13 +911,14 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
     /// No-ops (with a diagnostic log) when the saga is missing. Failures are logged and swallowed.
     /// </summary>
     /// <param name="sagaId">The saga whose pending providers are rate-limited.</param>
+    /// <param name="expectedInstanceToken">The saga instance fence.</param>
     /// <param name="ct">Cancels the saga read.</param>
     /// <returns>A task that completes once the publish (or no-op) finishes.</returns>
-    private async Task PublishRateLimitSentinelAsync( string sagaId, CancellationToken ct ) {
+    private async Task PublishRateLimitSentinelAsync( string sagaId, string expectedInstanceToken, CancellationToken ct ) {
         try {
             LookupSagaState? saga = await _sagaManager.GetAsync( sagaId, ct );
 
-            if (saga is null) {
+            if (saga is null || saga.InstanceToken != expectedInstanceToken) {
                 LogSagaNotFoundForLookupCompletion( _logger, sagaId );
                 return;
             }
@@ -551,6 +974,26 @@ public sealed partial class QueueProcessorBackgroundService : BackgroundService 
         Level = LogLevel.Debug,
         Message = "Processing message {MessageId} for saga {SagaId}, lookup type {LookupType}" )]
     private static partial void LogProcessingMessage( ILogger logger, string messageId, string sagaId, LookupRequestType lookupType );
+
+    /// <summary>Logs an error when the authoritative saga identity differs from the queued request.</summary>
+    [LoggerMessage(
+        EventId = LogEventIds.Services.Queue.SagaIdentityMismatch,
+        Level = LogLevel.Error,
+        Message = "Saga identity mismatch for message {MessageId}, saga {SagaId}: request {RequestLookupType}/{RequestLookupValue}/{RequestLookupKey}; authoritative {AuthoritativeLookupType}/{AuthoritativeLookupValue}/{AuthoritativeLookupKey}" )]
+    private static partial void LogSagaIdentityMismatch(
+        ILogger logger,
+        string sagaId,
+        string messageId,
+        string requestLookupKey,
+        string authoritativeLookupKey,
+        LookupRequestType requestLookupType,
+        LookupRequestType authoritativeLookupType,
+        string requestLookupValue,
+        string authoritativeLookupValue );
+
+    [LoggerMessage( EventId = LogEventIds.Services.Queue.SagaIdentityQuarantineFailed, Level = LogLevel.Error,
+        Message = "Failed to quarantine identity-mismatched message {MessageId} for saga {SagaId}" )]
+    private static partial void LogIdentityQuarantineFailed( ILogger logger, Exception ex, string messageId, string sagaId );
 
     /// <summary>Logs (Debug) that an endpoint is rate-limited and the message is being requeued.</summary>
     /// <param name="logger">The logger to write to.</param>

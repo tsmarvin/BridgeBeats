@@ -18,7 +18,7 @@ public class TidalLinkParserTests {
 
     /// <summary>
     /// Verifies that <c>GetTracksIsrcURI</c> emits exactly one <c>include</c> parameter whose value
-    /// is the comma-separated set of albums and artists, and that the ISRC filter and country code
+    /// is the comma-separated set of albums, artists, and genres, and that the ISRC filter and country code
     /// parameters are preserved.
     /// </summary>
     [TestMethod]
@@ -38,12 +38,12 @@ public class TidalLinkParserTests {
         Assert.HasCount( 1, includeValues,
             $"Expected exactly 1 'include' key in '{uri}'. Duplicate include keys violate JSON:API." );
 
-        // The value must be comma-separated and contain both relationships
+        // The value must be comma-separated and contain all required relationships
         string[] parts = includeValues[0].Split( ',' );
         CollectionAssert.AreEquivalent(
-            new[] { "albums", "artists" },
+            new[] { "albums", "artists", "genres" },
             parts,
-            $"Expected include value to contain exactly albums and artists; got '{includeValues[0]}'" );
+            $"Expected include value to contain exactly albums, artists, and genres; got '{includeValues[0]}'" );
 
         // The other params must survive the template substitution
         Assert.AreEqual( isrc, parsed["filter[isrc]"],
@@ -87,7 +87,7 @@ public class TidalLinkParserTests {
 
     /// <summary>
     /// Verifies that <c>GetTrackIdURI</c> emits exactly one <c>include</c> parameter whose value
-    /// is the comma-separated set of albums and artists, and that the country code is preserved.
+    /// is the comma-separated set of albums, artists, and genres, and that the country code is preserved.
     /// </summary>
     [TestMethod]
     public void GetTrackIdURI_ShouldEmitSingleIncludeParameter( ) {
@@ -107,9 +107,9 @@ public class TidalLinkParserTests {
 
         string[] parts = includeValues[0].Split( ',' );
         CollectionAssert.AreEquivalent(
-            new[] { "albums", "artists" },
+            new[] { "albums", "artists", "genres" },
             parts,
-            $"Expected include value to contain exactly albums and artists; got '{includeValues[0]}'" );
+            $"Expected include value to contain exactly albums, artists, and genres; got '{includeValues[0]}'" );
 
         Assert.AreEqual( storefront, parsed["countryCode"],
             "countryCode must be preserved after collapsing include params" );
@@ -202,6 +202,31 @@ public class TidalLinkParserTests {
 
         Assert.AreEqual( storefront, parsed["countryCode"],
             $"Expected countryCode={storefront}; got '{parsed["countryCode"]}'" );
+    }
+
+    /// <summary>Storefront data cannot inject additional query parameters.</summary>
+    [TestMethod]
+    public void GetTracksIsrcURI_WithInvalidStorefront_Throws( ) {
+        _ = Assert.ThrowsExactly<ArgumentException>( ( ) =>
+            TidalLinkParser.GetTracksIsrcURI( "US&include=evil", "USRC12345678" ) );
+    }
+
+    /// <summary>External identifiers are escaped before insertion into the query string.</summary>
+    [TestMethod]
+    public void GetTracksIsrcURI_WithReservedCharacters_EscapesValue( ) {
+        string uri = TidalLinkParser.GetTracksIsrcURI( "us", "ABC&countryCode=ZZ" );
+
+        Assert.Contains( "ABC%26countryCode%3DZZ", uri );
+        NameValueCollection parsed = ParseQueryString( uri );
+        Assert.AreEqual( "ABC&countryCode=ZZ", parsed["filter[isrc]"] );
+        Assert.AreEqual( "US", parsed["countryCode"] );
+    }
+
+    /// <summary>Native ids are restricted to the numeric shape returned by Tidal URLs.</summary>
+    [TestMethod]
+    public void GetTrackIdURI_WithNonNumericId_Throws( ) {
+        _ = Assert.ThrowsExactly<ArgumentException>( ( ) =>
+            TidalLinkParser.GetTrackIdURI( "US", "123/path" ) );
     }
 
     /// <summary>

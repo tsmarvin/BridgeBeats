@@ -99,8 +99,8 @@ namespace BridgeBeats.Providers.Tidal {
         /// <returns>A relative request URI for the artist search endpoint.</returns>
         public static string GetArtistSearchUri( string storefront, string artist )
             => ArtistSearchURI
-                .Replace( "{storefront}", storefront )
-                .Replace( "{artist}", Uri.EscapeDataString( artist ) );
+                .Replace( "{storefront}", ValidateStorefront( storefront ) )
+                .Replace( "{artist}", EscapeRequired( artist, nameof( artist ) ) );
 
         /// <summary>
         /// Builds the relative Tidal API URI for an artist's tracks relationship.
@@ -110,8 +110,8 @@ namespace BridgeBeats.Providers.Tidal {
         /// <returns>A relative request URI for the artist-tracks relationship endpoint.</returns>
         public static string GetArtistTracksUri( string storefront, string artistId )
             => ArtistTrackRelationshipsUri
-                .Replace( "{storefront}", storefront )
-                .Replace( "{artistId}", artistId );
+                .Replace( "{storefront}", ValidateStorefront( storefront ) )
+                .Replace( "{artistId}", ValidateNumericId( artistId, nameof( artistId ) ) );
 
         /// <summary>
         /// Builds the relative Tidal API URI for an artist's albums relationship.
@@ -121,8 +121,8 @@ namespace BridgeBeats.Providers.Tidal {
         /// <returns>A relative request URI for the artist-albums relationship endpoint.</returns>
         public static string GetArtistAlbumsUri( string storefront, string artistId )
             => ArtistAlbumRelationshipsUri
-                .Replace( "{storefront}", storefront )
-                .Replace( "{artistId}", artistId );
+                .Replace( "{storefront}", ValidateStorefront( storefront ) )
+                .Replace( "{artistId}", ValidateNumericId( artistId, nameof( artistId ) ) );
 
         /// <summary>
         /// Builds the relative Tidal API URI that filters tracks by ISRC.
@@ -132,8 +132,8 @@ namespace BridgeBeats.Providers.Tidal {
         /// <returns>A relative request URI for the ISRC-filtered tracks endpoint.</returns>
         public static string GetTracksIsrcURI( string storefront, string isrc )
             => TracksIsrcURI
-                .Replace( "{storefront}", storefront )
-                .Replace( "{isrc}", isrc );
+                .Replace( "{storefront}", ValidateStorefront( storefront ) )
+                .Replace( "{isrc}", EscapeRequired( isrc, nameof( isrc ) ) );
 
         /// <summary>
         /// Builds the relative Tidal API URI that filters albums by UPC (barcode id).
@@ -143,8 +143,8 @@ namespace BridgeBeats.Providers.Tidal {
         /// <returns>A relative request URI for the UPC-filtered albums endpoint.</returns>
         public static string GetAlbumUpcURI( string storefront, string upc )
             => AlbumsUpcURI
-                .Replace( "{storefront}", storefront )
-                .Replace( "{upc}", upc );
+                .Replace( "{storefront}", ValidateStorefront( storefront ) )
+                .Replace( "{upc}", EscapeRequired( upc, nameof( upc ) ) );
 
         /// <summary>
         /// Builds the relative Tidal API URI that fetches an album by id.
@@ -154,8 +154,8 @@ namespace BridgeBeats.Providers.Tidal {
         /// <returns>A relative request URI for the album-by-id endpoint.</returns>
         public static string GetAlbumIdURI( string storefront, string albumId )
             => AlbumIdUri
-                .Replace( "{storefront}", storefront )
-                .Replace( "{albumId}", albumId );
+                .Replace( "{storefront}", ValidateStorefront( storefront ) )
+                .Replace( "{albumId}", ValidateNumericId( albumId, nameof( albumId ) ) );
 
         /// <summary>
         /// Builds the relative Tidal API URI that fetches a track by id.
@@ -165,11 +165,34 @@ namespace BridgeBeats.Providers.Tidal {
         /// <returns>A relative request URI for the track-by-id endpoint.</returns>
         public static string GetTrackIdURI( string storefront, string trackId )
             => TrackIdUri
-                .Replace( "{storefront}", storefront )
-                .Replace( "{trackId}", trackId );
+                .Replace( "{storefront}", ValidateStorefront( storefront ) )
+                .Replace( "{trackId}", ValidateNumericId( trackId, nameof( trackId ) ) );
 
-        /// <summary>Template for the ISRC-filtered tracks request, side-loading albums and artists.</summary>
-        private const string TracksIsrcURI = "tracks?filter%5Bisrc%5D={isrc}&countryCode={storefront}&include=albums,artists";
+        private static string ValidateStorefront( string storefront ) {
+            ArgumentException.ThrowIfNullOrWhiteSpace( storefront );
+            string normalized = storefront.Trim( ).ToUpperInvariant( );
+            return normalized.Length == 2 && normalized.All( char.IsAsciiLetter )
+                ? normalized
+                : throw new ArgumentException(
+                    "Tidal storefront must be a two-letter ASCII country code.",
+                    nameof( storefront ) );
+        }
+
+        private static string ValidateNumericId( string value, string parameterName ) {
+            ArgumentException.ThrowIfNullOrWhiteSpace( value, parameterName );
+            string normalized = value.Trim( );
+            return normalized.All( char.IsAsciiDigit )
+                ? normalized
+                : throw new ArgumentException( "Tidal entity ids must contain only digits.", parameterName );
+        }
+
+        private static string EscapeRequired( string value, string parameterName ) {
+            ArgumentException.ThrowIfNullOrWhiteSpace( value, parameterName );
+            return Uri.EscapeDataString( value.Trim( ) );
+        }
+
+        /// <summary>Template for the ISRC-filtered tracks request, side-loading albums, artists, and genres.</summary>
+        private const string TracksIsrcURI = "tracks?filter%5Bisrc%5D={isrc}&countryCode={storefront}&include=albums,artists,genres";
 
         /// <summary>Template for the UPC-filtered albums request, side-loading artists and cover art.</summary>
         private const string AlbumsUpcURI = "albums?filter%5BbarcodeId%5D={upc}&countryCode={storefront}&include=artists,coverArt";
@@ -183,8 +206,8 @@ namespace BridgeBeats.Providers.Tidal {
         /// <summary>Template for the artist-tracks relationship request, fingerprint-collapsed and side-loading track resources.</summary>
         private const string ArtistTrackRelationshipsUri = "artists/{artistId}/relationships/tracks?countryCode={storefront}&collapseBy=FINGERPRINT&include=tracks";
 
-        /// <summary>Template for the track-by-id request, side-loading albums and artists.</summary>
-        private const string TrackIdUri = "tracks/{trackId}?countryCode={storefront}&include=albums,artists";
+        /// <summary>Template for the track-by-id request, side-loading albums, artists, and genres.</summary>
+        private const string TrackIdUri = "tracks/{trackId}?countryCode={storefront}&include=albums,artists,genres";
 
         /// <summary>Template for the album-by-id request, side-loading artists and cover art.</summary>
         private const string AlbumIdUri = "albums/{albumId}?countryCode={storefront}&include=artists,coverArt";

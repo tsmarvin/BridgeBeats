@@ -1,7 +1,7 @@
 namespace BridgeBeats.Contracts.DTOs;
 
 /// <summary>
-/// Point-in-time status of the CacheBootstrap worker, which warms the cache on a schedule.
+/// Point-in-time status of the Maintenance worker, which warms the cache on a schedule.
 /// Published to Redis under <see cref="RedisKey"/> and read back to surface bootstrap state
 /// alongside lookup statistics.
 /// </summary>

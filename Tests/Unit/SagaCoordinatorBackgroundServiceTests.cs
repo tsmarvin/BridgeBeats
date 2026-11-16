@@ -45,6 +45,8 @@ public class SagaCoordinatorBackgroundServiceTests {
     private HashSet<SupportedProviders> _enabledProviders = null!;
     /// <summary>Mock logger for the background service.</summary>
     private Mock<ILogger<SagaCoordinatorBackgroundService>> _loggerMock = null!;
+    /// <summary>Mock stale-refresh review store used by finalization lifecycle tests.</summary>
+    private Mock<IRefreshReviewStore> _refreshReviewStoreMock = null!;
 
     /// <summary>Fixed saga id used across the tests.</summary>
     private const string TestSagaId = "test-saga-id-12345678";
@@ -73,22 +75,61 @@ public class SagaCoordinatorBackgroundServiceTests {
         _queueResolverMock = new Mock<IProviderQueueResolver<QueuedLookupRequest>>( );
         _enabledProviders = [SupportedProviders.Spotify, SupportedProviders.AppleMusic, SupportedProviders.Tidal];
         _loggerMock = new Mock<ILogger<SagaCoordinatorBackgroundService>>( );
+        _refreshReviewStoreMock = new Mock<IRefreshReviewStore>( );
+        _ = _sagaManagerMock.Setup( s => s.GetAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( CreateCompleteSaga( ) );
+        _ = _refreshReviewStoreMock.Setup( store => store.MarkUnresolvedAsync(
+                It.IsAny<RefreshReviewEntry>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Returns( Task.CompletedTask );
+        _ = _refreshReviewStoreMock.Setup( store => store.CompleteAsync(
+                It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Returns( Task.CompletedTask );
 
         _ = _redisMock.Setup( r => r.GetSubscriber( It.IsAny<object>( ) ) ).Returns( _subscriberMock.Object );
 
         // By default the coordinator wins the secondaries-queued marker (no concurrent handler)
         _ = _sagaManagerMock
-            .Setup( s => s.TryMarkSecondariesQueuedAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Setup( s => s.TryMarkSecondariesQueuedAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _sagaManagerMock
+            .Setup( s => s.TryMarkSecondariesQueuedAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( true );
 
         // By default the coordinator wins the finalize claim (no concurrent handler)
         _ = _sagaManagerMock
-            .Setup( s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Setup( s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _sagaManagerMock
+            .Setup( s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( true );
 
         // By default the write-generation CAS advances (first call wins per generation)
         _ = _sagaManagerMock
-            .Setup( s => s.TryAdvanceWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ) )
+            .Setup( s => s.TryAdvanceWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _sagaManagerMock
+            .Setup( s => s.TryAdvanceWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+
+        // Token-fenced coordinator mutations succeed by default. Individual tests override these
+        // setups when exercising a lost instance race or a failed durable write.
+        _ = _sagaManagerMock
+            .Setup( s => s.TryUpdateProviderStateAsync( It.IsAny<string>( ), It.IsAny<ProviderLookupState>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _sagaManagerMock
+            .Setup( s => s.TrySetPartialResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _sagaManagerMock
+            .Setup( s => s.TrySetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( SagaFinalResultWriteOutcome.Stored );
+        _ = _sagaManagerMock
+            .Setup( s => s.TrySetIsPartialAsync( It.IsAny<string>( ), It.IsAny<bool>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _sagaManagerMock
+            .Setup( s => s.TryReleaseFinalizeClaimAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _sagaManagerMock
+            .Setup( s => s.TryInitializeProviderStatesAsync( It.IsAny<string>( ), It.IsAny<IEnumerable<SupportedProviders>>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( true );
     }
 
@@ -122,7 +163,8 @@ public class SagaCoordinatorBackgroundServiceTests {
                 _resultCombiner,
                 _queueResolverMock.Object,
                 _enabledProviders,
-                _loggerMock.Object
+                _loggerMock.Object,
+                _refreshReviewStoreMock.Object
             )
         );
     }
@@ -143,7 +185,8 @@ public class SagaCoordinatorBackgroundServiceTests {
                 _resultCombiner,
                 _queueResolverMock.Object,
                 _enabledProviders,
-                _loggerMock.Object
+                _loggerMock.Object,
+                _refreshReviewStoreMock.Object
             )
         );
     }
@@ -164,7 +207,8 @@ public class SagaCoordinatorBackgroundServiceTests {
                 _resultCombiner,
                 _queueResolverMock.Object,
                 _enabledProviders,
-                _loggerMock.Object
+                _loggerMock.Object,
+                _refreshReviewStoreMock.Object
             )
         );
     }
@@ -185,7 +229,8 @@ public class SagaCoordinatorBackgroundServiceTests {
                 _resultCombiner,
                 _queueResolverMock.Object,
                 _enabledProviders,
-                _loggerMock.Object
+                _loggerMock.Object,
+                _refreshReviewStoreMock.Object
             )
         );
     }
@@ -206,7 +251,8 @@ public class SagaCoordinatorBackgroundServiceTests {
                 _resultCombiner,
                 _queueResolverMock.Object,
                 _enabledProviders,
-                _loggerMock.Object
+                _loggerMock.Object,
+                _refreshReviewStoreMock.Object
             )
         );
     }
@@ -227,7 +273,8 @@ public class SagaCoordinatorBackgroundServiceTests {
                 null!,
                 _queueResolverMock.Object,
                 _enabledProviders,
-                _loggerMock.Object
+                _loggerMock.Object,
+                _refreshReviewStoreMock.Object
             )
         );
     }
@@ -248,6 +295,26 @@ public class SagaCoordinatorBackgroundServiceTests {
                 _resultCombiner,
                 _queueResolverMock.Object,
                 _enabledProviders,
+                null!,
+                _refreshReviewStoreMock.Object
+            )
+        );
+    }
+
+    /// <summary>A missing refresh-review store fails construction instead of disabling review flow.</summary>
+    [TestMethod]
+    public void Constructor_WithNullRefreshReviewStore_ShouldThrowArgumentNullException( ) {
+        _ = Assert.ThrowsExactly<ArgumentNullException>( ( ) =>
+            new SagaCoordinatorBackgroundService(
+                _redisMock.Object,
+                _sagaManagerMock.Object,
+                _atProtoStorageMock.Object,
+                _cacheRepositoryMock.Object,
+                _deduplicatorMock.Object,
+                _resultCombiner,
+                _queueResolverMock.Object,
+                _enabledProviders,
+                _loggerMock.Object,
                 null!
             )
         );
@@ -268,7 +335,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         SagaCoordinatorBackgroundService service = CreateService( );
         LookupSagaState completeSaga = CreateCompleteSaga( );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -295,7 +362,7 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - Should have queried for unfinalized sagas
         _sagaManagerMock.Verify(
-            s => s.GetCompletedButUnfinalizedAsync(
+            s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -313,7 +380,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Arrange
         SagaCoordinatorBackgroundService service = CreateService( );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -351,7 +418,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         SagaCoordinatorBackgroundService service = CreateService( );
         LookupSagaState completeSaga = CreateCompleteSaga( );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -384,7 +451,7 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - Should have set final result URI
         _sagaManagerMock.Verify(
-            s => s.SetFinalResultUriAsync( completeSaga.SagaId, TestRecordUri, It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetFinalResultUriAsync( completeSaga.SagaId, TestRecordUri, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
 
@@ -397,6 +464,11 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Assert - Should have released the deduplication lock
         _deduplicatorMock.Verify(
             d => d.ReleaseAsync( completeSaga.LookupKey, TestRecordUri, It.IsAny<CancellationToken>( ) ),
+            Times.Once
+        );
+
+        _refreshReviewStoreMock.Verify(
+            store => store.CompleteAsync( completeSaga.SagaId, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
     }
@@ -416,7 +488,7 @@ public class SagaCoordinatorBackgroundServiceTests {
             PartialResultUri = null
         };
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -443,13 +515,13 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - Should have written partial result first
         _sagaManagerMock.Verify(
-            s => s.SetPartialResultUriAsync( partialSaga.SagaId, TestRecordUri, It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetPartialResultUriAsync( partialSaga.SagaId, TestRecordUri, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
 
         // Assert - Should also have written final result
         _sagaManagerMock.Verify(
-            s => s.SetFinalResultUriAsync( partialSaga.SagaId, TestRecordUri, It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetFinalResultUriAsync( partialSaga.SagaId, TestRecordUri, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
     }
@@ -465,8 +537,10 @@ public class SagaCoordinatorBackgroundServiceTests {
         SagaCoordinatorBackgroundService service = CreateService( );
         LookupSagaState saga1 = CreateCompleteSaga( ) with { SagaId = "saga-1" };
         LookupSagaState saga2 = CreateCompleteSaga( ) with { SagaId = "saga-2" };
+        _ = _sagaManagerMock.Setup( s => s.GetAsync( "saga-1", It.IsAny<CancellationToken>( ) ) ).ReturnsAsync( saga1 );
+        _ = _sagaManagerMock.Setup( s => s.GetAsync( "saga-2", It.IsAny<CancellationToken>( ) ) ).ReturnsAsync( saga2 );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -526,14 +600,14 @@ public class SagaCoordinatorBackgroundServiceTests {
             }
         };
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
             ) )
             .ReturnsAsync( [failedSaga] );
 
-        _ = _sagaManagerMock.Setup( s => s.DeleteAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+        _ = _sagaManagerMock.Setup( s => s.TryDeleteAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( true );
 
         // Act
@@ -556,23 +630,292 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - Should delete the saga
         _sagaManagerMock.Verify(
-            s => s.DeleteAsync( failedSaga.SagaId, It.IsAny<CancellationToken>( ) ),
+            s => s.TryDeleteAsync( failedSaga.SagaId, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
     }
 
+    /// <summary>A failed provider leg does not discard a successful sibling refresh result.</summary>
+    [TestMethod]
+    [DataRow( false )]
+    [DataRow( true )]
+    public async Task WriteFinalResult_RefreshFailure_PreservesSuccessfulSibling( bool includeSuccessfulProvider ) {
+        SagaCoordinatorBackgroundService service = CreateService( );
+        LookupSagaState saga = CreateCompleteSaga( ) with {
+            ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                [SupportedProviders.Spotify] = new( SupportedProviders.Spotify, true, false, null, DateTimeOffset.UtcNow, "worker unavailable" )
+            }
+        };
+        if (includeSuccessfulProvider) {
+            saga = saga with {
+                ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState>( saga.ProviderStates ) {
+                    [SupportedProviders.AppleMusic] = new( SupportedProviders.AppleMusic, true, true,
+                        "{\"isrc\":\"USRC12345678\",\"trackName\":\"Track\",\"artistName\":\"Artist\",\"url\":\"https://example.test\"}",
+                        DateTimeOffset.UtcNow, null )
+                }
+            };
+        }
+        RefreshReviewEntry context = new( ) {
+            SourceRecordUri = "at://refresh/outage",
+            SagaId = saga.SagaId,
+            InstanceToken = saga.InstanceToken,
+            LookupType = saga.LookupType,
+            LookupValue = saga.LookupValue
+        };
+        _ = _refreshReviewStoreMock.Setup( store => store.GetPendingForSagaAsync( saga.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [context] );
+        _ = _sagaManagerMock.Setup( manager => manager.TryDeleteAsync( saga.SagaId, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _atProtoStorageMock.Setup( storage => storage.StoreMediaLinkResultAsync(
+                It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( "at://did:plc:test/link/result" );
+
+        await service.InvokeFinalizeForTestAsync( saga, TestContext.CancellationToken );
+
+        if (includeSuccessfulProvider) {
+            _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAsync(
+                It.Is<MediaLinkResult>( result => result.Results.Count == 1 ),
+                It.IsAny<CancellationToken>( ) ), Times.Once );
+            _refreshReviewStoreMock.Verify( store => store.MarkUnresolvedAsync(
+                It.IsAny<RefreshReviewEntry>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+            _refreshReviewStoreMock.Verify( store => store.CompleteAsync(
+                saga.SagaId, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Once );
+            _deduplicatorMock.Verify( dedup => dedup.ReleaseAsync(
+                saga.LookupKey, "at://did:plc:test/link/result", It.IsAny<CancellationToken>( ) ), Times.Once );
+            _sagaManagerMock.Verify( manager => manager.TryDeleteAsync(
+                saga.SagaId, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Never );
+        } else {
+            _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAsync(
+                It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+            _refreshReviewStoreMock.Verify( store => store.MarkUnresolvedAsync(
+                context, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+            _deduplicatorMock.Verify( dedup => dedup.ReleaseAsync(
+                saga.LookupKey, null, It.IsAny<CancellationToken>( ) ), Times.Once );
+            _sagaManagerMock.Verify( manager => manager.TryDeleteAsync(
+                saga.SagaId, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Once );
+        }
+    }
+
+    /// <summary>A zero-result stale refresh is persisted for review before its saga is deleted.</summary>
+    [TestMethod]
+    public async Task WriteFinalResult_RefreshWithNoResults_MarksReviewBeforeDeletingSaga( ) {
+        Mock<IRefreshReviewStore> reviewStore = new( );
+        int sequence = 0;
+        int reviewOrder = 0;
+        int deleteOrder = 0;
+        RefreshReviewEntry refreshEntry = new( ) {
+            SourceRecordUri = "at://record/refresh-context",
+            SagaId = TestSagaId,
+            InstanceToken = "instance-current",
+            LookupType = LookupRequestType.IsrcLookup,
+            LookupValue = "USRC12345678"
+        };
+        _ = reviewStore.Setup( store => store.GetPendingForSagaAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [refreshEntry] );
+        _ = reviewStore.Setup( store => store.MarkUnresolvedAsync(
+                It.IsAny<RefreshReviewEntry>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Callback( ( ) => reviewOrder = Interlocked.Increment( ref sequence ) )
+            .Returns( Task.CompletedTask );
+        _ = _sagaManagerMock.Setup( manager => manager.TryDeleteAsync(
+                TestSagaId, "instance-current", It.IsAny<CancellationToken>( ) ) )
+            .Callback( ( ) => deleteOrder = Interlocked.Increment( ref sequence ) )
+            .ReturnsAsync( true );
+
+        LookupSagaState failedSaga = CreateCompleteSaga( ) with {
+            ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                [SupportedProviders.Spotify] = new(
+                    SupportedProviders.Spotify,
+                    IsComplete: true,
+                    IsSuccess: false,
+                    ResultJson: null,
+                    CompletedAt: DateTimeOffset.UtcNow,
+                    ErrorMessage: null )
+            }
+        };
+
+        await CreateService( reviewStore.Object ).InvokeFinalizeForTestAsync(
+            failedSaga, TestContext.CancellationToken );
+
+        reviewStore.Verify( store => store.MarkUnresolvedAsync(
+            It.Is<RefreshReviewEntry>( entry => entry.InstanceToken == "instance-current" ),
+            It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        Assert.IsGreaterThan( 0, reviewOrder );
+        Assert.IsLessThan( deleteOrder, reviewOrder,
+            "The review entry must be durable before the saga is deleted." );
+    }
+
+    /// <summary>Stale X zero-result handling cannot mutate replacement Y's review context or lock.</summary>
+    [TestMethod]
+    public async Task WriteFinalResult_ZeroResult_StaleXContextDoesNotFallbackToSagaId( ) {
+        Mock<IRefreshReviewStore> reviewStore = new( );
+        LookupSagaState staleX = CreateCompleteSaga( ) with { InstanceToken = "instance-x" };
+        LookupSagaState replacementYSaga = staleX with { InstanceToken = "instance-y" };
+        RefreshReviewEntry replacementYEntry = new( ) {
+            SourceRecordUri = "at://record-y",
+            SagaId = staleX.SagaId,
+            InstanceToken = "instance-y",
+            LookupType = LookupRequestType.IsrcLookup,
+            LookupValue = "Y"
+        };
+        _ = _sagaManagerMock.Setup( manager => manager.GetAsync(
+                staleX.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( replacementYSaga );
+        _ = reviewStore.Setup( store => store.GetPendingForSagaAsync( staleX.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [replacementYEntry] );
+
+        LookupSagaState failedSaga = staleX with {
+            ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                [SupportedProviders.Spotify] = new(
+                    SupportedProviders.Spotify, true, false, null, DateTimeOffset.UtcNow, null )
+            }
+        };
+
+        await CreateService( reviewStore.Object ).InvokeFinalizeForTestAsync(
+            failedSaga, TestContext.CancellationToken );
+
+        reviewStore.Verify( store => store.MarkUnresolvedAsync(
+            It.IsAny<RefreshReviewEntry>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        reviewStore.Verify( store => store.GetPendingForSagaAsync(
+            staleX.SagaId, It.IsAny<CancellationToken>( ) ), Times.Never );
+        _deduplicatorMock.Verify( deduplicator => deduplicator.ReleaseAsync(
+            It.IsAny<string>( ), It.IsAny<string?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( manager => manager.TryDeleteAsync(
+            staleX.SagaId, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( manager => manager.TryClaimFinalizeAsync(
+            staleX.SagaId, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>Current X that loses the finalize claim cannot mutate review, completion, or saga state.</summary>
+    [TestMethod]
+    public async Task WriteFinalResult_ZeroResult_CurrentXClaimLoserIsCompletelySilent( ) {
+        Mock<IRefreshReviewStore> reviewStore = new( );
+        LookupSagaState failedX = CreateCompleteSaga( ) with {
+            InstanceToken = "instance-x",
+            ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                [SupportedProviders.Spotify] = new(
+                    SupportedProviders.Spotify, true, false, null, DateTimeOffset.UtcNow, null )
+            }
+        };
+        RefreshReviewEntry reviewEntry = new( ) {
+            SourceRecordUri = "at://record-x",
+            SagaId = failedX.SagaId,
+            InstanceToken = failedX.InstanceToken,
+            LookupType = LookupRequestType.IsrcLookup,
+            LookupValue = "X"
+        };
+
+        _ = _sagaManagerMock.Setup( manager => manager.GetAsync(
+                failedX.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( failedX );
+        _ = _sagaManagerMock.Setup( manager => manager.TryClaimFinalizeAsync(
+                failedX.SagaId, failedX.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( false );
+        _ = reviewStore.Setup( store => store.GetPendingForSagaAsync(
+                failedX.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [reviewEntry] );
+
+        await CreateService( reviewStore.Object ).InvokeFinalizeForTestAsync(
+            failedX, TestContext.CancellationToken );
+
+        reviewStore.Verify( store => store.GetPendingForSagaAsync(
+            failedX.SagaId, It.IsAny<CancellationToken>( ) ), Times.Never );
+        reviewStore.Verify( store => store.MarkUnresolvedAsync(
+            It.IsAny<RefreshReviewEntry>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _deduplicatorMock.Verify( deduplicator => deduplicator.ReleaseAsync(
+            It.IsAny<string>( ), It.IsAny<string?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( manager => manager.TryDeleteAsync(
+            failedX.SagaId, It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( manager => manager.TryReleaseFinalizeClaimAsync(
+            failedX.SagaId, failedX.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( manager => manager.TrySetFinalResultUriAsync(
+            It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAsync(
+            It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
+
+    /// <summary>Current Y zero-result cleanup promotes its own matching review context.</summary>
+    [TestMethod]
+    public async Task WriteFinalResult_ZeroResult_CurrentYContextIsPromotedAndDeleted( ) {
+        Mock<IRefreshReviewStore> reviewStore = new( );
+        LookupSagaState currentY = CreateCompleteSaga( ) with { InstanceToken = "instance-y" };
+        _ = _sagaManagerMock.Setup( manager => manager.GetAsync( currentY.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( currentY );
+        RefreshReviewEntry context = new( ) {
+            SourceRecordUri = "at://record-y",
+            SagaId = currentY.SagaId,
+            InstanceToken = currentY.InstanceToken,
+            LookupType = LookupRequestType.IsrcLookup,
+            LookupValue = "Y"
+        };
+        _ = reviewStore.Setup( store => store.GetPendingForSagaAsync(
+                currentY.SagaId, It.IsAny<CancellationToken>( ) ) ).ReturnsAsync( [context] );
+        _ = reviewStore.Setup( store => store.MarkUnresolvedAsync(
+                It.IsAny<RefreshReviewEntry>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Returns( Task.CompletedTask );
+        _ = _sagaManagerMock.Setup( manager => manager.TryDeleteAsync(
+                currentY.SagaId, currentY.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+
+        LookupSagaState failedSaga = currentY with {
+            ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                [SupportedProviders.Spotify] = new(
+                    SupportedProviders.Spotify, true, false, null, DateTimeOffset.UtcNow, null )
+            }
+        };
+        await CreateService( reviewStore.Object ).InvokeFinalizeForTestAsync(
+            failedSaga, TestContext.CancellationToken );
+
+        reviewStore.Verify( store => store.MarkUnresolvedAsync(
+            It.Is<RefreshReviewEntry>( entry => entry.SourceRecordUri == context.SourceRecordUri
+                && entry.InstanceToken == currentY.InstanceToken ),
+            It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
+        _sagaManagerMock.Verify( manager => manager.TryDeleteAsync(
+            currentY.SagaId, currentY.InstanceToken!, It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
+    /// <summary>A review-store outage does not strand a terminal saga or its deduplication waiters.</summary>
+    [TestMethod]
+    public async Task WriteFinalResult_ReviewStoreFailure_ReleasesAndDeletesSaga( ) {
+        Mock<IRefreshReviewStore> reviewStore = new( );
+        _ = reviewStore.Setup( store => store.MarkUnresolvedAsync(
+                It.IsAny<RefreshReviewEntry>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new InvalidOperationException( "Redis unavailable" ) );
+        _ = _sagaManagerMock.Setup( manager => manager.TryDeleteAsync( TestSagaId, "instance-current", It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+
+        LookupSagaState failedSaga = CreateCompleteSaga( ) with {
+            ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                [SupportedProviders.Spotify] = new(
+                    SupportedProviders.Spotify,
+                    IsComplete: true,
+                    IsSuccess: false,
+                    ResultJson: null,
+                    CompletedAt: DateTimeOffset.UtcNow,
+                    ErrorMessage: "Not found" )
+            }
+        };
+
+        await CreateService( reviewStore.Object ).InvokeFinalizeForTestAsync(
+            failedSaga, TestContext.CancellationToken );
+
+        _deduplicatorMock.Verify( deduplicator => deduplicator.ReleaseAsync(
+            failedSaga.LookupKey, null, It.IsAny<CancellationToken>( ) ), Times.Once );
+        _sagaManagerMock.Verify( manager => manager.TryDeleteAsync(
+            TestSagaId, "instance-current", It.IsAny<CancellationToken>( ) ), Times.Once );
+    }
+
     /// <summary>
-    /// Verifies that finalizing a saga clears its partial flag (sets <c>IsPartial</c> false), so a
-    /// finalized saga is no longer treated as partial.
+    /// Verifies that finalizing a saga does not issue a second state mutation after the final URI
+    /// operation atomically clears the partial flag.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task WriteFinalResult_WhenSagaIsFinalized_ShouldClearIsPartialFlag( ) {
+    public async Task WriteFinalResult_WhenSagaIsFinalized_DoesNotIssueSeparatePartialMutation( ) {
         // Arrange
         SagaCoordinatorBackgroundService service = CreateService( );
         LookupSagaState completeSaga = CreateCompleteSaga( );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -597,10 +940,10 @@ public class SagaCoordinatorBackgroundServiceTests {
             // Expected
         }
 
-        // Assert - Should have cleared the partial flag after setting the final result URI
+        // Assert - The final-URI Lua operation clears the partial flag atomically.
         _sagaManagerMock.Verify(
-            s => s.SetIsPartialAsync( completeSaga.SagaId, false, It.IsAny<CancellationToken>( ) ),
-            Times.Once
+            s => s.TrySetIsPartialAsync( completeSaga.SagaId, false, "instance-current", It.IsAny<CancellationToken>( ) ),
+            Times.Never
         );
     }
 
@@ -631,7 +974,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         _ = _sagaManagerMock.Setup( s => s.GetAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( uriSaga );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -672,7 +1015,7 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - Saga should be marked partial when secondaries are queued
         _sagaManagerMock.Verify(
-            s => s.SetIsPartialAsync( TestSagaId, true, It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetIsPartialAsync( TestSagaId, true, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
 
@@ -682,9 +1025,13 @@ public class SagaCoordinatorBackgroundServiceTests {
             Times.Exactly( 2 )
         );
 
-        // Assert - Partial result written with the IsPartial flag set on the stored record
+        // Assert - Partial result written (non-terminal write path: SetPartialResultUriAsync, not SetFinalResultUriAsync)
         _atProtoStorageMock.Verify(
-            a => a.StoreMediaLinkResultAsync( It.Is<MediaLinkResult>( r => r.IsPartial ), It.IsAny<CancellationToken>( ) ),
+            a => a.StoreMediaLinkResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ),
+            Times.Once
+        );
+        _sagaManagerMock.Verify(
+            s => s.TrySetPartialResultUriAsync( TestSagaId, TestRecordUri, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
 
@@ -718,7 +1065,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         _ = _sagaManagerMock.Setup( s => s.GetAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( uriSaga );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -755,7 +1102,7 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - Cached provider results materialized into the saga as completed states
         _sagaManagerMock.Verify(
-            s => s.UpdateProviderStateAsync(
+            s => s.TryUpdateProviderStateAsync(
                 TestSagaId,
                 It.Is<ProviderLookupState>( p =>
                     p.Provider == SupportedProviders.AppleMusic &&
@@ -764,12 +1111,13 @@ public class SagaCoordinatorBackgroundServiceTests {
                     p.ResultJson != null &&
                     p.CompletedAt != null
                 ),
+                "instance-current",
                 It.IsAny<CancellationToken>( )
             ),
             Times.Once
         );
         _sagaManagerMock.Verify(
-            s => s.UpdateProviderStateAsync(
+            s => s.TryUpdateProviderStateAsync(
                 TestSagaId,
                 It.Is<ProviderLookupState>( p =>
                     p.Provider == SupportedProviders.Tidal &&
@@ -777,6 +1125,7 @@ public class SagaCoordinatorBackgroundServiceTests {
                     p.IsSuccess &&
                     p.ResultJson != null
                 ),
+                "instance-current",
                 It.IsAny<CancellationToken>( )
             ),
             Times.Once
@@ -785,10 +1134,10 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Assert - No secondary lookups queued (everything came from cache)
         _queueResolverMock.Verify( r => r.GetQueue( It.IsAny<SupportedProviders>( ) ), Times.Never );
 
-        // Assert - Final result stored with ALL three providers' results, not marked partial
+        // Assert - Final result stored with ALL three providers' results (terminal write path: SetFinalResultUriAsync below)
         _atProtoStorageMock.Verify(
             a => a.StoreMediaLinkResultAsync(
-                It.Is<MediaLinkResult>( r => r.Results.Count == 3 && !r.IsPartial ),
+                It.Is<MediaLinkResult>( r => r.Results.Count == 3 ),
                 It.IsAny<CancellationToken>( )
             ),
             Times.Once
@@ -796,9 +1145,67 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - Saga finalized
         _sagaManagerMock.Verify(
-            s => s.SetFinalResultUriAsync( TestSagaId, TestRecordUri, It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetFinalResultUriAsync( TestSagaId, TestRecordUri, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
+    }
+
+    /// <summary>
+    /// Verifies a stale coordinator cannot materialize cached secondary providers after a replacement
+    /// saga instance wins the race. The stale X token is fenced before any queue or result write, and
+    /// the replacement Y instance receives no provider, core, or review mutations.
+    /// </summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task SagaCompletion_WhenCachedSecondaryRaceLosesInstanceFence_DoesNotQueueOrMutateReplacement( ) {
+        Dictionary<string, Action<RedisChannel, RedisValue>> handlers = [];
+        _ = _subscriberMock
+            .Setup( s => s.SubscribeAsync( It.IsAny<RedisChannel>( ), It.IsAny<Action<RedisChannel, RedisValue>>( ), It.IsAny<CommandFlags>( ) ) )
+            .Callback<RedisChannel, Action<RedisChannel, RedisValue>, CommandFlags>(
+                ( channel, handler, _ ) => handlers[channel.ToString( )] = handler )
+            .Returns( Task.CompletedTask );
+
+        SagaCoordinatorBackgroundService service = CreateService( );
+        LookupSagaState staleX = CreateUriLookupSaga( ) with { InstanceToken = "instance-x" };
+        LookupSagaState replacementY = staleX with {
+            InstanceToken = "instance-y",
+            ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState>( staleX.ProviderStates )
+        };
+        LookupSagaState current = staleX;
+        _ = _sagaManagerMock.Setup( s => s.GetAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => current );
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
+                It.IsAny<TimeSpan>( ), It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [] );
+
+        MediaLinkResult cachedResult = CreateCachedExternalIdResult( SupportedProviders.AppleMusic, SupportedProviders.Tidal );
+        _ = _cacheRepositoryMock.Setup( c => c.TryGetCachedResultByISRCAsync( It.IsAny<string>( ) ) )
+            .ReturnsAsync( ( ) => {
+                // Replacement Y wins immediately after X reads the cache and before its fenced write.
+                current = replacementY;
+                return (cachedResult, TestRecordUri, false);
+            } );
+        _ = _sagaManagerMock.Setup( s => s.TryUpdateProviderStateAsync(
+                TestSagaId, It.IsAny<ProviderLookupState>( ), "instance-x", It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( false );
+
+        using CancellationTokenSource cts = new( );
+        _ = service.StartAsync( cts.Token );
+        await Task.Delay( 100, TestContext.CancellationToken );
+        Assert.IsTrue( handlers.ContainsKey( "saga:completed" ) );
+        handlers["saga:completed"]( RedisChannel.Literal( "saga:completed" ), TestSagaId );
+        await Task.Delay( 250, TestContext.CancellationToken );
+
+        await cts.CancelAsync( );
+        try { await service.StopAsync( CancellationToken.None ); } catch (OperationCanceledException) { }
+
+        _sagaManagerMock.Verify( s => s.TryUpdateProviderStateAsync(
+            TestSagaId, It.IsAny<ProviderLookupState>( ), "instance-x", It.IsAny<CancellationToken>( ) ), Times.Once );
+        _sagaManagerMock.Verify( s => s.TryUpdateProviderStateAsync(
+            TestSagaId, It.IsAny<ProviderLookupState>( ), "instance-y", It.IsAny<CancellationToken>( ) ), Times.Never );
+        _queueResolverMock.Verify( r => r.GetQueue( It.IsAny<SupportedProviders>( ) ), Times.Never );
+        _atProtoStorageMock.Verify( a => a.StoreMediaLinkResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _refreshReviewStoreMock.Verify( r => r.MarkUnresolvedAsync( It.IsAny<RefreshReviewEntry>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
     }
 
     /// <summary>
@@ -823,7 +1230,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         _ = _sagaManagerMock.Setup( s => s.GetAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( uriSaga );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -865,16 +1272,12 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - Cached AppleMusic result materialized into the saga
         _sagaManagerMock.Verify(
-            s => s.UpdateProviderStateAsync(
-                TestSagaId,
-                It.Is<ProviderLookupState>( p =>
+            s => s.TryUpdateProviderStateAsync( TestSagaId, It.Is<ProviderLookupState>( p =>
                     p.Provider == SupportedProviders.AppleMusic &&
                     p.IsComplete &&
                     p.IsSuccess &&
                     p.ResultJson != null
-                ),
-                It.IsAny<CancellationToken>( )
-            ),
+                ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
 
@@ -892,18 +1295,22 @@ public class SagaCoordinatorBackgroundServiceTests {
             Times.Once
         );
 
-        // Assert - Partial result includes the cached provider's data (Spotify + AppleMusic)
+        // Assert - Partial result includes the cached provider's data (Spotify + AppleMusic), non-terminal write
         _atProtoStorageMock.Verify(
             a => a.StoreMediaLinkResultAsync(
-                It.Is<MediaLinkResult>( r => r.Results.Count == 2 && r.IsPartial ),
+                It.Is<MediaLinkResult>( r => r.Results.Count == 2 ),
                 It.IsAny<CancellationToken>( )
             ),
+            Times.Once
+        );
+        _sagaManagerMock.Verify(
+            s => s.TrySetPartialResultUriAsync( TestSagaId, It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
 
         // Assert - Saga not finalized while the secondary lookup is pending
         _sagaManagerMock.Verify(
-            s => s.SetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
     }
@@ -930,7 +1337,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         _ = _sagaManagerMock.Setup( s => s.GetAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( bulkSaga );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -1008,7 +1415,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         _ = _sagaManagerMock.Setup( s => s.GetAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( uriSaga );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -1021,7 +1428,7 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Another handler already won the race to queue secondaries
         _ = _sagaManagerMock
-            .Setup( s => s.TryMarkSecondariesQueuedAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
+            .Setup( s => s.TryMarkSecondariesQueuedAsync( TestSagaId, "instance-current", It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( false );
 
         Mock<IRequestQueue<QueuedLookupRequest>> queueMock = new( );
@@ -1060,23 +1467,27 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Assert - The idempotent state/partial writes still run (they happen before the
         // marker claim so a published partial can never be mistaken for a final result)
         _sagaManagerMock.Verify(
-            s => s.InitializeProviderStatesAsync( TestSagaId, It.IsAny<IEnumerable<SupportedProviders>>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryInitializeProviderStatesAsync( TestSagaId, It.IsAny<IEnumerable<SupportedProviders>>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
         _sagaManagerMock.Verify(
-            s => s.SetIsPartialAsync( TestSagaId, true, It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetIsPartialAsync( TestSagaId, true, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
 
         // Assert - It still defers finalization (secondaries pending elsewhere)
         _sagaManagerMock.Verify(
-            s => s.SetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
 
-        // Assert - The partial result is still written for waiting callers
+        // Assert - The partial result is still written for waiting callers (non-terminal write path)
         _atProtoStorageMock.Verify(
-            a => a.StoreMediaLinkResultAsync( It.Is<MediaLinkResult>( r => r.IsPartial ), It.IsAny<CancellationToken>( ) ),
+            a => a.StoreMediaLinkResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ),
+            Times.Once
+        );
+        _sagaManagerMock.Verify(
+            s => s.TrySetPartialResultUriAsync( TestSagaId, TestRecordUri, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
     }
@@ -1103,7 +1514,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         _ = _sagaManagerMock.Setup( s => s.GetAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( uriSaga );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -1117,15 +1528,15 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Record the order of the saga-manager calls that close the partial-vs-final race
         List<string> callOrder = [];
         _ = _sagaManagerMock
-            .Setup( s => s.InitializeProviderStatesAsync( TestSagaId, It.IsAny<IEnumerable<SupportedProviders>>( ), It.IsAny<CancellationToken>( ) ) )
+            .Setup( s => s.TryInitializeProviderStatesAsync( TestSagaId, It.IsAny<IEnumerable<SupportedProviders>>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
             .Callback( ( ) => callOrder.Add( "InitializeProviderStates" ) )
-            .Returns( Task.CompletedTask );
+            .ReturnsAsync( true );
         _ = _sagaManagerMock
-            .Setup( s => s.SetIsPartialAsync( TestSagaId, true, It.IsAny<CancellationToken>( ) ) )
+            .Setup( s => s.TrySetIsPartialAsync( TestSagaId, true, "instance-current", It.IsAny<CancellationToken>( ) ) )
             .Callback( ( ) => callOrder.Add( "SetIsPartial" ) )
-            .Returns( Task.CompletedTask );
+            .ReturnsAsync( true );
         _ = _sagaManagerMock
-            .Setup( s => s.TryMarkSecondariesQueuedAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
+            .Setup( s => s.TryMarkSecondariesQueuedAsync( TestSagaId, "instance-current", It.IsAny<CancellationToken>( ) ) )
             .Callback( ( ) => callOrder.Add( "TryMarkSecondariesQueued" ) )
             .ReturnsAsync( true );
 
@@ -1164,10 +1575,8 @@ public class SagaCoordinatorBackgroundServiceTests {
     }
 
     /// <summary>
-    /// Verifies the terminal-state contract when every secondary enqueue throws: both enqueues are
-    /// attempted, the saga is not finalized (the one-provider result is not promoted to final), the
-    /// partial result is written for waiting callers, and the saga is immediately removed from the
-    /// reconciliation pending index so it does not strand to TTL expiry.
+    /// Verifies that every failed secondary enqueue is converted into a terminal provider leg and
+    /// publishes progress, so the one-time fan-out marker cannot strand the saga.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
@@ -1186,7 +1595,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         _ = _sagaManagerMock.Setup( s => s.GetAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( uriSaga );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -1234,24 +1643,44 @@ public class SagaCoordinatorBackgroundServiceTests {
             Times.Exactly( 2 )
         );
 
-        // Assert - The saga is NOT finalized: the one-provider result must not be promoted to
-        // final while secondary providers are still unresolved
+        // No providers remain unresolved: both failed enqueues were durably converted into
+        // terminal failed legs, so this invocation finalizes immediately.
         _sagaManagerMock.Verify(
-            s => s.SetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
+            Times.Once
+        );
+
+        _atProtoStorageMock.Verify(
+            a => a.StoreMediaLinkResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ),
+            Times.Once
+        );
+        _sagaManagerMock.Verify(
+            s => s.TrySetPartialResultUriAsync( TestSagaId, TestRecordUri, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
-
-        // Assert - The partial result is written for waiting callers instead
-        _atProtoStorageMock.Verify(
-            a => a.StoreMediaLinkResultAsync( It.Is<MediaLinkResult>( r => r.IsPartial ), It.IsAny<CancellationToken>( ) ),
-            Times.Once
-        );
         _sagaManagerMock.Verify(
-            s => s.SetIsPartialAsync( TestSagaId, true, It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetIsPartialAsync( TestSagaId, true, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
 
-        // Assert - The saga is removed from the pending index so it does not strand to TTL expiry
+        _sagaManagerMock.Verify(
+            s => s.TryUpdateProviderStateAsync(
+                TestSagaId,
+                It.Is<ProviderLookupState>( state =>
+                    state.IsComplete && !state.IsSuccess && state.ErrorMessage != null ),
+                "instance-current",
+                It.IsAny<CancellationToken>( ) ),
+            Times.Exactly( 2 )
+        );
+        _subscriberMock.Verify(
+            s => s.PublishAsync(
+                RedisChannel.Literal( "saga:completed" ),
+                TestSagaId,
+                It.IsAny<CommandFlags>( ) ),
+            Times.AtLeastOnce( )
+        );
+
+        // Successful terminal release clears the reconciliation entry.
         _sagaManagerMock.Verify(
             s => s.RemoveFromPendingIndexAsync( TestSagaId, It.IsAny<CancellationToken>( ) ),
             Times.Once
@@ -1280,7 +1709,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         _ = _sagaManagerMock.Setup( s => s.GetAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( uriSaga );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -1334,14 +1763,38 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - Not finalized: secondaries are still pending
         _sagaManagerMock.Verify(
-            s => s.SetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
 
-        // Assert - The partial result is written so waiting callers receive a response
+        // Assert - The partial result is written so waiting callers receive a response (non-terminal write path)
         _atProtoStorageMock.Verify(
-            a => a.StoreMediaLinkResultAsync( It.Is<MediaLinkResult>( r => r.IsPartial ), It.IsAny<CancellationToken>( ) ),
+            a => a.StoreMediaLinkResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ),
             Times.Once
+        );
+        _sagaManagerMock.Verify(
+            s => s.TrySetPartialResultUriAsync( TestSagaId, TestRecordUri, "instance-current", It.IsAny<CancellationToken>( ) ),
+            Times.Once
+        );
+
+        _sagaManagerMock.Verify(
+            s => s.TryUpdateProviderStateAsync(
+                TestSagaId,
+                It.Is<ProviderLookupState>( state =>
+                    state.Provider == SupportedProviders.Tidal
+                    && state.IsComplete
+                    && !state.IsSuccess
+                    && state.ErrorMessage != null ),
+                "instance-current",
+                It.IsAny<CancellationToken>( ) ),
+            Times.Once
+        );
+        _subscriberMock.Verify(
+            s => s.PublishAsync(
+                RedisChannel.Literal( "saga:completed" ),
+                TestSagaId,
+                It.IsAny<CommandFlags>( ) ),
+            Times.AtLeastOnce( )
         );
 
         // Assert - The pending index is NOT cleared: at least one provider is in flight
@@ -1363,7 +1816,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         SagaCoordinatorBackgroundService service = CreateService( );
         LookupSagaState uriSaga = CreateUriLookupSaga( );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -1404,13 +1857,17 @@ public class SagaCoordinatorBackgroundServiceTests {
             Times.Exactly( 2 )
         );
 
-        // Assert - Partial result written instead of a premature final
+        // Assert - Partial result written instead of a premature final (non-terminal write path)
         _atProtoStorageMock.Verify(
-            a => a.StoreMediaLinkResultAsync( It.Is<MediaLinkResult>( r => r.IsPartial ), It.IsAny<CancellationToken>( ) ),
+            a => a.StoreMediaLinkResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
         _sagaManagerMock.Verify(
-            s => s.SetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetPartialResultUriAsync( TestSagaId, TestRecordUri, "instance-current", It.IsAny<CancellationToken>( ) ),
+            Times.Once
+        );
+        _sagaManagerMock.Verify(
+            s => s.TrySetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
     }
@@ -1431,7 +1888,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         SagaCoordinatorBackgroundService service = CreateService( );
         LookupSagaState completeSaga = CreateCompleteSaga( );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -1440,7 +1897,7 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Finalize claim is already held by a concurrent handler
         _ = _sagaManagerMock
-            .Setup( s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Setup( s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( false );
 
         // Act
@@ -1463,7 +1920,7 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - No final URI recorded
         _sagaManagerMock.Verify(
-            s => s.SetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
 
@@ -1476,7 +1933,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Assert - No generation reset: the terminal path does not advance the generation, so
         // there is nothing to roll back when the claim is lost.
         _sagaManagerMock.Verify(
-            s => s.ResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
     }
@@ -1511,12 +1968,13 @@ public class SagaCoordinatorBackgroundServiceTests {
                 )
             },
             FinalResultUri = null,
-            IsPartial = true
+            IsPartial = true,
+            InstanceToken = "instance-current"
         };
 
         // The generation was already advanced by a concurrent handler
         _ = _sagaManagerMock
-            .Setup( s => s.TryAdvanceWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ) )
+            .Setup( s => s.TryAdvanceWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( false );
 
         using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource( TestContext.CancellationToken );
@@ -1532,13 +1990,13 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - No partial URI recorded
         _sagaManagerMock.Verify(
-            s => s.SetPartialResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetPartialResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
 
         // Assert - Finalize claim never acquired on the non-terminal path
         _sagaManagerMock.Verify(
-            s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
     }
@@ -1554,7 +2012,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         SagaCoordinatorBackgroundService service = CreateService( );
         LookupSagaState completeSaga = CreateCompleteSaga( );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -1587,13 +2045,13 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - Final URI recorded
         _sagaManagerMock.Verify(
-            s => s.SetFinalResultUriAsync( completeSaga.SagaId, TestRecordUri, It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetFinalResultUriAsync( completeSaga.SagaId, TestRecordUri, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
 
         // Assert - The claim is NOT released on the success path
         _sagaManagerMock.Verify(
-            s => s.ReleaseFinalizeClaimAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryReleaseFinalizeClaimAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
     }
@@ -1610,7 +2068,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         SagaCoordinatorBackgroundService service = CreateService( );
         LookupSagaState completeSaga = CreateCompleteSaga( );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -1637,13 +2095,13 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Assert - Generation NOT reset: the terminal path never advances the generation,
         // so there is nothing to roll back after a PDS write failure.
         _sagaManagerMock.Verify(
-            s => s.ResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
 
         // Assert - Claim released so the next poll can re-finalize
         _sagaManagerMock.Verify(
-            s => s.ReleaseFinalizeClaimAsync( completeSaga.SagaId, It.IsAny<CancellationToken>( ) ),
+            s => s.TryReleaseFinalizeClaimAsync( completeSaga.SagaId, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
 
@@ -1679,7 +2137,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         _ = _sagaManagerMock.Setup( s => s.GetAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( alreadyFinalizedSaga );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -1711,7 +2169,7 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - No second final URI write
         _sagaManagerMock.Verify(
-            s => s.SetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
 
@@ -1743,7 +2201,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         _ = _sagaManagerMock.Setup( s => s.GetAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( completeSaga );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -1780,20 +2238,17 @@ public class SagaCoordinatorBackgroundServiceTests {
     }
 
     /// <summary>
-    /// Verifies that a failure occurring after the final result URI has been durably recorded does
-    /// NOT reset the write generation or release the finalize claim. Retaining both prevents a
-    /// re-entrant PDS write against a URI that was already written. Pairs with
-    /// <see cref="Finalize_WhenPdsWriteFails_ReleasesClaimAndDedup"/> (pre-URI failure) as a
-    /// discriminator: together they prove the release is conditioned on the durability line.
+    /// Verifies refresh cleanup failure after the final URI is durable cannot block dedup waiters
+    /// or release the finalize claim for a re-entrant PDS write.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task Finalize_WhenFailureAfterUriRecorded_DoesNotResetGenerationOrReleaseClaim( ) {
+    public async Task Finalize_WhenRefreshCleanupFailsAfterDurability_ReleasesDedupAndKeepsClaim( ) {
         // Arrange
         SagaCoordinatorBackgroundService service = CreateService( );
         LookupSagaState completeSaga = CreateCompleteSaga( );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -1807,13 +2262,13 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // SetFinalResultUriAsync succeeds (URI is now durably recorded)
         _ = _sagaManagerMock
-            .Setup( s => s.SetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
-            .Returns( Task.CompletedTask );
+            .Setup( s => s.TrySetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( SagaFinalResultWriteOutcome.Stored );
 
-        // The first post-URI step throws — simulates a failure after the durability line
-        _ = _sagaManagerMock
-            .Setup( s => s.SetIsPartialAsync( It.IsAny<string>( ), It.IsAny<bool>( ), It.IsAny<CancellationToken>( ) ) )
-            .ThrowsAsync( new InvalidOperationException( "post-URI step failed" ) );
+        _ = _refreshReviewStoreMock
+            .Setup( store => store.CompleteAsync(
+                completeSaga.SagaId, completeSaga.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
+            .ThrowsAsync( new InvalidOperationException( "refresh cleanup failed" ) );
 
         // Act
         using CancellationTokenSource cts = new( );
@@ -1829,15 +2284,20 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - No generation reset after the durability line
         _sagaManagerMock.Verify(
-            s => s.ResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
 
         // Assert - A failure after the URI is recorded must retain the claim (no release)
         _sagaManagerMock.Verify(
-            s => s.ReleaseFinalizeClaimAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryReleaseFinalizeClaimAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
+
+        _deduplicatorMock.Verify(
+            deduplicator => deduplicator.ReleaseAsync(
+                completeSaga.LookupKey, TestRecordUri, It.IsAny<CancellationToken>( ) ),
+            Times.Once );
 
         // Assert - dedup must never be released with null on this path; releasing null would hand
         // waiters an empty completion for a saga whose result was already recorded
@@ -1846,6 +2306,28 @@ public class SagaCoordinatorBackgroundServiceTests {
             Times.Never,
             "Post-URI failure must not release the dedup lock with null"
         );
+    }
+
+    /// <summary>A lost final-URI fence never publishes the stale instance's PDS URI.</summary>
+    [TestMethod]
+    public async Task Finalize_WhenFinalUriFenceIsLostAfterPdsWrite_DoesNotReleaseStaleResult( ) {
+        SagaCoordinatorBackgroundService service = CreateService( );
+        LookupSagaState saga = CreateCompleteSaga( );
+        _ = _atProtoStorageMock.Setup( storage => storage.StoreMediaLinkResultAsync(
+                It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( TestRecordUri );
+        _ = _sagaManagerMock.Setup( manager => manager.TrySetFinalResultUriAsync(
+                saga.SagaId, TestRecordUri, saga.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( SagaFinalResultWriteOutcome.InstanceMismatch );
+
+        await service.InvokeFinalizeForTestAsync( saga, TestContext.CancellationToken );
+
+        _deduplicatorMock.Verify( deduplicator => deduplicator.ReleaseAsync(
+            It.IsAny<string>( ), It.IsAny<string?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( manager => manager.RemoveFromPendingIndexAsync(
+            saga.SagaId, It.IsAny<CancellationToken>( ) ), Times.Never );
+        _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAsync(
+            It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ), Times.Once );
     }
 
     /// <summary>
@@ -1862,7 +2344,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         SagaCoordinatorBackgroundService service = CreateService( );
         LookupSagaState completeSaga = CreateCompleteSaga( );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -1875,8 +2357,8 @@ public class SagaCoordinatorBackgroundServiceTests {
             .ThrowsAsync( new OperationCanceledException( ) );
 
         _ = _sagaManagerMock
-            .Setup( s => s.ReleaseFinalizeClaimAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
-            .Returns( Task.CompletedTask );
+            .Setup( s => s.TryReleaseFinalizeClaimAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
 
         // Act
         using CancellationTokenSource cts = new( );
@@ -1892,13 +2374,13 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - Generation NOT reset: the terminal path never advances the generation.
         _sagaManagerMock.Verify(
-            s => s.ResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
 
         // Assert - Claim must be released so the next host can re-finalize
         _sagaManagerMock.Verify(
-            s => s.ReleaseFinalizeClaimAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryReleaseFinalizeClaimAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
 
@@ -1910,7 +2392,7 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - Saga must not be deleted
         _sagaManagerMock.Verify(
-            s => s.DeleteAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryDeleteAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
     }
@@ -1929,7 +2411,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         SagaCoordinatorBackgroundService service = CreateService( );
         LookupSagaState completeSaga = CreateCompleteSaga( );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -1943,12 +2425,12 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // SetFinalResultUriAsync completes — durability line crossed
         _ = _sagaManagerMock
-            .Setup( s => s.SetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
-            .Returns( Task.CompletedTask );
+            .Setup( s => s.TrySetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( SagaFinalResultWriteOutcome.Stored );
 
         // The first post-URI step throws OperationCanceledException — cancellation after the durability line
         _ = _sagaManagerMock
-            .Setup( s => s.SetIsPartialAsync( It.IsAny<string>( ), It.IsAny<bool>( ), It.IsAny<CancellationToken>( ) ) )
+            .Setup( s => s.TrySetIsPartialAsync( It.IsAny<string>( ), It.IsAny<bool>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
             .ThrowsAsync( new OperationCanceledException( ) );
 
         // Act
@@ -1965,14 +2447,14 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - No generation reset after the durability line
         _sagaManagerMock.Verify(
-            s => s.ResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
 
         // Assert - Claim must NOT be released; releasing would allow a re-entrant PDS write against
         // a URI that is already recorded
         _sagaManagerMock.Verify(
-            s => s.ReleaseFinalizeClaimAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryReleaseFinalizeClaimAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
 
@@ -1984,7 +2466,7 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - Saga must not be deleted
         _sagaManagerMock.Verify(
-            s => s.DeleteAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryDeleteAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
     }
@@ -2012,8 +2494,8 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Set up mock to advance generation monotonically using a local counter
         int storedGeneration = 0;
         _ = _sagaManagerMock
-            .Setup( s => s.TryAdvanceWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ) )
-            .ReturnsAsync( ( string _, int gen, CancellationToken _ ) => {
+            .Setup( s => s.TryAdvanceWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( string _, int gen, string _, CancellationToken _ ) => {
                 if (gen > storedGeneration) {
                     storedGeneration = gen;
                     return true;
@@ -2038,7 +2520,8 @@ public class SagaCoordinatorBackgroundServiceTests {
                     ResultJson: spotifyJson, CompletedAt: DateTimeOffset.UtcNow, ErrorMessage: null )
             },
             FinalResultUri = null,
-            IsPartial = false
+            IsPartial = false,
+            InstanceToken = "instance-current"
         };
 
         LookupSagaState sagaGen2 = sagaGen1 with {
@@ -2051,6 +2534,10 @@ public class SagaCoordinatorBackgroundServiceTests {
                     ResultJson: appleMusicJson, CompletedAt: DateTimeOffset.UtcNow, ErrorMessage: null )
             }
         };
+
+        _ = _sagaManagerMock
+            .Setup( s => s.GetAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( sagaGen1 );
 
         LookupSagaState sagaGen3 = sagaGen1 with {
             ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
@@ -2069,8 +2556,8 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Also set up the claim mock to only allow the first terminal winner through
         bool claimHeld = false;
         _ = _sagaManagerMock
-            .Setup( s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
-            .Returns( ( string _, CancellationToken _ ) => {
+            .Setup( s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
+            .Returns( ( string _, string _, CancellationToken _ ) => {
                 bool won = !claimHeld;
                 claimHeld = true;
                 return Task.FromResult( won );
@@ -2099,9 +2586,9 @@ public class SagaCoordinatorBackgroundServiceTests {
     }
 
     /// <summary>
-    /// Verifies the non-terminal write path: <c>terminal=false</c> sets <c>IsPartial=true</c> on
-    /// the combined result, calls <c>SetPartialResultUriAsync</c> (not <c>SetFinalResultUriAsync</c>),
-    /// and never calls <c>SetIsPartialAsync(false)</c> or <c>TryClaimFinalizeAsync</c>.
+    /// Verifies the non-terminal write path: <c>terminal=false</c> calls <c>SetPartialResultUriAsync</c>
+    /// (not <c>SetFinalResultUriAsync</c>), and never calls <c>SetIsPartialAsync(false)</c> or
+    /// <c>TryClaimFinalizeAsync</c>.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
@@ -2127,7 +2614,8 @@ public class SagaCoordinatorBackgroundServiceTests {
                 )
             },
             FinalResultUri = null,
-            IsPartial = true
+            IsPartial = true,
+            InstanceToken = "instance-current"
         };
 
         _ = _atProtoStorageMock
@@ -2143,50 +2631,49 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Act - non-terminal write
         await service.InvokeWriteForTestAsync( partialSaga, terminal: false, cts.Token );
 
-        // Assert - the combined result written to PDS carries IsPartial=true
+        // Assert - the combined result is stored once (non-terminal path confirmed by SetPartialResultUriAsync below)
         _atProtoStorageMock.Verify(
             a => a.StoreMediaLinkResultAsync(
-                It.Is<MediaLinkResult>( r => r.IsPartial ),
+                It.IsAny<MediaLinkResult>( ),
                 It.IsAny<CancellationToken>( )
             ),
             Times.Once,
-            "Non-terminal write must produce a result with IsPartial=true"
+            "Non-terminal write must store the result exactly once"
         );
 
         // Assert - partial URI stored, not final URI
         _sagaManagerMock.Verify(
-            s => s.SetPartialResultUriAsync( TestSagaId, TestRecordUri, It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetPartialResultUriAsync( TestSagaId, TestRecordUri, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
         _sagaManagerMock.Verify(
-            s => s.SetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Non-terminal write must not set the final result URI"
         );
 
         // Assert - the finalize claim is never acquired on the non-terminal path
         _sagaManagerMock.Verify(
-            s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Non-terminal write must not call TryClaimFinalizeAsync"
         );
 
         // Assert - IsPartial flag is never cleared on the non-terminal path
         _sagaManagerMock.Verify(
-            s => s.SetIsPartialAsync( It.IsAny<string>( ), false, It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetIsPartialAsync( It.IsAny<string>( ), false, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Non-terminal write must not clear the IsPartial flag"
         );
     }
 
     /// <summary>
-    /// Verifies the terminal write path: <c>terminal=true</c> clears <c>IsPartial</c> (calls
-    /// <c>SetIsPartialAsync(false)</c>) exactly once after recording the final URI. This is the
-    /// positive control that distinguishes the two write paths.
+    /// Verifies the terminal write path relies on the final-URI Lua operation to clear
+    /// <c>IsPartial</c> atomically rather than issuing a second fenced mutation.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task WriteResult_Terminal_ClearsIsPartialAfterFinalUri( ) {
+    public async Task WriteResult_Terminal_ClearsIsPartialAtomicallyWithFinalUri( ) {
         // Arrange
         SagaCoordinatorBackgroundService service = CreateService( );
         LookupSagaState completeSaga = CreateCompleteSaga( );
@@ -2204,20 +2691,20 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Act - terminal write
         await service.InvokeWriteForTestAsync( completeSaga, terminal: true, cts.Token );
 
-        // Assert - IsPartial cleared exactly once after the final URI
+        // Assert - no separate post-durability partial-state mutation is issued.
         _sagaManagerMock.Verify(
-            s => s.SetIsPartialAsync( TestSagaId, false, It.IsAny<CancellationToken>( ) ),
-            Times.Once,
-            "Terminal write must clear the IsPartial flag once"
+            s => s.TrySetIsPartialAsync( TestSagaId, false, "instance-current", It.IsAny<CancellationToken>( ) ),
+            Times.Never,
+            "Final URI storage clears IsPartial in the same Lua operation"
         );
 
         // Assert - final URI recorded (not partial)
         _sagaManagerMock.Verify(
-            s => s.SetFinalResultUriAsync( TestSagaId, TestRecordUri, It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetFinalResultUriAsync( TestSagaId, TestRecordUri, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
         _sagaManagerMock.Verify(
-            s => s.SetPartialResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetPartialResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Terminal write must not call SetPartialResultUriAsync"
         );
@@ -2252,7 +2739,8 @@ public class SagaCoordinatorBackgroundServiceTests {
                 )
             },
             FinalResultUri = null,
-            IsPartial = true
+            IsPartial = true,
+            InstanceToken = "instance-current"
         };
 
         // PDS write fails before the durability line
@@ -2267,22 +2755,53 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - generation conditionally reset so the next trigger can re-advance and retry
         _sagaManagerMock.Verify(
-            s => s.ResetWriteGenerationAsync( TestSagaId, It.IsAny<int>( ), It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryResetWriteGenerationAsync( TestSagaId, It.IsAny<int>( ), It.IsAny<int>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once,
             "Non-terminal pre-durability failure must reset the write generation"
         );
 
         // Assert - finalize claim NEVER acquired or released on the non-terminal path
         _sagaManagerMock.Verify(
-            s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Non-terminal write must not call TryClaimFinalizeAsync"
         );
         _sagaManagerMock.Verify(
-            s => s.ReleaseFinalizeClaimAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryReleaseFinalizeClaimAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Non-terminal write must not release a finalize claim it never held"
         );
+        _refreshReviewStoreMock.Verify(
+            store => store.ClearSweepAttemptsAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            Times.Never,
+            "A failed PDS write must not clear sweep attempts before the partial URI is durable"
+        );
+    }
+
+    /// <summary>Matching current-instance refresh context suppresses non-terminal PDS materialization.</summary>
+    [TestMethod]
+    public async Task WriteResult_NonTerminal_MatchingRefreshContext_SuppressesPdsAndBookkeeping( ) {
+        SagaCoordinatorBackgroundService service = CreateService( );
+        LookupSagaState refreshSaga = CreateUriLookupSaga( QueuePriority.Bulk ) with {
+            SagaId = TestSagaId,
+            InstanceToken = "instance-current"
+        };
+        RefreshReviewEntry context = new( ) {
+            SourceRecordUri = "at://record/refresh-live",
+            SagaId = TestSagaId,
+            InstanceToken = "instance-current",
+            LookupType = refreshSaga.LookupType,
+            LookupValue = refreshSaga.LookupValue
+        };
+        _ = _refreshReviewStoreMock.Setup( store => store.GetPendingForSagaAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [context] );
+
+        await service.InvokeWriteForTestAsync( refreshSaga, terminal: false, TestContext.CancellationToken );
+
+        _atProtoStorageMock.Verify( storage => storage.StoreMediaLinkResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( manager => manager.TryAdvanceWriteGenerationAsync(
+            It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _refreshReviewStoreMock.Verify( store => store.ClearSweepAttemptsAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
     }
 
     /// <summary>
@@ -2295,7 +2814,7 @@ public class SagaCoordinatorBackgroundServiceTests {
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task WriteResult_NonTerminal_WhenFailureAfterPartialUriRecorded_DoesNotResetGeneration( ) {
+    public async Task WriteResult_NonTerminal_WhenFailureAfterPartialUriRecorded_ClearsRefreshAttemptsWithoutResettingGeneration( ) {
         // Arrange
         SagaCoordinatorBackgroundService service = CreateService( );
 
@@ -2317,7 +2836,8 @@ public class SagaCoordinatorBackgroundServiceTests {
                 )
             },
             FinalResultUri = null,
-            IsPartial = true
+            IsPartial = true,
+            InstanceToken = "instance-current"
         };
 
         // PDS write succeeds and returns a URI
@@ -2327,8 +2847,24 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // SetPartialResultUriAsync succeeds — partial URI durably recorded (uriRecorded = true)
         _ = _sagaManagerMock
-            .Setup( s => s.SetPartialResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
-            .Returns( Task.CompletedTask );
+            .Setup( s => s.TryAdvanceWriteGenerationAsync(
+                It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _sagaManagerMock
+            .Setup( s => s.TrySetPartialResultUriAsync(
+                It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+
+        RefreshReviewEntry refreshContext = new( ) {
+            SourceRecordUri = "at://record/refresh-context",
+            SagaId = TestSagaId,
+            InstanceToken = "instance-current",
+            LookupType = LookupRequestType.IsrcLookup,
+            LookupValue = "USRC12345678"
+        };
+        _ = _refreshReviewStoreMock
+            .Setup( store => store.GetPendingForSagaAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( [] );
 
         // The first post-durability step throws — simulates a failure after the durability line
         _ = _cacheRepositoryMock
@@ -2343,19 +2879,24 @@ public class SagaCoordinatorBackgroundServiceTests {
         // Assert - generation must NOT be reset after the durability line; retaining it prevents
         // a re-entrant duplicate partial write
         _sagaManagerMock.Verify(
-            s => s.ResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Non-terminal post-durability failure must not reset the write generation"
+        );
+        _refreshReviewStoreMock.Verify(
+            store => store.ClearSweepAttemptsAsync( refreshContext.SourceRecordUri, It.IsAny<CancellationToken>( ) ),
+            Times.Never,
+            "A background refresh with no matching pending context does not clear refresh bookkeeping"
         );
 
         // Assert - finalize claim NEVER acquired or released on the non-terminal path
         _sagaManagerMock.Verify(
-            s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Non-terminal write must not call TryClaimFinalizeAsync"
         );
         _sagaManagerMock.Verify(
-            s => s.ReleaseFinalizeClaimAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryReleaseFinalizeClaimAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Non-terminal write must not release a finalize claim it never held"
         );
@@ -2383,8 +2924,10 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         LookupSagaState saga1 = CreateCompleteSaga( );
         LookupSagaState saga2 = CreateCompleteSaga( ) with { SagaId = SagaId2 };
+        _ = _sagaManagerMock.Setup( s => s.GetAsync( saga1.SagaId, It.IsAny<CancellationToken>( ) ) ).ReturnsAsync( saga1 );
+        _ = _sagaManagerMock.Setup( s => s.GetAsync( saga2.SagaId, It.IsAny<CancellationToken>( ) ) ).ReturnsAsync( saga2 );
 
-        _ = _sagaManagerMock.Setup( s => s.GetCompletedButUnfinalizedAsync(
+        _ = _sagaManagerMock.Setup( s => s.GetPendingReconciliationAsync(
                 It.IsAny<TimeSpan>( ),
                 It.IsAny<int>( ),
                 It.IsAny<CancellationToken>( )
@@ -2455,7 +2998,8 @@ public class SagaCoordinatorBackgroundServiceTests {
                 )
             },
             FinalResultUri = null,
-            IsPartial = true
+            IsPartial = true,
+            InstanceToken = "instance-current"
         };
 
         _ = _atProtoStorageMock
@@ -2473,20 +3017,20 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert — final URI recorded (saga finalized despite unchanged generation)
         _sagaManagerMock.Verify(
-            s => s.SetFinalResultUriAsync( TestSagaId, TestRecordUri, It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetFinalResultUriAsync( TestSagaId, TestRecordUri, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once,
             "Terminal write must call SetFinalResultUriAsync even when the generation did not grow"
         );
 
-        // Assert — partial flag cleared
+        // Assert — the final-URI Lua operation clears the partial flag atomically.
         _sagaManagerMock.Verify(
-            s => s.SetIsPartialAsync( TestSagaId, false, It.IsAny<CancellationToken>( ) ),
-            Times.Once
+            s => s.TrySetIsPartialAsync( TestSagaId, false, "instance-current", It.IsAny<CancellationToken>( ) ),
+            Times.Never
         );
 
         // Assert — generation CAS was never consulted on the terminal path
         _sagaManagerMock.Verify(
-            s => s.TryAdvanceWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryAdvanceWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Terminal write must not call TryAdvanceWriteGenerationAsync"
         );
@@ -2533,7 +3077,7 @@ public class SagaCoordinatorBackgroundServiceTests {
         };
 
         _ = _sagaManagerMock
-            .Setup( s => s.DeleteAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Setup( s => s.TryDeleteAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( true );
 
         using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource( TestContext.CancellationToken );
@@ -2543,7 +3087,7 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert — saga must NOT be deleted: more providers are still in flight
         _sagaManagerMock.Verify(
-            s => s.DeleteAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryDeleteAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Non-terminal null combine must not delete the saga"
         );
@@ -2580,8 +3124,8 @@ public class SagaCoordinatorBackgroundServiceTests {
             .ReturnsAsync( TestRecordUri );
 
         _ = _sagaManagerMock
-            .Setup( s => s.SetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
-            .Returns( Task.CompletedTask );
+            .Setup( s => s.TrySetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( SagaFinalResultWriteOutcome.Stored );
 
         _ = _cacheRepositoryMock
             .Setup( c => c.IndexResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
@@ -2601,13 +3145,13 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - URI was durably stored before the release
         _sagaManagerMock.Verify(
-            s => s.SetFinalResultUriAsync( TestSagaId, TestRecordUri, It.IsAny<CancellationToken>( ) ),
+            s => s.TrySetFinalResultUriAsync( TestSagaId, TestRecordUri, "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Once
         );
 
         // Assert - finalize claim was never returned; it is retained to prevent re-entrant writes
         _sagaManagerMock.Verify(
-            s => s.ReleaseFinalizeClaimAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryReleaseFinalizeClaimAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Post-release index failure must not release the finalize claim"
         );
@@ -2631,8 +3175,8 @@ public class SagaCoordinatorBackgroundServiceTests {
             .ReturnsAsync( TestRecordUri );
 
         _ = _sagaManagerMock
-            .Setup( s => s.SetPartialResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
-            .Returns( Task.CompletedTask );
+            .Setup( s => s.TrySetPartialResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
 
         _ = _cacheRepositoryMock
             .Setup( c => c.IndexResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
@@ -2652,14 +3196,14 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - write generation was not reset; the durability line was crossed
         _sagaManagerMock.Verify(
-            s => s.ResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Post-release index failure must not reset the write generation"
         );
 
         // Assert - finalize claim was never acquired or released on the non-terminal path
         _sagaManagerMock.Verify(
-            s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Non-terminal write must not call TryClaimFinalizeAsync"
         );
@@ -2684,8 +3228,8 @@ public class SagaCoordinatorBackgroundServiceTests {
             .ReturnsAsync( TestRecordUri );
 
         _ = _sagaManagerMock
-            .Setup( s => s.SetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
-            .Returns( Task.CompletedTask );
+            .Setup( s => s.TrySetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( SagaFinalResultWriteOutcome.Stored );
 
         _ = _cacheRepositoryMock
             .Setup( c => c.IndexResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
@@ -2705,7 +3249,7 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - finalize claim was never returned; it is retained to prevent re-entrant writes
         _sagaManagerMock.Verify(
-            s => s.ReleaseFinalizeClaimAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryReleaseFinalizeClaimAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Post-release OCE from indexing must not release the finalize claim"
         );
@@ -2729,8 +3273,8 @@ public class SagaCoordinatorBackgroundServiceTests {
             .ReturnsAsync( TestRecordUri );
 
         _ = _sagaManagerMock
-            .Setup( s => s.SetPartialResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
-            .Returns( Task.CompletedTask );
+            .Setup( s => s.TrySetPartialResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
 
         _ = _cacheRepositoryMock
             .Setup( c => c.IndexResultAsync( It.IsAny<MediaLinkResult>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
@@ -2750,14 +3294,14 @@ public class SagaCoordinatorBackgroundServiceTests {
 
         // Assert - write generation was not reset; the durability line was crossed
         _sagaManagerMock.Verify(
-            s => s.ResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryResetWriteGenerationAsync( It.IsAny<string>( ), It.IsAny<int>( ), It.IsAny<int>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Post-release OCE from indexing must not reset the write generation"
         );
 
         // Assert - finalize claim was never acquired or released on the non-terminal path
         _sagaManagerMock.Verify(
-            s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ),
+            s => s.TryClaimFinalizeAsync( It.IsAny<string>( ), "instance-current", It.IsAny<CancellationToken>( ) ),
             Times.Never,
             "Non-terminal write must not call TryClaimFinalizeAsync"
         );
@@ -2771,7 +3315,7 @@ public class SagaCoordinatorBackgroundServiceTests {
     /// Builds a service wired to all the mocks, the real combiner, and the enabled-providers set.
     /// </summary>
     /// <returns>A service under test.</returns>
-    private SagaCoordinatorBackgroundService CreateService( ) {
+    private SagaCoordinatorBackgroundService CreateService( IRefreshReviewStore? reviewStore = null ) {
         return new SagaCoordinatorBackgroundService(
             _redisMock.Object,
             _sagaManagerMock.Object,
@@ -2781,7 +3325,8 @@ public class SagaCoordinatorBackgroundServiceTests {
             _resultCombiner,
             _queueResolverMock.Object,
             _enabledProviders,
-            _loggerMock.Object
+            _loggerMock.Object,
+            reviewStore ?? _refreshReviewStoreMock.Object
         );
     }
 
@@ -2824,6 +3369,7 @@ public class SagaCoordinatorBackgroundServiceTests {
             IsPartial = false,
             InitialProvider = SupportedProviders.Spotify,
             RateLimitInfo = null,
+            InstanceToken = "instance-current",
             OriginPriority = originPriority
         };
     }
@@ -2888,7 +3434,8 @@ public class SagaCoordinatorBackgroundServiceTests {
             FinalResultUri = null,
             IsPartial = false,
             InitialProvider = SupportedProviders.Spotify,
-            RateLimitInfo = null
+            RateLimitInfo = null,
+            InstanceToken = "instance-current"
         };
     }
 

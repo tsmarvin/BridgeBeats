@@ -2,6 +2,7 @@ using System.Text.Json;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Core.Domain.Extensions;
 using BridgeBeats.Core.Domain.Providers.Tidal;
+using BridgeBeats.Core.Infrastructure.Extensions;
 using Serilog;
 
 namespace BridgeBeats.Worker.Tidal;
@@ -81,6 +82,9 @@ public static class Program {
 
         // Register JSON serializer options (required by TidalLookupService)
         _ = builder.Services.AddSingleton( new JsonSerializerOptions { WriteIndented = true } );
+
+        // Register the track genre cache used by TidalLookupService
+        _ = builder.Services.AddGenreCache( );
 
         // Register queue processor background service for consuming from Redis streams
         _ = builder.Services.AddQueueProcessor<TidalLookupService>( SupportedProviders.Tidal );

@@ -278,7 +278,7 @@ public sealed partial class RedisMediaLinkCache : IMediaLinkCacheRepository {
     /// title/artist metadata pointers, and provider-id pointers. All written keys are recorded in
     /// <c>keys:{rkey}</c> so they can be refreshed or removed as a unit, and all share the configured
     /// cache-day TTL. When an entry for the same record already exists, only the TTLs are refreshed
-    /// rather than rewriting the pointers. This is the same method CacheBootstrap calls to rebuild
+    /// rather than rewriting the pointers. This is the same method the Maintenance worker calls to rebuild
     /// Redis from the PDS.
     /// </remarks>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="result"/> is null.</exception>
@@ -530,19 +530,17 @@ public sealed partial class RedisMediaLinkCache : IMediaLinkCacheRepository {
 
     /// <summary>
     /// Checks if a result is stale based on the cache days configuration.
-    /// Partial results are always stale-eligible so callers re-enter the lookup path
-    /// and wait for the complete result instead of serving the partial as final.
     /// </summary>
     /// <param name="result">The fetched result.</param>
     /// <param name="recordUri">The record URI it came from.</param>
     /// <returns>The result, its URI, and a staleness flag.</returns>
-    /// <remarks>A record is stale when it is partial or its last-looked-up time is older than the configured cache window.</remarks>
+    /// <remarks>A record is stale when its last-looked-up time is older than the configured cache window.</remarks>
     private (MediaLinkResult result, string recordUri, bool isStale) CheckRecordFreshness(
         MediaLinkResult result,
         string recordUri
     ) {
         DateTime expirationDate = DateTime.UtcNow.AddDays( -_cacheDays );
-        bool isStale = result.IsPartial || result.LookedUpAt < expirationDate;
+        bool isStale = result.LookedUpAt < expirationDate;
         return (result, recordUri, isStale);
     }
 

@@ -15,7 +15,7 @@ namespace BridgeBeats.Core.Infrastructure.Migrations
         protected override void BuildModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
-            modelBuilder.HasAnnotation("ProductVersion", "10.0.9");
+            modelBuilder.HasAnnotation("ProductVersion", "10.0.13");
 
             modelBuilder.Entity("BridgeBeats.Core.Infrastructure.Identity.ApplicationUser", b =>
                 {
@@ -34,22 +34,10 @@ namespace BridgeBeats.Core.Infrastructure.Migrations
                     b.Property<string>("AppleMusicUserToken")
                         .HasColumnType("TEXT");
 
-                    b.Property<string>("AtProtoAccessToken")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("AtProtoDPoPKey")
-                        .HasColumnType("TEXT");
-
                     b.Property<string>("AtProtoDid")
                         .HasColumnType("TEXT");
 
                     b.Property<string>("AtProtoHandle")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("AtProtoRefreshToken")
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime?>("AtProtoTokenExpiration")
                         .HasColumnType("TEXT");
 
                     b.Property<string>("ConcurrencyStamp")
@@ -123,51 +111,6 @@ namespace BridgeBeats.Core.Infrastructure.Migrations
                         .HasDatabaseName("UserNameIndex");
 
                     b.ToTable("AspNetUsers", (string)null);
-                });
-
-            modelBuilder.Entity("BridgeBeats.Core.Infrastructure.Identity.AtProtoOAuthState", b =>
-                {
-                    b.Property<string>("State")
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("AuthorizationServerUri")
-                        .HasMaxLength(512)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("CodeVerifier")
-                        .IsRequired()
-                        .HasMaxLength(512)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime>("CreatedAt")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("DPoPKeyJwk")
-                        .IsRequired()
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("Did")
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime>("ExpiresAt")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("Handle")
-                        .IsRequired()
-                        .HasMaxLength(256)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("PdsUri")
-                        .HasMaxLength(512)
-                        .HasColumnType("TEXT");
-
-                    b.HasKey("State");
-
-                    b.HasIndex("ExpiresAt");
-
-                    b.ToTable("AtProtoOAuthStates");
                 });
 
             modelBuilder.Entity("BridgeBeats.Core.Infrastructure.Playlists.PlaylistEntry", b =>

@@ -45,6 +45,23 @@ public static class SpotifyConstants {
     // Type-specific bulk stream names
 
     /// <summary>
+    /// Redis stream name <c>"queue:spotify:interactive"</c> for live-user Spotify lookups.
+    /// </summary>
+    public const string InteractiveStream = "queue:spotify:interactive";
+
+    /// <summary>Redis stream for single-item background Spotify lookups.</summary>
+    public const string BackgroundStream = "queue:spotify:background";
+
+    /// <summary>Consumer group shared by Spotify generic and bulk streams.</summary>
+    public const string ConsumerGroup = "spotify-workers";
+
+    /// <summary>Redis pub/sub channel that wakes the generic Spotify queue consumer.</summary>
+    public const string WorkSignalChannel = "queue:spotify:work";
+
+    /// <summary>Redis pub/sub channel that wakes the Spotify bulk batch consumer.</summary>
+    public const string BulkWorkSignalChannel = "queue:spotify:bulk:work";
+
+    /// <summary>
     /// Redis stream name <c>"queue:spotify:bulk:track-id"</c> for <c>SongIdLookup</c> messages routed
     /// by <c>SpotifyBulkQueueDecorator</c> and consumed by <c>SpotifyBulkProcessorService</c>.
     /// </summary>

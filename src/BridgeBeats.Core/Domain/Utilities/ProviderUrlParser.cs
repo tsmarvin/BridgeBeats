@@ -82,6 +82,30 @@ public static partial class ProviderUrlParser {
     }
 
     /// <summary>
+    /// Extracts a catalog storefront from provider URLs that encode one. Apple Music stores the
+    /// storefront as the first path segment; Spotify and Tidal URLs do not carry equivalent data.
+    /// </summary>
+    /// <param name="provider">The provider whose URL is being inspected.</param>
+    /// <param name="url">The provider URL.</param>
+    /// <returns>The normalized lowercase storefront, or <see langword="null"/> when absent.</returns>
+    public static string? ExtractStorefront( SupportedProviders provider, string url ) {
+        if (provider != SupportedProviders.AppleMusic
+            || !Uri.TryCreate( url, UriKind.Absolute, out Uri? uri )
+            || !uri.Host.Equals( "music.apple.com", StringComparison.OrdinalIgnoreCase )) {
+            return null;
+        }
+
+        string? storefront = uri.Segments
+            .Select( segment => segment.Trim( '/' ) )
+            .FirstOrDefault( segment => !string.IsNullOrWhiteSpace( segment ) );
+
+        return storefront is { Length: >= 2 and <= 3 }
+            && storefront.All( char.IsAsciiLetter )
+                ? storefront.ToLowerInvariant( )
+                : null;
+    }
+
+    /// <summary>
     /// Extracts the entity id from an Apple Music link. A <c>?i=</c> track selector takes precedence
     /// (it identifies the specific track inside an album link); otherwise the last path segment of
     /// the <c>music.apple.com</c> URL is used, stripped of any trailing query string.

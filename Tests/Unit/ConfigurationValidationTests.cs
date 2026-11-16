@@ -2,6 +2,9 @@ using BridgeBeats.Contracts.Interfaces; // Added for IMediaLinkService
 using BridgeBeats.Web.Configuration;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.FileProviders;
+using Microsoft.Extensions.Hosting;
+using Moq;
 
 namespace BridgeBeats.Tests.Unit;
 
@@ -146,6 +149,12 @@ public class ConfigurationValidationTests {
 
         // Act
         IServiceCollection services = new ServiceCollection( );
+
+        // SpotifyLookupService now requires IGenreCacheService (matching the Apple/Tidal direct
+        // lookup services). The real host registers it via AddGenreCache() ahead of this call; this
+        // test bypasses that host wiring, so it substitutes a bare instance to satisfy the dependency.
+        _ = services.AddSingleton( new Mock<IGenreCacheService>( ).Object );
+
         IConfiguration config = new ConfigurationBuilder( ).AddInMemoryCollection( overrides ).Build( );
         _ = services.AddBridgeBeatsServices( config );
         ServiceProvider sp = services.BuildServiceProvider( );
@@ -154,6 +163,97 @@ public class ConfigurationValidationTests {
         Assert.IsNotNull( sp );
         IMediaLinkService? mediaService = sp.GetService<IMediaLinkService>();
         Assert.IsNotNull( mediaService, "IMediaLinkService should be registered with Spotify credentials" );
+    }
+
+    /// <summary>Local development leaves Bluesky disabled when no signing key is configured.</summary>
+    [TestMethod]
+    public void AddBridgeBeatsServices_WithLocalDomainAndNoSigningKey_SkipsBluesky( ) {
+        IConfiguration config = new ConfigurationBuilder( ).AddInMemoryCollection( new Dictionary<string, string?> {
+            ["BridgeBeats:Domain"] = "localhost",
+            ["BridgeBeats:SpotifyClientId"] = "spotify_client_id",
+            ["BridgeBeats:SpotifyClientSecret"] = "spotify_secret",
+            ["BridgeBeats:IdentityConnectionString"] = "Data Source=Identity;Mode=Memory",
+            ["BridgeBeats:ApiKeySalt"] = "api_key_salt"
+        } ).Build( );
+        IServiceCollection services = new ServiceCollection( );
+        _ = services.AddSingleton( new Mock<IGenreCacheService>( ).Object );
+
+        _ = services.AddBridgeBeatsServices( config );
+
+        using ServiceProvider provider = services.BuildServiceProvider( );
+        Assert.IsFalse( provider.GetRequiredService<AuthenticationFeatureState>( ).BlueskyEnabled );
+    }
+
+    /// <summary>Fail-fast applies when invalid authentication configuration would stop startup.</summary>
+    [TestMethod]
+    public void AddBridgeBeatsServices_WithFailFastAndDomainAndNoSigningKey_FailsFast( ) {
+        IConfiguration config = new ConfigurationBuilder( ).AddInMemoryCollection( new Dictionary<string, string?> {
+            ["BridgeBeats:Domain"] = "bridgebeats.example"
+        } ).Build( );
+
+        InvalidOperationException error = Assert.ThrowsExactly<InvalidOperationException>( ( ) =>
+            new ServiceCollection( ).AddBridgeBeatsServices( config, failFastOnInvalidAuthConfiguration: true ) );
+        Assert.Contains( "ATProtoOAuthSigningKeyPath", error.Message );
+    }
+
+    /// <summary>
+    /// Any deployed environment other than Development or Testing must fail fast, so a staging
+    /// deployment cannot silently start without Bluesky sign-in. Exercises the environment rule the
+    /// host itself applies rather than restating it.
+    /// </summary>
+    [TestMethod]
+    public void RequiresStrictAuthConfiguration_OnlyRelaxesDevelopmentAndTesting( ) {
+        (string Environment, bool Strict)[] cases = [
+            ("Production", true),
+            ("Staging", true),
+            ("QA", true),
+            ("Development", false),
+            ("Testing", false)
+        ];
+
+        foreach ((string environmentName, bool strict) in cases) {
+            StubHostEnvironment environment = new( ) { EnvironmentName = environmentName };
+            Assert.AreEqual( strict, StartupExtensions.RequiresStrictAuthConfiguration( environment ), environmentName );
+        }
+    }
+
+    /// <summary>
+    /// A staging deployment with an invalid domain fails startup instead of skipping Bluesky,
+    /// which is how the flag the host computes behaves in that environment.
+    /// </summary>
+    [TestMethod]
+    public void AddBridgeBeatsServices_OutsideDevelopmentAndTesting_FailsFastOnInvalidDomain( ) {
+        IConfiguration config = new ConfigurationBuilder( ).AddInMemoryCollection( new Dictionary<string, string?> {
+            ["BridgeBeats:Domain"] = "http://invalid.example/path",
+            ["BridgeBeats:ATProtoOAuthSigningKeyPath"] = "/not/a/real/key"
+        } ).Build( );
+        StubHostEnvironment staging = new( ) { EnvironmentName = "Staging" };
+
+        InvalidOperationException error = Assert.ThrowsExactly<InvalidOperationException>( ( ) =>
+            new ServiceCollection( ).AddBridgeBeatsServices(
+                config,
+                failFastOnInvalidAuthConfiguration: StartupExtensions.RequiresStrictAuthConfiguration( staging ) ) );
+        Assert.Contains( "BridgeBeats:Domain", error.Message );
+    }
+
+    /// <summary>Development still relaxes an invalid domain instead of failing startup.</summary>
+    [TestMethod]
+    public void AddBridgeBeatsServices_InDevelopmentWithInvalidDomain_SkipsBluesky( ) {
+        IConfiguration config = new ConfigurationBuilder( ).AddInMemoryCollection( new Dictionary<string, string?> {
+            ["BridgeBeats:Domain"] = "http://invalid.example/path",
+            ["BridgeBeats:SpotifyClientId"] = "spotify_client_id",
+            ["BridgeBeats:SpotifyClientSecret"] = "spotify_secret",
+            ["BridgeBeats:IdentityConnectionString"] = "Data Source=Identity;Mode=Memory",
+            ["BridgeBeats:ApiKeySalt"] = "api_key_salt",
+            ["BridgeBeats:ATProtoOAuthSigningKeyPath"] = "/not/a/real/key"
+        } ).Build( );
+        IServiceCollection services = new ServiceCollection( );
+        _ = services.AddSingleton( new Mock<IGenreCacheService>( ).Object );
+
+        _ = services.AddBridgeBeatsServices( config );
+
+        using ServiceProvider provider = services.BuildServiceProvider( );
+        Assert.IsFalse( provider.GetRequiredService<AuthenticationFeatureState>( ).BlueskyEnabled );
     }
 
     /// <summary>
@@ -254,5 +354,16 @@ public class ConfigurationValidationTests {
             _ = services.AddBridgeBeatsServices( config );
         } );
         Assert.Contains( "CardCacheCleanupInterval must be greater than zero", ex.Message );
+    }
+
+    /// <summary>Supplies just the environment name for the host's strict-configuration rule.</summary>
+    private sealed class StubHostEnvironment : IHostEnvironment {
+        public string EnvironmentName { get; set; } = string.Empty;
+
+        public string ApplicationName { get; set; } = string.Empty;
+
+        public string ContentRootPath { get; set; } = string.Empty;
+
+        public IFileProvider ContentRootFileProvider { get; set; } = new NullFileProvider( );
     }
 }

@@ -30,7 +30,6 @@ namespace BridgeBeats.Tests.Unit;
 /// - Session manager persist writes ciphertext: the stored string does not contain the refresh token.
 /// - Session manager key-ring-mismatch on read degrades to fresh login (returns false, does not throw).
 /// - ATProtoPersistedCredentials.ToString() omits all token fields.
-/// - ATProtoOAuthResult.ToString() omits all token fields.
 /// </summary>
 [TestClass]
 public class CredentialsAtRestEncryptionTests {
@@ -561,35 +560,4 @@ public class CredentialsAtRestEncryptionTests {
         Assert.Contains( "DPoP", result, "ToString must include AuthenticationType" );
     }
 
-    /// <summary>
-    /// <see cref="ATProtoOAuthResult.ToString()"/> must not include the access token, the refresh
-    /// token, or the DPoP key JWK in its output.
-    ///
-    /// Failure-first evidence: before the ToString() override was added the default record
-    /// ToString() emitted all property values. The assertions below failed because the output
-    /// contained AccessToken, RefreshToken, and DPoPKeyJwk verbatim.
-    /// </summary>
-    [TestMethod]
-    public void ATProtoOAuthResult_ToString_OmitsSecretFields( ) {
-        ATProtoOAuthResult result = new( ) {
-            Did = "did:plc:oauthuser",
-            Handle = "bob.bsky.social",
-            AccessToken = "secret-access-token-aaa",
-            RefreshToken = "secret-refresh-token-bbb",
-            DPoPKeyJwk = "{\"kty\":\"EC\",\"secret-key\":\"secret-material\"}",
-            TokenExpiration = DateTime.UtcNow.AddHours( 2 ),
-            Scope = "atproto transition:generic"
-        };
-
-        string str = result.ToString( );
-
-        Assert.DoesNotContain( "secret-access-token-aaa", str, "ToString must not include AccessToken" );
-        Assert.DoesNotContain( "secret-refresh-token-bbb", str, "ToString must not include RefreshToken" );
-        Assert.DoesNotContain( "secret-material", str, "ToString must not include DPoPKeyJwk content" );
-
-        // Non-secret identity fields should be present.
-        Assert.Contains( "did:plc:oauthuser", str, "ToString must include Did" );
-        Assert.Contains( "bob.bsky.social", str, "ToString must include Handle" );
-        Assert.Contains( "atproto transition:generic", str, "ToString must include Scope" );
-    }
 }

@@ -15,6 +15,12 @@ namespace BridgeBeats.Core.Domain.Providers.Spotify;
 /// </remarks>
 public interface ISpotifyBulkLookupService {
 
+    /// <summary>Resolves a single track by ISRC after a batched native-id miss.</summary>
+    Task<MusicLookupResult?> GetInfoByISRCAsync( string isrc );
+
+    /// <summary>Resolves a single album by UPC after a batched native-id miss.</summary>
+    Task<MusicLookupResult?> GetInfoByUPCAsync( string upc );
+
     /// <summary>
     /// Performs a bulk lookup of tracks by their Spotify IDs.
     /// </summary>

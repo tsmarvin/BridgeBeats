@@ -58,7 +58,7 @@ internal static class CarRepoReader {
     /// <param name="prefix">The collection prefix (<c>{collection}/</c>) to match and strip.</param>
     /// <returns>The lazy sequence of <c>(rkey, record JSON)</c> pairs for the collection.</returns>
     /// <exception cref="CarParseException">Thrown when a value block referenced by a matching key is missing or decodes to null.</exception>
-    private static IEnumerable<(string Rkey, JsonNode Record)> ProjectRecords(
+    private static IEnumerable<(string Rkey, string Cid, JsonNode Record)> ProjectRecords(
         IEnumerable<(string Key, string ValueCidHex)> records,
         CarFile carFile,
         string prefix
@@ -77,7 +77,7 @@ internal static class CarRepoReader {
             JsonNode recordNode = DagCborConverter.ToJsonNode( blockBytes )
                 ?? throw new CarParseException( $"Record block for key '{key}' deserialized to null." );
 
-            yield return (rkey, recordNode);
+            yield return (rkey, Cid.FromKeyHex( valueCidHex ).ToString( ), recordNode);
         }
     }
 }
@@ -92,7 +92,7 @@ internal static class CarRepoReader {
 /// <param name="BlockCount">The total number of blocks in the decoded CAR (used for logging and as the walk's count caps).</param>
 /// <param name="CommitVersion">The repository commit version read from the commit block.</param>
 internal sealed record CarEnumerationResult(
-    IEnumerable<(string Rkey, System.Text.Json.Nodes.JsonNode Record)> Records,
+    IEnumerable<(string Rkey, string Cid, System.Text.Json.Nodes.JsonNode Record)> Records,
     int BlockCount,
     int CommitVersion
 );

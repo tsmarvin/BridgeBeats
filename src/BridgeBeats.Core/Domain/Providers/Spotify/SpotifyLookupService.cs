@@ -18,22 +18,22 @@ namespace BridgeBeats.Core.Domain.Providers.Spotify {
     /// This is the direct variant (it extends <see cref="MusicLookupServiceBase"/>); the proxy variant
     /// that forwards to a worker is <see cref="SpotifyHttpLookupService"/>. Title/artist resolution
     /// searches the artist, enumerates their albums, and matches a sanitized album title, falling back
-    /// to matching a sanitized song title across the artist's albums. When an optional
-    /// <see cref="IGenreCacheService"/> is supplied, track-to-artist genre mappings are cached as a
-    /// best-effort, fire-and-forget side effect whose failures are logged and swallowed. Bulk requests
-    /// surface a 429 as <see cref="Contracts.Exceptions.RetryAfterExceededException"/> rather than a partial result.
+    /// to matching a sanitized song title across the artist's albums. Track-to-artist genre mappings are
+    /// cached via <see cref="IGenreCacheService"/> as a best-effort, fire-and-forget side effect whose
+    /// failures are logged and swallowed. Bulk requests surface a 429 as
+    /// <see cref="Contracts.Exceptions.RetryAfterExceededException"/> rather than a partial result.
     /// </remarks>
     /// <param name="handler">Supplies the Spotify bearer token for authenticated API calls.</param>
     /// <param name="factory">Factory for the <c>spotify-api</c> HTTP client.</param>
     /// <param name="logger">Logger for lookup and parse diagnostics.</param>
     /// <param name="serializerOptions">JSON options for deserializing Spotify API responses.</param>
-    /// <param name="genreCache">Optional genre cache for best-effort track-to-artist mapping; <see langword="null"/> disables caching.</param>
+    /// <param name="genreCache">Genre cache used for best-effort track-to-artist mapping.</param>
     public sealed partial class SpotifyLookupService(
         SpotifyTokenHandler handler,
         IHttpClientFactory factory,
         ILogger<SpotifyLookupService> logger,
         JsonSerializerOptions serializerOptions,
-        IGenreCacheService? genreCache = null
+        IGenreCacheService genreCache
     ) : MusicLookupServiceBase( logger, serializerOptions ), IMusicLookupService, ISpotifyBulkLookupService {
 
         /// <summary>Gets the provider this service resolves against (<see cref="SupportedProviders.Spotify"/>).</summary>
@@ -376,15 +376,20 @@ namespace BridgeBeats.Core.Domain.Providers.Spotify {
         }
 
         /// <summary>
-        /// Performs an API request for bulk lookup operations with a custom endpoint key for rate
-        /// limiting, translating a 429 into a rate-limit exception.
+        /// Performs an API request for bulk lookup operations, using a custom endpoint key for
+        /// failure diagnostics.
         /// </summary>
         /// <param name="requestUri">The API endpoint URI.</param>
         /// <param name="endpointKey">The endpoint key for rate limit tracking.</param>
-        /// <returns>The response body on success, or <see langword="null"/> on a non-429 failure status.</returns>
-        /// <exception cref="Contracts.Exceptions.RetryAfterExceededException">
-        /// Thrown when the response is HTTP 429; the <c>Retry-After</c> delta (or 30 seconds when absent)
-        /// is carried on the exception.
+        /// <returns>The response body on success, or <see langword="null"/> on any non-2xx status other than 400 (which throws — see exceptions below); 401, 403, 404, and 5xx return <see langword="null"/>.</returns>
+        /// <exception cref="Contracts.Exceptions.ProviderRateLimitException">
+        /// Thrown by the provider HTTP pipeline when its Polly retry policy exhausts an HTTP 429.
+        /// </exception>
+        /// <exception cref="Contracts.Exceptions.SpotifyBulkRejectedException">
+        /// Thrown when the response is HTTP 400 Bad Request. A 400 indicates a malformed or otherwise
+        /// unacceptable id in the batch; re-enqueueing each item individually isolates the poison id.
+        /// All other non-2xx responses (including 401, 403, 404, and 5xx) return <see langword="null"/>
+        /// so the caller's batch back-off path handles them.
         /// </exception>
         private async Task<string?> NewBulkMusicApiRequest( string requestUri, string endpointKey ) {
             using HttpClient client = await CreateAuthenticatedClientAsync( );
@@ -394,20 +399,21 @@ namespace BridgeBeats.Core.Domain.Providers.Spotify {
                 return await response.Content.ReadAsStringAsync( );
             }
 
-            // Handle rate limiting with custom endpoint key
-            if (response.StatusCode == System.Net.HttpStatusCode.TooManyRequests) {
-                TimeSpan retryAfter = response.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds( 30 );
-                LogBulkRateLimited( Logger, endpointKey, retryAfter );
-                // Use the standard threshold - bulk requests are always thrown for requeue
-                throw new Contracts.Exceptions.RetryAfterExceededException(
-                    retryAfter,
-                    TimeSpan.Zero, // Threshold is 0 since bulk requests are always queued
+            // Only a 400 Bad Request indicates a malformed id; other failures fall through to
+            // the batch back-off path. 401/403 are request-wide auth failures that individual
+            // retries cannot resolve; 404 and 5xx are similarly not id-specific. Returning null
+            // routes all of those to the existing cooldown + rebatch path, unchanged.
+            int statusCode = (int)response.StatusCode;
+            if (statusCode == 400) {
+                LogBulkRequestFailed( Logger, endpointKey, statusCode );
+                throw new Contracts.Exceptions.SpotifyBulkRejectedException(
+                    statusCode,
                     new Uri( client.BaseAddress!, requestUri ),
                     SupportedProviders.Spotify
                 );
             }
 
-            LogBulkRequestFailed( Logger, endpointKey, (int)response.StatusCode );
+            LogBulkRequestFailed( Logger, endpointKey, statusCode );
             return null;
         }
 
@@ -492,7 +498,7 @@ namespace BridgeBeats.Core.Domain.Providers.Spotify {
         /// <param name="isPrimary">Whether to mark the result as the primary provider result.</param>
         /// <returns>
         /// The mapped result, or <see langword="null"/> when deserialization fails. As a side effect, a
-        /// track's artist mapping is cached when a genre cache is configured.
+        /// track's artist mapping is cached.
         /// </returns>
         private MusicLookupResult? ParseSpotifyResponse(
             JsonElement element,
@@ -589,7 +595,7 @@ namespace BridgeBeats.Core.Domain.Providers.Spotify {
                         }
                     }
                 } while (response?.Artists?.Next != null);
-            } catch (Exception ex) {
+            } catch (JsonException ex) {
                 LogParseArtistListError( Logger, ex );
             }
 
@@ -697,12 +703,12 @@ namespace BridgeBeats.Core.Domain.Providers.Spotify {
         /// <param name="trackId">The Spotify track ID.</param>
         /// <param name="artists">The list of artists on the track; only those with a non-empty id are used.</param>
         /// <remarks>
-        /// No-ops when no genre cache is configured, the track id is blank, or no usable artist ids are
-        /// present. The cache work runs on a background task whose failures are logged and swallowed, so
-        /// the caller is never blocked or made to fail by caching errors.
+        /// No-ops when the track id is blank or no usable artist ids are present. The cache work runs on
+        /// a background task whose failures are logged and swallowed, so the caller is never blocked or
+        /// made to fail by caching errors.
         /// </remarks>
         private void CacheTrackArtistMapping( string trackId, List<SpotifyArtistSimplified> artists ) {
-            if (genreCache == null || string.IsNullOrWhiteSpace( trackId ) || artists.Count == 0) {
+            if (string.IsNullOrWhiteSpace( trackId ) || artists.Count == 0) {
                 return;
             }
 
@@ -793,16 +799,6 @@ namespace BridgeBeats.Core.Domain.Providers.Spotify {
             Level = LogLevel.Error,
             Message = "An error occurred while parsing bulk artists response from Spotify." )]
         internal static partial void LogParseBulkArtistsError( ILogger logger, Exception ex );
-
-        /// <summary>Logs rate limiting on bulk endpoint.</summary>
-        /// <param name="logger">The logger to write to.</param>
-        /// <param name="endpoint">The bulk endpoint label.</param>
-        /// <param name="retryAfter">The wait before retrying.</param>
-        [LoggerMessage(
-            EventId = LogEventIds.Providers.Spotify.BulkRateLimited,
-            Level = LogLevel.Warning,
-            Message = "Rate limited on bulk endpoint {Endpoint}, retry after {RetryAfter}" )]
-        internal static partial void LogBulkRateLimited( ILogger logger, string endpoint, TimeSpan retryAfter );
 
         /// <summary>Logs bulk API request failure.</summary>
         /// <param name="logger">The logger to write to.</param>

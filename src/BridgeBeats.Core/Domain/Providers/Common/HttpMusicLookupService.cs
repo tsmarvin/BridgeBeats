@@ -1,6 +1,8 @@
 using System.Net.Http.Json;
+using System.Text.Json;
 using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
+using BridgeBeats.Contracts.Exceptions;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records.WorkerApi;
 using BridgeBeats.Core.Infrastructure.Logging;
@@ -14,9 +16,8 @@ namespace BridgeBeats.Core.Domain.Providers.Common;
 /// <remarks>
 /// This is the proxy half of the two <see cref="IMusicLookupService"/> implementation families. It
 /// posts each request to a named worker (one of the <c>/lookup/*</c> routes) and unwraps the worker's
-/// <see cref="ProviderLookupResponse"/> envelope. Success is signalled by the envelope, not the HTTP
-/// status code: the worker returns HTTP 200 even for handled errors and reports failure through
-/// <see cref="ProviderLookupResponse.Success"/> / <see cref="ProviderLookupResponse.ErrorMessage"/>.
+/// <see cref="ProviderLookupResponse"/> envelope. Status-bearing responses are mapped to typed
+/// exceptions while a successful no-match envelope maps to <see langword="null"/>.
 /// Direct, in-process provider services derive instead from <see cref="MusicLookupServiceBase"/>.
 /// </remarks>
 /// <param name="provider">The provider this proxy represents, surfaced through <see cref="Provider"/>.</param>
@@ -104,34 +105,64 @@ public partial class HttpMusicLookupService(
     /// <param name="endpoint">The worker route (for example <c>/lookup/url</c>) to post to.</param>
     /// <param name="request">The request payload to serialize as JSON.</param>
     /// <returns>
-    /// The <see cref="ProviderLookupResponse.Result"/> on success; <see langword="null"/> when the HTTP
-    /// status is unsuccessful, the body is empty, or the envelope reports an error message.
+    /// The <see cref="ProviderLookupResponse.Result"/> on success; <see langword="null"/> for an empty
+    /// response body or the worker's successful no-match envelope.
     /// </returns>
-    /// <exception cref="HttpRequestException">Re-thrown (after logging) on a transport-level failure.</exception>
+    /// <exception cref="ProviderRateLimitException">Thrown for a worker 429 response with a valid retry delay.</exception>
+    /// <exception cref="HttpRequestException">Thrown (after logging) for a worker error status, an error envelope,
+    /// an invalid success body, or a transport-level failure.</exception>
     private async Task<MusicLookupResult?> PostAsync<TRequest>( string endpoint, TRequest request ) {
         try {
             using HttpClient client = httpClientFactory.CreateClient( httpClientName );
+            using HttpResponseMessage response = await client.PostAsJsonAsync( endpoint, request );
 
-            HttpResponseMessage response = await client.PostAsJsonAsync( endpoint, request );
+            ProviderLookupResponse? result = null;
+            try {
+                result = await response.Content.ReadFromJsonAsync<ProviderLookupResponse>( );
+            } catch (JsonException) when (!response.IsSuccessStatusCode) {
+                // Status-bearing failures do not require a response envelope.
+                LogWorkerHttpError( logger, provider, (int)response.StatusCode, endpoint );
+            } catch (JsonException ex) {
+                throw new HttpRequestException( "Provider worker returned an invalid response.", ex, response.StatusCode );
+            }
+
+            if (response.StatusCode == System.Net.HttpStatusCode.TooManyRequests) {
+                // The envelope preserves sub-second precision; Retry-After is integer-rounded for
+                // HTTP interoperability and is only a fallback for non-envelope responses.
+                double? retryAfter = result?.RetryAfterSeconds ?? ParseRetryAfterSeconds( response );
+                double? threshold = result?.RetryThresholdSeconds;
+                if (!retryAfter.HasValue || !IsValidRetrySeconds( retryAfter.Value )) {
+                    throw new HttpRequestException( "Worker rate-limit response was missing retry metadata.", null, response.StatusCode );
+                }
+                TimeSpan retryDelay = TimeSpan.FromSeconds( retryAfter.Value );
+                if (threshold.HasValue && !IsValidRetrySeconds( threshold.Value )) {
+                    throw new HttpRequestException( "Worker rate-limit response contained invalid threshold metadata.", null, response.StatusCode );
+                }
+                if (threshold is >= 0 && retryAfter.Value > threshold.Value) {
+                    throw new RetryAfterExceededException( retryDelay, TimeSpan.FromSeconds( threshold.Value ), null, provider );
+                }
+                throw new ProviderRateLimitException( retryDelay, null, provider );
+            }
 
             if (!response.IsSuccessStatusCode) {
                 LogWorkerHttpError( logger, provider, (int)response.StatusCode, endpoint );
-                return null;
+                throw new HttpRequestException( "Provider worker request failed.", null, response.StatusCode );
             }
-
-            ProviderLookupResponse? result = await response.Content.ReadFromJsonAsync<ProviderLookupResponse>( );
 
             if (result == null) {
                 LogWorkerNullResponse( logger, provider, endpoint );
                 return null;
             }
 
-            if (!result.Success && !string.IsNullOrWhiteSpace( result.ErrorMessage )) {
-                LogWorkerError( logger, provider, endpoint, result.ErrorMessage );
-                return null;
+            if (!result.Success) {
+                const string Sanitized = "Provider worker reported a lookup failure.";
+                LogWorkerError( logger, provider, endpoint, Sanitized );
+                throw new HttpRequestException( Sanitized, null, System.Net.HttpStatusCode.ServiceUnavailable );
             }
 
             return result.Result;
+        } catch (ProviderRateLimitException) {
+            throw;
         } catch (HttpRequestException ex) {
             LogHttpRequestError( logger, ex, provider, endpoint );
             throw; // Re-throw to let the caller handle worker unavailability
@@ -140,6 +171,33 @@ public partial class HttpMusicLookupService(
             throw;
         }
     }
+
+    private static double? ParseRetryAfterSeconds( HttpResponseMessage response ) {
+        if (!response.Headers.TryGetValues( "Retry-After", out IEnumerable<string>? values )) {
+            return null;
+        }
+
+        string? value = values.FirstOrDefault( );
+        if (double.TryParse( value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double seconds )
+            && double.IsFinite( seconds )
+            && seconds >= 0
+            && seconds <= TimeSpan.MaxValue.TotalSeconds) {
+            return seconds;
+        }
+
+        if (DateTimeOffset.TryParse(
+                value,
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AllowWhiteSpaces | System.Globalization.DateTimeStyles.AssumeUniversal,
+                out DateTimeOffset date )) {
+            return Math.Max( 0, (date - DateTimeOffset.UtcNow).TotalSeconds );
+        }
+
+        return null;
+    }
+
+    private static bool IsValidRetrySeconds( double seconds )
+        => double.IsFinite( seconds ) && seconds >= 0 && seconds <= TimeSpan.MaxValue.TotalSeconds;
 
     #region LoggerMessage Methods
 

@@ -63,18 +63,12 @@ public class SpotifyBulkQueueDecoratorTests {
         _ = _redisMock.Setup( r => r.GetDatabase( It.IsAny<int>( ), It.IsAny<object>( ) ) )
             .Returns( _databaseMock.Object );
 
-        // Default: any StreamAddAsync call succeeds (8-param overload used by StackExchange.Redis 2.13)
+        // Default: atomic XADD + wake publication succeeds.
         _ = _databaseMock
-            .Setup( d => d.StreamAddAsync(
-                It.IsAny<RedisKey>( ),
-                It.IsAny<NameValueEntry[]>( ),
-                It.IsAny<RedisValue?>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<bool>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<StreamTrimMode>( ),
+            .Setup( d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ) )
-            .ReturnsAsync( (RedisValue)"1234567890-0" );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"1234567890-0" ) );
 
         _decorator = new SpotifyBulkQueueDecorator( _innerQueueMock.Object, _redisMock.Object, _loggerMock.Object );
     }
@@ -136,16 +130,12 @@ public class SpotifyBulkQueueDecoratorTests {
         // Act
         await _decorator.EnqueueAsync( request, QueuePriority.Bulk, TestContext.CancellationToken );
 
-        // Assert — XADD was called exactly once, with the track-id stream key
+        // Assert — the atomic enqueue script targets the track-id stream.
         _databaseMock.Verify(
-            d => d.StreamAddAsync(
-                BulkTrackIdStream,
-                It.IsAny<NameValueEntry[]>( ),
-                It.IsAny<RedisValue?>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<bool>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<StreamTrimMode>( ),
+            d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ),
+                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == BulkTrackIdStream ),
+                It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ),
             Times.Once
         );
@@ -155,6 +145,37 @@ public class SpotifyBulkQueueDecoratorTests {
             q => q.EnqueueAsync( It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ),
             Times.Never
         );
+    }
+
+    /// <summary>An isolated queue prefix is applied to the bulk stream and its wake channel.</summary>
+    [TestMethod]
+    public async Task EnqueueAsync_WithKeyPrefix_UsesOnlyPrefixedBulkKeyspace( ) {
+        SpotifyBulkQueueDecorator decorator = new(
+            _innerQueueMock.Object,
+            _redisMock.Object,
+            _loggerMock.Object,
+            keyPrefix: "isolated" );
+        QueuedLookupRequest request = CreateRequest(
+            LookupRequestType.SongIdLookup,
+            "3n3Ppam7vgaVa1iaRUc9Lp" );
+
+        await decorator.EnqueueAsync( request, QueuePriority.Bulk, TestContext.CancellationToken );
+
+        _databaseMock.Verify( database => database.ScriptEvaluateAsync(
+            It.IsAny<string>( ),
+            It.Is<RedisKey[]?>( keys => keys != null
+                && keys.Length == 1
+                && keys[0] == "queue:isolated:spotify:bulk:track-id" ),
+            It.Is<RedisValue[]?>( arguments => arguments != null
+                && arguments.Length == 5
+                && arguments[4] == "queue:isolated:spotify:bulk:work" ),
+            It.IsAny<CommandFlags>( ) ), Times.Once );
+        _databaseMock.Verify( database => database.ScriptEvaluateAsync(
+            It.IsAny<string>( ),
+            It.Is<RedisKey[]?>( keys => keys != null
+                && keys.Any( key => key == BulkTrackIdStream ) ),
+            It.IsAny<RedisValue[]?>( ),
+            It.IsAny<CommandFlags>( ) ), Times.Never );
     }
 
     /// <summary>
@@ -169,16 +190,12 @@ public class SpotifyBulkQueueDecoratorTests {
         // Act
         await _decorator.EnqueueAsync( request, QueuePriority.Bulk, TestContext.CancellationToken );
 
-        // Assert — XADD was called exactly once, with the album-id stream key
+        // Assert — the atomic enqueue script targets the album-id stream.
         _databaseMock.Verify(
-            d => d.StreamAddAsync(
-                BulkAlbumIdStream,
-                It.IsAny<NameValueEntry[]>( ),
-                It.IsAny<RedisValue?>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<bool>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<StreamTrimMode>( ),
+            d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ),
+                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == BulkAlbumIdStream ),
+                It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ),
             Times.Once
         );
@@ -212,16 +229,10 @@ public class SpotifyBulkQueueDecoratorTests {
             Times.Once
         );
 
-        // Assert — no XADD to any stream
+        // Assert — no atomic bulk enqueue.
         _databaseMock.Verify(
-            d => d.StreamAddAsync(
-                It.IsAny<RedisKey>( ),
-                It.IsAny<NameValueEntry[]>( ),
-                It.IsAny<RedisValue?>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<bool>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<StreamTrimMode>( ),
+            d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ),
             Times.Never
         );
@@ -272,16 +283,10 @@ public class SpotifyBulkQueueDecoratorTests {
             Times.Once
         );
 
-        // Assert — no StreamAddAsync (no bulk-stream write)
+        // Assert — no bulk-stream write.
         _databaseMock.Verify(
-            d => d.StreamAddAsync(
-                It.IsAny<RedisKey>( ),
-                It.IsAny<NameValueEntry[]>( ),
-                It.IsAny<RedisValue?>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<bool>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<StreamTrimMode>( ),
+            d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ),
             Times.Never
         );
@@ -309,16 +314,10 @@ public class SpotifyBulkQueueDecoratorTests {
             Times.Once
         );
 
-        // Assert — no StreamAddAsync (no bulk-stream write)
+        // Assert — no bulk-stream write.
         _databaseMock.Verify(
-            d => d.StreamAddAsync(
-                It.IsAny<RedisKey>( ),
-                It.IsAny<NameValueEntry[]>( ),
-                It.IsAny<RedisValue?>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<bool>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<StreamTrimMode>( ),
+            d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ),
             Times.Never
         );
@@ -336,16 +335,12 @@ public class SpotifyBulkQueueDecoratorTests {
         // Act
         await _decorator.EnqueueAsync( request, QueuePriority.Background, TestContext.CancellationToken );
 
-        // Assert — XADD to the track-id stream
+        // Assert — atomic enqueue to the track-id stream.
         _databaseMock.Verify(
-            d => d.StreamAddAsync(
-                BulkTrackIdStream,
-                It.IsAny<NameValueEntry[]>( ),
-                It.IsAny<RedisValue?>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<bool>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<StreamTrimMode>( ),
+            d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ),
+                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == BulkTrackIdStream ),
+                It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ),
             Times.Once
         );
@@ -369,16 +364,12 @@ public class SpotifyBulkQueueDecoratorTests {
         // Act
         await _decorator.EnqueueAsync( request, QueuePriority.Background, TestContext.CancellationToken );
 
-        // Assert — XADD to the album-id stream
+        // Assert — atomic enqueue to the album-id stream.
         _databaseMock.Verify(
-            d => d.StreamAddAsync(
-                BulkAlbumIdStream,
-                It.IsAny<NameValueEntry[]>( ),
-                It.IsAny<RedisValue?>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<bool>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<StreamTrimMode>( ),
+            d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ),
+                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == BulkAlbumIdStream ),
+                It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ),
             Times.Once
         );
@@ -398,21 +389,15 @@ public class SpotifyBulkQueueDecoratorTests {
     [TestMethod]
     public async Task EnqueueAsync_WhenSongIdLookup_ShouldSerializePayloadField( ) {
         // Arrange
-        NameValueEntry[]? capturedFields = null;
+        RedisValue[]? capturedArguments = null;
         _ = _databaseMock
-            .Setup( d => d.StreamAddAsync(
-                It.IsAny<RedisKey>( ),
-                It.IsAny<NameValueEntry[]>( ),
-                It.IsAny<RedisValue?>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<bool>( ),
-                It.IsAny<long?>( ),
-                It.IsAny<StreamTrimMode>( ),
+            .Setup( d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
                 It.IsAny<CommandFlags>( ) ) )
-            .Callback( ( RedisKey _, NameValueEntry[] fields, RedisValue? _, long? _, bool _, long? _, StreamTrimMode _, CommandFlags _ ) => {
-                capturedFields = fields;
+            .Callback( ( string _, RedisKey[]? _, RedisValue[]? arguments, CommandFlags _ ) => {
+                capturedArguments = arguments;
             } )
-            .ReturnsAsync( (RedisValue)"1234567890-0" );
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"1234567890-0" ) );
 
         QueuedLookupRequest request = CreateRequest( LookupRequestType.SongIdLookup, "3n3Ppam7vgaVa1iaRUc9Lp" );
 
@@ -420,9 +405,9 @@ public class SpotifyBulkQueueDecoratorTests {
         await _decorator.EnqueueAsync( request, QueuePriority.Bulk, TestContext.CancellationToken );
 
         // Assert — fields contain "payload" and "enqueuedAt"
-        Assert.IsNotNull( capturedFields );
-        string? payloadField = (string?)capturedFields.FirstOrDefault( f => f.Name == "payload" ).Value;
-        string? enqueuedAtField = (string?)capturedFields.FirstOrDefault( f => f.Name == "enqueuedAt" ).Value;
+        Assert.IsNotNull( capturedArguments );
+        string? payloadField = capturedArguments[1];
+        string? enqueuedAtField = capturedArguments[3];
         Assert.IsNotNull( payloadField, "payload field must be present" );
         Assert.IsNotNull( enqueuedAtField, "enqueuedAt field must be present" );
 

@@ -17,7 +17,7 @@ read_secret() {
 export DOTNET_ENVIRONMENT="${DOTNET_ENVIRONMENT:-Production}"
 export ASPNETCORE_ENVIRONMENT="${ASPNETCORE_ENVIRONMENT:-$DOTNET_ENVIRONMENT}"
 
-# ---- Configure Aspire Dashboard (Aspire 13.4) ----
+# ---- Configure Aspire Dashboard ----
 # Allow unsecured transport since we use HTTP behind Caddy reverse proxy (Caddy handles HTTPS)
 export ASPIRE_ALLOW_UNSECURED_TRANSPORT="true"
 # Dashboard auth is handled by Caddy forward_auth, so we disable all dashboard auth
@@ -100,6 +100,7 @@ if [ -z "$INTERNAL_SERVICE_KEY" ]; then
     exit 1
 fi
 RATE_LIMIT_REQUESTS_PER_HOUR="${RATE_LIMIT_REQUESTS_PER_HOUR:-20}"
+OAUTH_TRUSTED_PROXY_HOST="${OAUTH_TRUSTED_PROXY_HOST-bridgebeats-caddy}"
 
 # Logging configuration
 LOG_DIR_PATH="${LOG_DIR_PATH:-/app/data/logs}"
@@ -157,6 +158,7 @@ cat > /src/BridgeBeats.Web/appsettings.json <<EOF
     "ApiKeySalt": "$API_KEY_SALT",
     "InternalServiceKey": "$INTERNAL_SERVICE_KEY",
     "RateLimitRequestsPerHour": $RATE_LIMIT_REQUESTS_PER_HOUR,
+    "OAuthTrustedProxyHost": "$OAUTH_TRUSTED_PROXY_HOST",
     "ATProtoIdentifier": "$ATPROTO_IDENTIFIER",
     "ATProtoUserDID": "$ATPROTO_USER_DID",
     "ATProtoPassword": "$ATPROTO_PASSWORD",
@@ -226,6 +228,7 @@ export ConnectionStrings__redis="$REDIS_CONNECTION_STRING"
 export Parameters__NodeNumber="$NODE_NUMBER"
 export Parameters__Domain="$DOMAIN"
 export Parameters__RateLimitRequestsPerHour="$RATE_LIMIT_REQUESTS_PER_HOUR"
+export Parameters__OAuthTrustedProxyHost="$OAUTH_TRUSTED_PROXY_HOST"
 export Parameters__CacheDays="$CACHE_DAYS"
 export Parameters__RefreshIntervalHours="$REFRESH_INTERVAL_HOURS"
 export Parameters__MaxRecordsPerRun="$MAX_RECORDS_PER_RUN"
@@ -242,7 +245,8 @@ export Parameters__ResilienceAttemptTimeoutSeconds="$RESILIENCE_ATTEMPT_TIMEOUT_
 
 # 5) Configure Aspire DCP paths (required for containerized deployment)
 export DcpPublisher__CliPath="/app/tools/dcp/dcp"
-export DcpPublisher__DashboardPath="/app/tools/dashboard/Aspire.Dashboard.dll"
+# Aspire 13.6 packages the dashboard as a native executable without a managed DLL or runtimeconfig.
+export DcpPublisher__DashboardPath="/app/tools/dashboard/Aspire.Dashboard"
 
 # 6) Launch the BridgeBeats AppHost (orchestrator)
 echo "Starting BridgeBeats AppHost (Environment: $DOTNET_ENVIRONMENT)..."

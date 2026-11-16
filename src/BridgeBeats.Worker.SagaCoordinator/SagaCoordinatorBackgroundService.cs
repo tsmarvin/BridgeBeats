@@ -4,6 +4,7 @@ using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
 using BridgeBeats.Core.Domain.Services.Queue;
+using BridgeBeats.Core.Infrastructure.Queue;
 using BridgeBeats.Worker.SagaCoordinator.Logging;
 using StackExchange.Redis;
 
@@ -40,9 +41,11 @@ namespace BridgeBeats.Worker.SagaCoordinator;
 /// When the first provider returns an external id (an ISRC for tracks or a UPC for albums), the
 /// coordinator fans out secondary lookups to the other enabled providers so the final card spans
 /// every provider. It first consults the ISRC/UPC cache and materializes any cached provider
-/// results straight into the saga; only the still-missing providers are queued. While secondaries
-/// are outstanding it writes an interim partial result so waiters receive something. ISRC/UPC-origin
-/// lookups skip this fan-out because they are already keyed by the canonical id.
+/// results straight into the saga; only the still-missing providers are queued. Interactive sagas
+/// may write an interim result while secondaries are outstanding. Maintenance refresh sagas never
+/// do: they retain the currently served PDS record until all provider legs are terminal, then write
+/// one result containing every successful sibling. ISRC/UPC-origin lookups skip this fan-out because
+/// they are already keyed by the canonical id.
 /// </para>
 /// </remarks>
 /// <param name="redis">The shared Redis connection used for Pub/Sub subscriptions.</param>
@@ -54,6 +57,7 @@ namespace BridgeBeats.Worker.SagaCoordinator;
 /// <param name="queueResolver">Resolves the per-provider queue used to enqueue secondary lookups.</param>
 /// <param name="enabledProviders">The providers eligible for secondary fan-out.</param>
 /// <param name="logger">The logger for this service.</param>
+/// <param name="refreshReviewStore">Stale-refresh context and unresolved-review store.</param>
 public sealed partial class SagaCoordinatorBackgroundService(
     IConnectionMultiplexer redis,
     ISagaStateManager sagaManager,
@@ -63,7 +67,8 @@ public sealed partial class SagaCoordinatorBackgroundService(
     SagaResultCombiner resultCombiner,
     IProviderQueueResolver<QueuedLookupRequest> queueResolver,
     HashSet<SupportedProviders> enabledProviders,
-    ILogger<SagaCoordinatorBackgroundService> logger
+    ILogger<SagaCoordinatorBackgroundService> logger,
+    IRefreshReviewStore refreshReviewStore
     ) : BackgroundService {
     private readonly IConnectionMultiplexer _redis = redis
                                                    ?? throw new ArgumentNullException( nameof( redis ) );
@@ -83,6 +88,8 @@ public sealed partial class SagaCoordinatorBackgroundService(
                                                                    ?? throw new ArgumentNullException( nameof( enabledProviders ) );
     private readonly ILogger<SagaCoordinatorBackgroundService> _logger = logger
                                                                        ?? throw new ArgumentNullException( nameof( logger ) );
+    private readonly IRefreshReviewStore _refreshReviewStore = refreshReviewStore
+                                                               ?? throw new ArgumentNullException( nameof( refreshReviewStore ) );
 
     private const string SagaCompletedChannel = "saga:completed";
     private const string LookupCompleteChannelPattern = "complete:*";
@@ -332,7 +339,7 @@ public sealed partial class SagaCoordinatorBackgroundService(
 
         try {
             // Query for completed but unfinalized sagas using the pending index
-            IReadOnlyList<LookupSagaState> unfinalizedSagas = await _sagaManager.GetCompletedButUnfinalizedAsync(
+            IReadOnlyList<LookupSagaState> unfinalizedSagas = await _sagaManager.GetPendingReconciliationAsync(
                 s_minimumSagaAge,
                 PollingBatchLimit,
                 ct
@@ -350,6 +357,11 @@ public sealed partial class SagaCoordinatorBackgroundService(
                 ct.ThrowIfCancellationRequested( );
 
                 try {
+                    if (!string.IsNullOrWhiteSpace( saga.FinalResultUri )) {
+                        _ = await ReleaseDurableResultAsync( saga, saga.FinalResultUri, ct );
+                        continue;
+                    }
+
                     // Run the same check as the Pub/Sub handlers - a completion missed by
                     // Pub/Sub must not finalize a one-provider result as complete while
                     // other providers still need secondary lookups
@@ -398,7 +410,7 @@ public sealed partial class SagaCoordinatorBackgroundService(
     /// already at or above the requested generation) the method returns immediately with no write.
     /// </para>
     /// <para>
-    /// On the terminal path, <see cref="ISagaStateManager.TryClaimFinalizeAsync"/> provides the
+    /// On the terminal path, the saga finalize-claim operation provides the
     /// exactly-once guarantee for post-write bookkeeping (URI recording, partial-flag clear, dedup
     /// release). On the non-terminal path the write-generation CAS alone prevents double writes and
     /// no finalize claim is used.
@@ -418,6 +430,28 @@ public sealed partial class SagaCoordinatorBackgroundService(
     /// <param name="ct">A token that cancels the operation.</param>
     /// <returns>A task that completes when the write (or its failure cleanup) is done.</returns>
     private async Task WriteResultAsync( LookupSagaState saga, bool terminal, CancellationToken ct ) {
+        if (string.IsNullOrWhiteSpace( saga.InstanceToken )) {
+            return;
+        }
+        string instanceToken = saga.InstanceToken;
+        // A cache/materialization race may have replaced this saga after the completion trigger
+        // read. Re-check the instance fence before any PDS write so the stale handler stays silent.
+        LookupSagaState? currentSaga = await _sagaManager.GetAsync( saga.SagaId, ct );
+        if (currentSaga is null || currentSaga.InstanceToken != instanceToken) {
+            return;
+        }
+
+        // Background refreshes are finalized through the refresh review lifecycle. A partial
+        // materialization would clear/overwrite the pending context while the refresh is still
+        // in flight, so matching current-instance refresh contexts must wait for terminal state.
+        if (!terminal) {
+            IReadOnlyList<RefreshReviewEntry> pendingRefresh = await _refreshReviewStore.GetPendingForSagaAsync(
+                saga.SagaId, ct ) ?? [];
+            if (pendingRefresh.Any( entry => entry.InstanceToken == instanceToken )) {
+                return;
+            }
+        }
+
         if (terminal) {
             LogAssemblingFinalResult( _logger, saga.SagaId, saga.ProviderStates.Count );
         } else if (_logger.IsEnabled( LogLevel.Information )) {
@@ -426,14 +460,58 @@ public sealed partial class SagaCoordinatorBackgroundService(
             LogAssemblingPartialResult( _logger, saga.SagaId, completedCount, totalCount );
         }
 
+        if (terminal) {
+            // Every terminal path, including the no-result review path, is fenced by the
+            // instance-scoped finalize claim before it can mutate review, deduplication, or saga state.
+            bool claimed = await _sagaManager.TryClaimFinalizeAsync( saga.SagaId, instanceToken, ct );
+            if (!claimed) {
+                LogFinalizationClaimLost( _logger, saga.SagaId );
+                QueueMetrics.RecordSagaLifecycleOutcome( "finalize_claim_lost" );
+                return;
+            }
+
+        }
+
         MediaLinkResult? finalResult = _resultCombiner.CombineResults( saga, allowIncomplete: !terminal );
 
         if (finalResult is null) {
             if (terminal) {
-                // Complete saga with zero successes: release waiters and discard the saga.
+                // Preserve stale-refresh context for operator review before discarding the saga.
+                // The store is idempotent, so the polling backstop can safely retry this sequence.
                 LogNoSuccessfulResults( _logger, saga.SagaId );
-                await _deduplicator.ReleaseAsync( saga.LookupKey, null, ct );
-                _ = await _sagaManager.DeleteAsync( saga.SagaId, ct );
+                try {
+                    IReadOnlyList<RefreshReviewEntry> pending = [.. (await _refreshReviewStore.GetPendingForSagaAsync( saga.SagaId, ct ) ?? [])
+                        .Where( entry => entry.InstanceToken == instanceToken )];
+                    foreach (RefreshReviewEntry entry in pending) {
+                        await _refreshReviewStore.MarkUnresolvedAsync(
+                            entry,
+                            "All provider refresh legs completed without a result.",
+                            ct );
+                    }
+                } catch (OperationCanceledException) when (ct.IsCancellationRequested) {
+                    _ = await _sagaManager.TryReleaseFinalizeClaimAsync(
+                        saga.SagaId, instanceToken, CancellationToken.None );
+                    throw;
+                } catch (Exception reviewEx) {
+                    // Review persistence is operational bookkeeping. A Redis outage must not
+                    // strand a terminal saga or leave its deduplication waiters blocked.
+                    LogRefreshReviewPersistenceFailed( _logger, reviewEx, saga.SagaId );
+                }
+                try {
+                    await _deduplicator.ReleaseAsync( saga.LookupKey, null, ct );
+                } catch (OperationCanceledException) when (ct.IsCancellationRequested) {
+                    _ = await _sagaManager.TryReleaseFinalizeClaimAsync(
+                        saga.SagaId, instanceToken, CancellationToken.None );
+                    throw;
+                } catch (Exception releaseEx) {
+                    LogFailedToWriteFinal( _logger, releaseEx, saga.SagaId );
+                    QueueMetrics.RecordSagaLifecycleOutcome( "dedup_release_failed" );
+                    _ = await _sagaManager.TryReleaseFinalizeClaimAsync(
+                        saga.SagaId, instanceToken, CancellationToken.None );
+                    return;
+                }
+                _ = await _sagaManager.TryDeleteAsync( saga.SagaId, instanceToken, ct );
+                QueueMetrics.RecordSagaLifecycleOutcome( "terminal_zero_result" );
             } else {
                 // No successful results yet on the non-terminal path: nothing to write.
                 // More providers are still outstanding; wait for the next trigger.
@@ -443,38 +521,65 @@ public sealed partial class SagaCoordinatorBackgroundService(
         }
 
         if (terminal) {
-            // Terminal path: gated by the finalize claim only. The generation CAS is not
+            // Terminal path: gated above by the finalize claim only. The generation CAS is not
             // used here because the generation counts successful providers, and a saga that
             // completes via the last leg failing has the same generation it had when the
             // previous partial was written — the CAS would refuse to advance and the saga
             // would never finalize. The finalize claim (HSETNX) provides the single-winner
             // guarantee for this path.
-            bool claimed = await _sagaManager.TryClaimFinalizeAsync( saga.SagaId, ct );
-            if (!claimed) {
-                LogFinalizationClaimLost( _logger, saga.SagaId );
-                return;
-            }
-
+            bool pdsWritten = false;
             bool uriRecorded = false;
+            string? durableRecordUri = null;
 
             try {
                 string recordUri = await _atProtoStorage.StoreMediaLinkResultAsync( finalResult, ct );
+                durableRecordUri = recordUri;
+                pdsWritten = true;
 
                 LogWroteFinalToAtProto( _logger, saga.SagaId, recordUri );
 
                 // Durability line: once this returns the URI is durably stored. A failure after
                 // this point must NOT release the claim — re-entering would issue a second PDS
                 // write against an already-recorded URI.
-                await _sagaManager.SetFinalResultUriAsync( saga.SagaId, recordUri, ct );
+                SagaFinalResultWriteOutcome writeOutcome = await _sagaManager.TrySetFinalResultUriAsync(
+                    saga.SagaId, recordUri, instanceToken, ct );
+                if (writeOutcome == SagaFinalResultWriteOutcome.InstanceMismatch) {
+                    // The PDS write belongs to the old generation. Never publish it on the shared
+                    // lookup channel: waiters may now belong to the replacement saga.
+                    LogFinalizationClaimLost( _logger, saga.SagaId );
+                    QueueMetrics.RecordSagaLifecycleOutcome( "final_uri_instance_mismatch" );
+                    return;
+                }
+                if (writeOutcome == SagaFinalResultWriteOutcome.Conflict) {
+                    // A same-generation finalizer won with a different URI. Publish only the URI
+                    // Redis says is authoritative; the duplicate PDS record is intentionally orphaned.
+                    LookupSagaState? authoritative = await _sagaManager.GetAsync( saga.SagaId, ct );
+                    if (authoritative?.InstanceToken == instanceToken
+                        && !string.IsNullOrWhiteSpace( authoritative.FinalResultUri )) {
+                        _ = await ReleaseDurableResultAsync(
+                            authoritative, authoritative.FinalResultUri, ct );
+                    }
+                    QueueMetrics.RecordSagaLifecycleOutcome( "final_uri_conflict" );
+                    return;
+                }
                 uriRecorded = true;
 
-                // Clear the partial flag before releasing waiters so the waiter's isFinal read
-                // is already authoritative by the time it wakes.
-                await _sagaManager.SetIsPartialAsync( saga.SagaId, false, ct );
+                try {
+                    await _refreshReviewStore.CompleteAsync( saga.SagaId, instanceToken, ct );
+                } catch (OperationCanceledException) when (ct.IsCancellationRequested) {
+                    throw;
+                } catch (Exception cleanupEx) {
+                    // Pending context has the saga TTL and self-expires. A cleanup failure must
+                    // not turn an already-durable PDS write into a failed finalization.
+                    LogRefreshReviewPersistenceFailed( _logger, cleanupEx, saga.SagaId );
+                }
 
-                await _deduplicator.ReleaseAsync( saga.LookupKey, recordUri, ct );
+                if (!await ReleaseDurableResultAsync( saga, recordUri, ct )) {
+                    return;
+                }
 
                 LogSuccessfullyFinalized( _logger, saga.SagaId, finalResult.Results.Count );
+                QueueMetrics.RecordSagaLifecycleOutcome( "terminal_success" );
 
                 // Best-effort: index after releasing waiters so a cache failure never delays
                 // wakeup. Swallow all exceptions — the result is already durably written.
@@ -489,8 +594,11 @@ public sealed partial class SagaCoordinatorBackgroundService(
                 // re-finalize. After the durability line: retain the claim — re-entering would
                 // issue a second PDS write against an already-recorded URI. The dedup lock is
                 // not released here in either case.
-                if (!uriRecorded) {
-                    await _sagaManager.ReleaseFinalizeClaimAsync( saga.SagaId, CancellationToken.None );
+                if (!pdsWritten) {
+                    _ = await _sagaManager.TryReleaseFinalizeClaimAsync( saga.SagaId, instanceToken, CancellationToken.None );
+                } else if (durableRecordUri is not null) {
+                    _ = await RecoverDurableResultAsync(
+                        saga, durableRecordUri, uriRecorded, CancellationToken.None );
                 }
                 throw;
             } catch (Exception ex) {
@@ -499,9 +607,12 @@ public sealed partial class SagaCoordinatorBackgroundService(
                 // Only release the claim before the durability line. After the URI is recorded,
                 // retaining the claim prevents a re-entrant PDS write; releasing the dedup lock
                 // with null would hand waiters an empty result for a saga that succeeded.
-                if (!uriRecorded) {
-                    await _sagaManager.ReleaseFinalizeClaimAsync( saga.SagaId, ct );
+                if (!pdsWritten) {
+                    _ = await _sagaManager.TryReleaseFinalizeClaimAsync( saga.SagaId, instanceToken, ct );
                     await _deduplicator.ReleaseAsync( saga.LookupKey, null, ct );
+                } else if (durableRecordUri is not null) {
+                    _ = await RecoverDurableResultAsync(
+                        saga, durableRecordUri, uriRecorded, CancellationToken.None );
                 }
             }
         } else {
@@ -510,11 +621,11 @@ public sealed partial class SagaCoordinatorBackgroundService(
             // observed, which is ≤ the number of providers N.
             int generation = finalResult.Results.Count;
 
-            if (!await _sagaManager.TryAdvanceWriteGenerationAsync( saga.SagaId, generation, ct )) {
+            bool advanced = await _sagaManager.TryAdvanceWriteGenerationAsync( saga.SagaId, generation, instanceToken, ct );
+            if (!advanced) {
                 return;
             }
 
-            finalResult.IsPartial = true;
             finalResult.RateLimitedProviders = saga.RateLimitInfo?.Select( r => r.Provider ).ToList( );
 
             bool uriRecorded = false;
@@ -524,7 +635,10 @@ public sealed partial class SagaCoordinatorBackgroundService(
 
                 LogWrotePartialToAtProto( _logger, saga.SagaId, recordUri );
 
-                await _sagaManager.SetPartialResultUriAsync( saga.SagaId, recordUri, ct );
+                bool recorded = await _sagaManager.TrySetPartialResultUriAsync( saga.SagaId, recordUri, instanceToken, ct );
+                if (!recorded) {
+                    return;
+                }
                 uriRecorded = true;
 
                 await _deduplicator.ReleaseAsync( saga.LookupKey, recordUri, ct );
@@ -544,7 +658,7 @@ public sealed partial class SagaCoordinatorBackgroundService(
                 // would issue a second partial write against a URI that is already recorded.
                 // The dedup lock is not released in either case.
                 if (!uriRecorded) {
-                    await _sagaManager.ResetWriteGenerationAsync( saga.SagaId, generation, generation - 1, CancellationToken.None );
+                    _ = await _sagaManager.TryResetWriteGenerationAsync( saga.SagaId, generation, generation - 1, instanceToken, CancellationToken.None );
                 }
                 throw;
             } catch (Exception ex) {
@@ -554,9 +668,93 @@ public sealed partial class SagaCoordinatorBackgroundService(
                 // recorded, retaining the generation prevents a re-entrant duplicate partial
                 // write.
                 if (!uriRecorded) {
-                    await _sagaManager.ResetWriteGenerationAsync( saga.SagaId, generation, generation - 1, ct );
+                    _ = await _sagaManager.TryResetWriteGenerationAsync( saga.SagaId, generation, generation - 1, instanceToken, ct );
                 }
             }
+        }
+    }
+
+    private async Task<bool> RecoverDurableResultAsync(
+        LookupSagaState saga,
+        string durableRecordUri,
+        bool uriWasRecorded,
+        CancellationToken ct
+    ) {
+        if (string.IsNullOrWhiteSpace( saga.InstanceToken )) {
+            QueueMetrics.RecordSagaLifecycleOutcome( "durable_release_instance_mismatch" );
+            return false;
+        }
+
+        string instanceToken = saga.InstanceToken;
+        try {
+            LookupSagaState? authoritative = await _sagaManager.GetAsync( saga.SagaId, ct );
+            if (authoritative is null
+                || string.IsNullOrWhiteSpace( authoritative.InstanceToken )
+                || authoritative.InstanceToken != instanceToken) {
+                QueueMetrics.RecordSagaLifecycleOutcome( "durable_release_instance_mismatch" );
+                return false;
+            }
+
+            string? authoritativeUri = authoritative.FinalResultUri;
+            if (string.IsNullOrWhiteSpace( authoritativeUri ) && !uriWasRecorded) {
+                SagaFinalResultWriteOutcome retryOutcome = await _sagaManager.TrySetFinalResultUriAsync(
+                    saga.SagaId, durableRecordUri, instanceToken, ct );
+                if (retryOutcome == SagaFinalResultWriteOutcome.InstanceMismatch) {
+                    QueueMetrics.RecordSagaLifecycleOutcome( "durable_release_instance_mismatch" );
+                    return false;
+                }
+                if (retryOutcome == SagaFinalResultWriteOutcome.Conflict) {
+                    authoritative = await _sagaManager.GetAsync( saga.SagaId, ct );
+                    if (authoritative is null || authoritative.InstanceToken != instanceToken
+                        || string.IsNullOrWhiteSpace( authoritative.FinalResultUri )) {
+                        return false;
+                    }
+                    authoritativeUri = authoritative.FinalResultUri;
+                } else {
+                    authoritativeUri = durableRecordUri;
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace( authoritativeUri )) {
+                return false;
+            }
+
+            return await ReleaseDurableResultAsync( authoritative, authoritativeUri, ct );
+        } catch (Exception recoveryEx) {
+            LogFailedToWriteFinal( _logger, recoveryEx, saga.SagaId );
+            QueueMetrics.RecordSagaLifecycleOutcome( "durable_release_recovery_failed" );
+            // The PDS record key is deterministic. Releasing the finalize claim lets the pending
+            // reconciliation sweep safely repeat the PutRecord if Redis was unavailable for the
+            // URI CAS, rather than leaving the saga permanently claimed and undiscoverable.
+            try {
+                _ = await _sagaManager.TryReleaseFinalizeClaimAsync(
+                    saga.SagaId, instanceToken, CancellationToken.None );
+            } catch (Exception claimEx) {
+                LogFailedToWriteFinal( _logger, claimEx, saga.SagaId );
+            }
+            return false;
+        }
+    }
+
+    private async Task<bool> ReleaseDurableResultAsync(
+        LookupSagaState saga,
+        string recordUri,
+        CancellationToken ct,
+        bool removePendingIndex = true
+    ) {
+        try {
+            await _deduplicator.ReleaseAsync( saga.LookupKey, recordUri, ct );
+            if (removePendingIndex) {
+                await _sagaManager.RemoveFromPendingIndexAsync( saga.SagaId, ct );
+            }
+            QueueMetrics.RecordSagaLifecycleOutcome( "dedup_released" );
+            return true;
+        } catch (OperationCanceledException) when (ct.IsCancellationRequested) {
+            throw;
+        } catch (Exception ex) {
+            LogFailedToWriteFinal( _logger, ex, saga.SagaId );
+            QueueMetrics.RecordSagaLifecycleOutcome( "dedup_release_failed" );
+            return false;
         }
     }
 
@@ -606,7 +804,7 @@ public sealed partial class SagaCoordinatorBackgroundService(
     /// other enabled providers too. It checks the ISRC/UPC cache first and materializes any cached
     /// provider results straight into the saga to avoid re-querying; only the providers that are still
     /// missing are queued as secondary <see cref="QueuedLookupRequest"/>s. A single-winner marker
-    /// (<see cref="Contracts.Interfaces.ISagaStateManager.TryMarkSecondariesQueuedAsync(string, CancellationToken)"/>)
+    /// (<see cref="Contracts.Interfaces.ISagaStateManager.TryMarkSecondariesQueuedAsync(string, string, CancellationToken)"/>)
     /// guards against duplicate fan-out by concurrent handlers. ISRC/UPC-origin sagas are skipped
     /// because they are already keyed by the canonical id.
     /// </summary>
@@ -622,6 +820,10 @@ public sealed partial class SagaCoordinatorBackgroundService(
         LookupSagaState originalSaga,
         CancellationToken ct
     ) {
+        if (string.IsNullOrWhiteSpace( originalSaga.InstanceToken )) {
+            return false;
+        }
+        string instanceToken = originalSaga.InstanceToken;
         // Don't trigger secondary lookups from secondary lookups (ISRC/UPC lookups)
         // Only provider-specific lookups (SpotifyLookup, AppleMusicLookup, TidalLookup) should trigger secondary lookups
         if (originalSaga.LookupType is LookupRequestType.IsrcLookup or LookupRequestType.UpcLookup) {
@@ -681,7 +883,13 @@ public sealed partial class SagaCoordinatorBackgroundService(
                         ErrorMessage: null
                     );
 
-                    await _sagaManager.UpdateProviderStateAsync( originalSaga.SagaId, cachedState, ct );
+                    bool cachedWritten = await _sagaManager.TryUpdateProviderStateAsync( originalSaga.SagaId, cachedState, instanceToken, ct );
+                    if (!cachedWritten) {
+                        // The saga instance was replaced while this handler was materializing
+                        // cache data. Defer finalization; the replacement instance owns the next
+                        // completion trigger and must not be overwritten by this stale handler.
+                        return true;
+                    }
 
                     // Keep the in-memory saga consistent so the partial/final result
                     // written by the caller includes the materialized data
@@ -702,6 +910,10 @@ public sealed partial class SagaCoordinatorBackgroundService(
         List<SupportedProviders> providersToQueue = [.. otherProviders.Where(p => !providersWithData.Contains(p))];
 
         if (providersToQueue.Count == 0) {
+            LookupSagaState? proof = await _sagaManager.GetAsync( originalSaga.SagaId, ct );
+            if (proof is null || proof.InstanceToken != instanceToken) {
+                return true;
+            }
             LogAllProvidersInCache( _logger, originalSaga.SagaId, externalId );
             return false;
         }
@@ -715,8 +927,13 @@ public sealed partial class SagaCoordinatorBackgroundService(
         // partial. Otherwise the marker loser could publish while IsPartial is still false
         // and no pending states exist, letting a waiting orchestrator mistake the
         // one-provider result for a final one (isFinal = IsComplete && !IsPartial).
-        await _sagaManager.InitializeProviderStatesAsync( originalSaga.SagaId, providersToQueue, ct );
-        await _sagaManager.SetIsPartialAsync( originalSaga.SagaId, true, ct );
+        bool fenced = await _sagaManager.TryInitializeProviderStatesAsync( originalSaga.SagaId, providersToQueue, instanceToken, ct );
+        if (!fenced) {
+            return false;
+        }
+        if (!await _sagaManager.TrySetIsPartialAsync( originalSaga.SagaId, true, instanceToken, ct )) {
+            return false;
+        }
 
         if (_logger.IsEnabled( LogLevel.Information )) {
             string providerNames = string.Join( ", ", providersToQueue );
@@ -727,7 +944,7 @@ public sealed partial class SagaCoordinatorBackgroundService(
         // The worker publishes both saga:completed and complete:{key}, so both handlers can
         // race through here and would otherwise enqueue every secondary twice. The loser
         // still reports "secondaries pending" so its caller defers finalization.
-        bool markerAcquired = await _sagaManager.TryMarkSecondariesQueuedAsync( originalSaga.SagaId, ct );
+        bool markerAcquired = await _sagaManager.TryMarkSecondariesQueuedAsync( originalSaga.SagaId, instanceToken, ct );
         if (!markerAcquired) {
             LogSecondariesAlreadyQueued( _logger, originalSaga.SagaId );
             return true;
@@ -743,6 +960,7 @@ public sealed partial class SagaCoordinatorBackgroundService(
 
         // Queue lookups for each provider using the ORIGINAL saga ID
         int queuedCount = 0;
+        int failedCount = 0;
         foreach (SupportedProviders provider in providersToQueue) {
             try {
                 // Create and queue the lookup request using the ORIGINAL saga ID
@@ -753,6 +971,7 @@ public sealed partial class SagaCoordinatorBackgroundService(
                     LookupType = lookupType,
                     LookupValue = externalId,
                     SagaId = originalSaga.SagaId,  // Use original saga ID!
+                    SagaInstanceToken = instanceToken,
                     IsAlbum = isAlbum,
                     Title = firstResult.Title,
                     Artist = firstResult.Artist,
@@ -767,27 +986,56 @@ public sealed partial class SagaCoordinatorBackgroundService(
                 string providerStr = provider.ToString( );
                 LogQueuedSecondaryLookup( _logger, lookupTypeStr, providerStr, externalId, originalSaga.SagaId );
                 queuedCount++;
+            } catch (OperationCanceledException) when (ct.IsCancellationRequested) {
+                throw;
             } catch (Exception ex) {
                 string providerStr = provider.ToString( );
                 LogFailedToQueueSecondary( _logger, ex, providerStr, externalId );
-                // Continue with other providers - don't fail the entire operation
+
+                // The one-time fan-out marker has already been claimed. Leaving this initialized
+                // provider incomplete would make the saga permanently non-terminal because no
+                // delivery exists to finish it and the marker prevents another fan-out. Record a
+                // terminal enqueue failure for this leg before continuing with the other providers.
+                ProviderLookupState enqueueFailure = new(
+                    Provider: provider,
+                    IsComplete: true,
+                    IsSuccess: false,
+                    ResultJson: null,
+                    CompletedAt: DateTimeOffset.UtcNow,
+                    ErrorMessage: $"Failed to enqueue {provider} secondary lookup."
+                );
+                if (!await _sagaManager.TryUpdateProviderStateAsync(
+                    originalSaga.SagaId,
+                    enqueueFailure,
+                    instanceToken,
+                    ct )) {
+                    return true;
+                }
+                originalSaga.ProviderStates[provider] = enqueueFailure;
+                failedCount++;
             }
         }
 
+        if (failedCount > 0) {
+            // Wake the coordinator after the failed legs have been made terminal. This is
+            // essential when every enqueue failed because no worker delivery exists to emit a
+            // later progress event; partial failures will also be rechecked safely.
+            ISubscriber subscriber = _redis.GetSubscriber( );
+            _ = await subscriber.PublishAsync(
+                RedisChannel.Literal( SagaCompletedChannel ),
+                originalSaga.SagaId );
+        }
+
         if (queuedCount == 0) {
-            // Every enqueue failed. Pending provider states and the partial flag are already
-            // set, so finalizing now would publish a result that is missing providers as
-            // complete and overwrite richer cached data. Waiters receive the honest partial
-            // instead; the cache marks partial results stale, so the lookup is retried once
-            // the queue backend recovers. Remove the saga from the reconciliation index so
-            // it does not strand as an actionable pending entry until TTL expiry. The saga
-            // record itself remains readable until TTL so late GetAsync calls still resolve.
             LogNoSecondariesEnqueued( _logger, originalSaga.SagaId, externalId );
-            await _sagaManager.RemoveFromPendingIndexAsync( originalSaga.SagaId, ct );
+            // Every secondary leg now has a durable terminal enqueue failure, so no delivery can
+            // produce another event. Let this invocation proceed directly to finalization instead
+            // of writing an unnecessary partial generation first.
+            return false;
         }
 
         // Pending provider states exist and the saga is marked partial, so the caller must
-        // defer finalization even when some (or all) enqueues failed.
+        // defer finalization while the successfully queued providers are still in flight.
         return true;
     }
 
@@ -1095,6 +1343,16 @@ public sealed partial class SagaCoordinatorBackgroundService(
         Level = LogLevel.Warning,
         Message = "Saga {SagaId} completed with no successful results, cleaning up" )]
     private static partial void LogNoSuccessfulResults( ILogger logger, string sagaId );
+
+    /// <summary>Logs that a zero-result saga could not be persisted for operator review.</summary>
+    /// <param name="logger">The logger to write to.</param>
+    /// <param name="ex">The exception raised by the review store.</param>
+    /// <param name="sagaId">The terminal saga whose review entry was not persisted.</param>
+    [LoggerMessage(
+        EventId = LogEventIds.RefreshReviewPersistenceFailed,
+        Level = LogLevel.Warning,
+        Message = "Failed to persist zero-result saga {SagaId} for refresh review; continuing terminal cleanup" )]
+    private static partial void LogRefreshReviewPersistenceFailed( ILogger logger, Exception ex, string sagaId );
 
     /// <summary>Logs that this handler lost the finalize claim race and is deferring to the winner.</summary>
     /// <param name="logger">The logger to write to.</param>

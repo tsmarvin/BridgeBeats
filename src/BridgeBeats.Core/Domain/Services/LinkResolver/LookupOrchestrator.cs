@@ -162,10 +162,10 @@ public sealed partial class LookupOrchestrator(
     /// <returns>The lookup outcome, possibly partial.</returns>
     public async Task<LookupResult> LookupByMetadataAsync( string title, string artist ) {
         if (string.IsNullOrWhiteSpace( title ) || string.IsNullOrWhiteSpace( artist )) {
-            return new LookupResult { Result = null, IsPartial = false };
+            return new LookupResult { Result = null };
         }
 
-        string lookupKey = $"{LookupRequestType.SongLookup}:{title.Trim().ToUpperInvariant()}:{artist.Trim().ToUpperInvariant()}";
+        string lookupKey = LookupKeyBuilder.MetadataKey( title, artist );
 
         return await PerformLookupAsync(
             lookupKey: lookupKey,
@@ -186,11 +186,11 @@ public sealed partial class LookupOrchestrator(
     /// <returns>The lookup outcome, possibly partial.</returns>
     public async Task<LookupResult> LookupByIsrcAsync( string isrc ) {
         if (string.IsNullOrWhiteSpace( isrc )) {
-            return new LookupResult { Result = null, IsPartial = false };
+            return new LookupResult { Result = null };
         }
 
         string normalizedIsrc = isrc.Trim( ).ToUpperInvariant( );
-        string lookupKey = $"{LookupRequestType.IsrcLookup}:{normalizedIsrc}";
+        string lookupKey = LookupKeyBuilder.IsrcKey( isrc );
 
         return await PerformLookupAsync(
             lookupKey: lookupKey,
@@ -209,11 +209,11 @@ public sealed partial class LookupOrchestrator(
     /// <returns>The lookup outcome, possibly partial.</returns>
     public async Task<LookupResult> LookupByUpcAsync( string upc ) {
         if (string.IsNullOrWhiteSpace( upc )) {
-            return new LookupResult { Result = null, IsPartial = false };
+            return new LookupResult { Result = null };
         }
 
         string normalizedUpc = upc.Trim( );
-        string lookupKey = $"{LookupRequestType.UpcLookup}:{normalizedUpc}";
+        string lookupKey = LookupKeyBuilder.UpcKey( upc );
 
         return await PerformLookupAsync(
             lookupKey: lookupKey,
@@ -236,7 +236,7 @@ public sealed partial class LookupOrchestrator(
     /// <returns>The lookup outcome, possibly partial.</returns>
     public async Task<LookupResult> LookupByProviderIdAsync( string providerId, SupportedProviders provider, bool isAlbum ) {
         if (string.IsNullOrWhiteSpace( providerId )) {
-            return new LookupResult { Result = null, IsPartial = false };
+            return new LookupResult { Result = null };
         }
 
         string normalizedId = providerId.Trim( );
@@ -265,7 +265,7 @@ public sealed partial class LookupOrchestrator(
     private async Task<LookupResult> LookupByUrlAsync( string url, SupportedProviders provider, TimeSpan? waitBudget = null ) {
         string lookupKey = LookupKeyBuilder.UrlKey( url );
 
-        return await PerformLookupAsync(
+        LookupResult lookupResult = await PerformLookupAsync(
             lookupKey: lookupKey,
             lookupType: LookupRequestType.UriLookup,
             lookupValue: url,
@@ -274,6 +274,20 @@ public sealed partial class LookupOrchestrator(
             initialProvider: provider,
             waitBudget: waitBudget
         );
+
+        // Input links are intentionally absent from PDS records. Restore the submitted URL on
+        // the response so Web can reconstruct the same saga key for its render-time progress
+        // probe, and so caching-path results preserve the same input-link contract as the direct
+        // resolver path.
+        if (lookupResult.Result is not null) {
+            // The controller probes InputLinks[0], so make the URL for this specific lookup the
+            // leading entry even if a reused in-memory result already carries another alias.
+            _ = lookupResult.Result.InputLinks.RemoveAll(
+                input => input.Equals( url, StringComparison.OrdinalIgnoreCase ) );
+            lookupResult.Result.InputLinks.Insert( 0, url );
+        }
+
+        return lookupResult;
     }
 
     /// <summary>
@@ -307,15 +321,17 @@ public sealed partial class LookupOrchestrator(
     ) {
         TimeSpan waitTimeout = waitBudget ?? _interactiveWaitTimeout;
 
-        // Check cache. Partial results are reported stale by the cache so they
-        // fall through to the dedup/wait logic below instead of masquerading as final.
+        // Check cache. Freshness is age-only (RedisMediaLinkCache.CheckRecordFreshness checks
+        // LookedUpAt against the configured window). PDS/cache reads carry no persisted partial
+        // flag and are assumed final. A partial saga generation can be visible briefly before its
+        // deterministic record is replaced by the final generation; that bounded consistency
+        // window is an accepted tradeoff for avoiding a saga read on every fresh cache hit.
         (MediaLinkResult result, string recordUri, bool isStale)? cached = await cacheCheck( );
 
         if (cached.HasValue && !cached.Value.isStale) {
             LogCacheHit( _logger, lookupKey );
             return new LookupResult {
-                Result = cached.Value.result,
-                IsPartial = cached.Value.result.IsPartial
+                Result = cached.Value.result
             };
         }
 
@@ -332,6 +348,16 @@ public sealed partial class LookupOrchestrator(
             // straight to the final-result wait, which honors the rate-limit escape hatch
             // and time budget (during a rate-limit window no publish would ever arrive)
             LookupSagaState? inFlightSaga = await _sagaManager.GetAsync( inFlightSagaId );
+            if (inFlightSaga is not null) {
+                await PromotePendingSagaAsync(
+                    inFlightSaga,
+                    lookupType,
+                    lookupValue,
+                    isAlbum,
+                    title,
+                    artist,
+                    initialProvider );
+            }
             string? storedResultUri = inFlightSaga?.FinalResultUri ?? inFlightSaga?.PartialResultUri;
             if (!string.IsNullOrEmpty( storedResultUri )) {
                 LogInFlightSagaHasStoredResult( _logger, inFlightSagaId );
@@ -353,18 +379,17 @@ public sealed partial class LookupOrchestrator(
                 return await WaitForFinalResultAsync( lookupKey, inFlightSagaId, resultUri, deadline );
             }
 
-            // Timeout or failure - check cache again, might have been populated
+            // Timeout or failure - check cache again, might have been populated.
+            // A cache-served result is always final; no live saga reference is attached.
             cached = await cacheCheck( );
             if (cached.HasValue) {
                 return new LookupResult {
-                    Result = cached.Value.result,
-                    IsPartial = cached.Value.result.IsPartial,
-                    SagaId = cached.Value.result.IsPartial ? inFlightSagaId : null
+                    Result = cached.Value.result
                 };
             }
 
             // Still nothing, return null
-            return new LookupResult { Result = null, IsPartial = false };
+            return new LookupResult { Result = null };
         }
 
         try {
@@ -386,6 +411,49 @@ public sealed partial class LookupOrchestrator(
             await _deduplicator.ReleaseAsync( lookupKey, null );
 
             throw;
+        }
+    }
+
+    /// <summary>
+    /// Atomically promotes an existing maintenance generation and publishes interactive copies of
+    /// its unfinished provider legs. Only the caller that changes the persisted priority publishes,
+    /// so concurrent manual lookups cannot create an interactive fan-out storm.
+    /// </summary>
+    private async Task PromotePendingSagaAsync(
+        LookupSagaState saga,
+        LookupRequestType lookupType,
+        string lookupValue,
+        bool isAlbum,
+        string? title,
+        string? artist,
+        SupportedProviders? initialProvider
+    ) {
+        if (string.IsNullOrWhiteSpace( saga.InstanceToken )
+            || !await _sagaManager.TryPromoteToInteractiveAsync( saga.SagaId, saga.InstanceToken )) {
+            return;
+        }
+
+        IEnumerable<SupportedProviders> candidates = initialProvider.HasValue
+            ? [initialProvider.Value]
+            : _enabledProviders;
+        foreach (SupportedProviders provider in candidates) {
+            if (saga.ProviderStates.TryGetValue( provider, out ProviderLookupState? state ) && state.IsComplete) {
+                continue;
+            }
+
+            IRequestQueue<QueuedLookupRequest> queue = _queueResolver.GetQueue( provider );
+            await queue.EnqueueAsync( new QueuedLookupRequest {
+                RequestId = Guid.NewGuid( ).ToString( "N" ),
+                Provider = provider,
+                LookupType = lookupType,
+                LookupValue = lookupValue,
+                SagaId = saga.SagaId,
+                SagaInstanceToken = saga.InstanceToken,
+                IsAlbum = isAlbum,
+                Title = title,
+                Artist = artist,
+                OriginPriority = QueuePriority.Interactive
+            }, QueuePriority.Interactive );
         }
     }
 
@@ -420,8 +488,9 @@ public sealed partial class LookupOrchestrator(
         // Generate deterministic saga ID from lookup key
         string sagaId = ISagaStateManager.GenerateSagaId( lookupKey );
 
-        // Create saga (or resume an in-progress one, e.g. when a cached partial sent us back here)
-        LookupSagaState saga = await _sagaManager.GetOrCreateAsync( sagaId, lookupKey, lookupType, lookupValue );
+        // Create a saga, or resume one already started for this deterministic lookup key.
+        LookupSagaState saga = await _sagaManager.GetOrCreateAsync(
+            sagaId, lookupKey, lookupType, lookupValue, QueuePriority.Interactive );
 
         DateTimeOffset deadline = DateTimeOffset.UtcNow + waitTimeout;
 
@@ -441,6 +510,9 @@ public sealed partial class LookupOrchestrator(
 
         // Determine which provider to queue first
         SupportedProviders firstProvider = initialProvider ?? _enabledProviders.First();
+        if (!string.IsNullOrWhiteSpace( saga.InstanceToken )) {
+            _ = await _sagaManager.TryPromoteToInteractiveAsync( sagaId, saga.InstanceToken );
+        }
 
         // For direct lookups (ISRC/UPC without initialProvider), initialize all enabled providers
         // For URL lookups (with initialProvider), only initialize the first provider
@@ -450,22 +522,40 @@ public sealed partial class LookupOrchestrator(
             ? [firstProvider]
             : [.. _enabledProviders];
 
-        await _sagaManager.InitializeProviderStatesAsync( sagaId, providersToInitialize );
+        if (string.IsNullOrWhiteSpace( saga.InstanceToken )
+            || !await _sagaManager.TryInitializeProviderStatesAsync( sagaId, providersToInitialize, saga.InstanceToken )) {
+            throw new InvalidOperationException( $"Saga instance was replaced before provider initialization for {sagaId}." );
+        }
 
         // If we have an initial provider (from URL lookup), set it
         if (initialProvider.HasValue) {
-            await _sagaManager.SetInitialProviderAsync( sagaId, initialProvider.Value );
+            if (!await _sagaManager.TrySetInitialProviderAsync( sagaId, initialProvider.Value, saga.InstanceToken )) {
+                throw new InvalidOperationException( $"Saga instance was replaced before initial-provider registration for {sagaId}." );
+            }
         }
 
-        // Queue the initial provider lookup at Interactive priority,
-        // unless the resumed saga already has this provider queued or completed
-        if (!saga.ProviderStates.ContainsKey( firstProvider )) {
+        // Direct external-id lookups own one independent leg per enabled provider. URL lookups
+        // intentionally start with only the URL's provider and let the coordinator derive
+        // secondary identifiers. When a maintenance saga is promoted, enqueue an interactive copy
+        // for every still-pending direct leg; the generation fence makes the old bulk copy stale
+        // after the first successful commit.
+        IReadOnlyList<SupportedProviders> providersToEnqueue = initialProvider.HasValue
+            ? [firstProvider]
+            : providersToInitialize;
+        foreach (SupportedProviders provider in providersToEnqueue) {
+            bool providerMissing = !saga.ProviderStates.TryGetValue(
+                provider, out ProviderLookupState? queuedProviderState );
+            if (!providerMissing && queuedProviderState!.IsComplete) {
+                continue;
+            }
+
             QueuedLookupRequest request = new( ) {
                 RequestId = Guid.NewGuid( ).ToString( "N" ),
-                Provider = firstProvider,
+                Provider = provider,
                 LookupType = lookupType,
                 LookupValue = lookupValue,
                 SagaId = sagaId,
+                SagaInstanceToken = saga.InstanceToken,
                 IsAlbum = isAlbum,
                 Title = title,
                 Artist = artist,
@@ -474,10 +564,10 @@ public sealed partial class LookupOrchestrator(
                 OriginPriority = QueuePriority.Interactive
             };
 
-            IRequestQueue<QueuedLookupRequest> queue = _queueResolver.GetQueue( firstProvider );
+            IRequestQueue<QueuedLookupRequest> queue = _queueResolver.GetQueue( provider );
             await queue.EnqueueAsync( request, QueuePriority.Interactive );
 
-            LogSagaCreated( _logger, sagaId, firstProvider, lookupType, lookupValue );
+            LogSagaCreated( _logger, sagaId, provider, lookupType, lookupValue );
         }
 
         // Wait for initial result via deduplicator subscription
@@ -503,14 +593,13 @@ public sealed partial class LookupOrchestrator(
         if (storedResultUri is not null) {
             MediaLinkResult? storedResult = await _atProtoStorage.GetMediaLinkResultAsync( storedResultUri );
             return !string.IsNullOrEmpty( saga2!.FinalResultUri )
-                ? new LookupResult { Result = storedResult, IsPartial = false }
+                ? new LookupResult { Result = storedResult }
                 : CreatePartialResult( storedResult, sagaId, saga2 );
         }
 
         // No result yet
         return new LookupResult {
             Result = null,
-            IsPartial = true,
             SagaId = sagaId,
             RateLimitedProviders = GetActiveRateLimits( saga2 )
         };
@@ -545,12 +634,10 @@ public sealed partial class LookupOrchestrator(
 
             MediaLinkResult? result = await _atProtoStorage.GetMediaLinkResultAsync( resultUri );
 
-            // Saga state missing (expired/deleted) - trust the stored result's own flag
+            // Saga state missing (expired/deleted) - no saga means no in-progress partial; result is served as final
             if (saga is null) {
                 return new LookupResult {
-                    Result = result,
-                    IsPartial = result?.IsPartial ?? false,
-                    SagaId = result?.IsPartial == true ? sagaId : null
+                    Result = result
                 };
             }
 
@@ -559,8 +646,7 @@ public sealed partial class LookupOrchestrator(
 
             if (isFinal) {
                 return new LookupResult {
-                    Result = result,
-                    IsPartial = false
+                    Result = result
                 };
             }
 
@@ -653,7 +739,6 @@ public sealed partial class LookupOrchestrator(
     private static LookupResult CreatePartialResult( MediaLinkResult? result, string sagaId, LookupSagaState? saga )
         => new( ) {
             Result = result,
-            IsPartial = true,
             SagaId = sagaId,
             RateLimitedProviders = GetActiveRateLimits( saga )
         };

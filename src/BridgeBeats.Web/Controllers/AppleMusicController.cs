@@ -30,6 +30,7 @@ namespace BridgeBeats.Web.Controllers;
 /// <param name="jwtHandler">Optional Apple Music JWT handler that produces the developer token; when null, Apple Music is not configured.</param>
 /// <param name="cardService">Optional Open Graph card service used to store lookup results and produce shareable card URLs.</param>
 /// <param name="cacheRepository">Optional cache repository used to resolve the ATProto URI for a result.</param>
+/// <param name="probe">Optional saga-progress probe used to set the "lookup in progress" indicator on result cards; when null, the indicator is never shown.</param>
 [Authorize]
 public partial class AppleMusicController(
     UserManager<ApplicationUser> userManager,
@@ -39,7 +40,8 @@ public partial class AppleMusicController(
     ICompositeViewEngine viewEngine,
     AppleJwtHandler? jwtHandler = null,
     IOpenGraphCardService? cardService = null,
-    IMediaLinkCacheRepository? cacheRepository = null
+    IMediaLinkCacheRepository? cacheRepository = null,
+    ILookupProgressProbe? probe = null
 ) : Controller {
 
     /// <summary>
@@ -298,8 +300,11 @@ public partial class AppleMusicController(
             // Add user token for accessing user's library
             client.DefaultRequestHeaders.Add( "Music-User-Token", user.AppleMusicUserToken );
 
-            // Fetch all playlist tracks with pagination
-            string playlistId = request.PlaylistId.SanitizeForLogging( );
+            // Fetch all playlist tracks with pagination.
+            // Uri.EscapeDataString is defense-in-depth; the [RegularExpression] annotation on
+            // ProcessPlaylistRequest.PlaylistId has already enforced the safe character set via
+            // ModelState validation above.
+            string playlistId = Uri.EscapeDataString( request.PlaylistId );
 
             List<string> trackIds = [];
             string? nextUrl = $"https://api.music.apple.com/v1/me/library/playlists/{playlistId}/tracks";
@@ -350,7 +355,7 @@ public partial class AppleMusicController(
                 }
                 if (totalTracks >= 1000) {
                     overonekay = true;
-                    LogPlaylistTooLarge( playlistId );
+                    LogPlaylistTooLarge( request.PlaylistId.SanitizeForLogging( ) );
                     break;
                 }
             }
@@ -444,13 +449,19 @@ public partial class AppleMusicController(
 
                 string? atProtoUri = await GetATProtoUriFromCache( lookupResult );
 
+                string appleProbeKey = LookupKeyBuilder.TypedKey(
+                    LookupRequestType.SongIdLookup, SupportedProviders.AppleMusic, songId.Trim( ) );
+                bool appleIsInProgress = probe is not null
+                    && await probe.IsActiveAsync( appleProbeKey, HttpContext.RequestAborted );
+
                 MusicLookupViewModel.MusicLookupResultItem item = new( )
                 {
                     CardUrl = cardUrl,
                     ATProtoUri = atProtoUri,
                     Result = lookupResult,
                     PrimaryProvider = primaryProvider,
-                    PrimaryResult = primaryResult
+                    PrimaryResult = primaryResult,
+                    IsLookupInProgress = appleIsInProgress
                 };
 
                 string html = await RenderViewToStringAsync( "_LookupResultCard", item );

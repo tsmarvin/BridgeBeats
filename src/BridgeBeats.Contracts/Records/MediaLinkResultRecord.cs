@@ -23,17 +23,14 @@ public sealed record MediaLinkResultRecord : AtProtoRecord {
     /// </summary>
     /// <param name="results">The per-provider result rows that make up this lookup.</param>
     /// <param name="lookedUpAt">The absolute instant the lookup was performed.</param>
-    /// <param name="isPartial"><see langword="true"/> when not every provider contributed a result; defaults to <see langword="false"/>.</param>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="results"/> is <see langword="null"/>.</exception>
     [JsonConstructor]
     public MediaLinkResultRecord(
         ICollection<ProviderResultRecord> results,
-        DateTimeOffset lookedUpAt,
-        bool isPartial = false
+        DateTimeOffset lookedUpAt
     ) : base( ) {
         Results = results ?? throw new ArgumentNullException( nameof( results ) );
         LookedUpAt = lookedUpAt;
-        IsPartial = isPartial;
     }
 
     /// <summary>The per-provider result rows captured for this lookup; see <see cref="ProviderResultRecord"/>.</summary>
@@ -45,12 +42,4 @@ public sealed record MediaLinkResultRecord : AtProtoRecord {
     [JsonPropertyName( "lookedUpAt" )]
     [JsonRequired]
     public DateTimeOffset LookedUpAt { get; init; }
-
-    /// <summary>
-    /// <see langword="true"/> when the persisted result is partial (not every provider responded).
-    /// Omitted from JSON when <see langword="false"/> so existing records remain unchanged.
-    /// </summary>
-    [JsonPropertyName( "isPartial" )]
-    [JsonIgnore( Condition = JsonIgnoreCondition.WhenWritingDefault )]
-    public bool IsPartial { get; init; }
 }

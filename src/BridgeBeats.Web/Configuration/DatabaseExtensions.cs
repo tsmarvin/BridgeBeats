@@ -27,7 +27,7 @@ public static class DatabaseExtensions {
         // pinned by the pre-fix non-persisted-reset bug are released on startup. Idempotent —
         // a no-op once windows are fresh, safe to run on every boot.
         DateTime windowFloor = DateTime.UtcNow.AddHours( -1 );
-        _ = await context.Database.ExecuteSqlInterpolatedAsync(
+        _ = await context.Database.ExecuteSqlAsync(
             $@"UPDATE AspNetUsers
                SET RequestCount = 0,
                    RateLimitWindowStart = NULL
@@ -49,6 +49,9 @@ public static class DatabaseExtensions {
         // Create AspireDashboardAccess role if it doesn't exist
         if (!await roleManager.RoleExistsAsync( Roles.AspireDashboardAccess )) {
             _ = await roleManager.CreateAsync( new IdentityRole( Roles.AspireDashboardAccess ) );
+        }
+        if (!await roleManager.RoleExistsAsync( Roles.PdsRecordAdministrator )) {
+            _ = await roleManager.CreateAsync( new IdentityRole( Roles.PdsRecordAdministrator ) );
         }
     }
 }

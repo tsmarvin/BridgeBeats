@@ -81,6 +81,14 @@ public sealed record QueueSettings {
     [JsonPropertyName( "providerMinBulkThresholds" )]
     public Dictionary<SupportedProviders, int> ProviderMinBulkThresholds { get; init; } = [];
 
+    /// <summary>Maximum number of provider lookups processed concurrently by one queue worker.</summary>
+    [JsonPropertyName( "defaultProviderConcurrency" )]
+    public int DefaultProviderConcurrency { get; init; } = 4;
+
+    /// <summary>Optional per-provider overrides for <see cref="DefaultProviderConcurrency"/>.</summary>
+    [JsonPropertyName( "providerConcurrency" )]
+    public Dictionary<SupportedProviders, int> ProviderConcurrency { get; init; } = [];
+
     /// <summary>
     /// Returns the minimum bulk queue threshold for the given provider, falling back to
     /// <see cref="DefaultMinBulkQueueThreshold"/> when no per-provider override is configured.
@@ -91,4 +99,12 @@ public sealed record QueueSettings {
         => ProviderMinBulkThresholds.TryGetValue( provider, out int threshold )
             ? threshold
             : DefaultMinBulkQueueThreshold;
+
+    /// <summary>Returns a validated per-provider concurrency bound.</summary>
+    public int GetProviderConcurrency( SupportedProviders provider ) {
+        int configured = ProviderConcurrency.TryGetValue( provider, out int value )
+            ? value
+            : DefaultProviderConcurrency;
+        return Math.Clamp( configured, 1, 32 );
+    }
 }

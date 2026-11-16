@@ -2,6 +2,7 @@ using System.Text.Json;
 using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Core.Domain.Extensions;
 using BridgeBeats.Core.Domain.Providers.AppleMusic;
+using BridgeBeats.Core.Infrastructure.Extensions;
 using Serilog;
 
 namespace BridgeBeats.Worker.AppleMusic;
@@ -81,6 +82,9 @@ public static class Program {
 
         // Register JSON serializer options (required by AppleMusicLookupService)
         _ = builder.Services.AddSingleton( new JsonSerializerOptions { WriteIndented = true } );
+
+        // Register the track genre cache used by AppleMusicLookupService
+        _ = builder.Services.AddGenreCache( );
 
         // Register queue processor background service for consuming from Redis streams
         _ = builder.Services.AddQueueProcessor<AppleMusicLookupService>( SupportedProviders.AppleMusic );

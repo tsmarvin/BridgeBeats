@@ -93,8 +93,7 @@ internal static class TestCarBuilder {
 
     /// <summary>
     /// Encodes a <see cref="MediaLinkResultRecord"/> as a DAG-CBOR record block (the value block an MST
-    /// entry points at), writing <c>results</c>, optional <c>isPartial</c>, and round-trip-formatted
-    /// <c>lookedUpAt</c>.
+    /// entry points at), writing <c>results</c> and round-trip-formatted <c>lookedUpAt</c>.
     /// </summary>
     /// <param name="record">The record to encode.</param>
     /// <returns>The CBOR-encoded record block bytes.</returns>
@@ -103,8 +102,8 @@ internal static class TestCarBuilder {
         writer.WriteStartMap( null );
 
         // DAG-CBOR canonical key order: length-first, then lexicographic.
-        // Key lengths: results(7) < isPartial(9) < lookedUpAt(10)
-        // Write results first, then isPartial (only when true), then lookedUpAt.
+        // Key lengths: results(7) < lookedUpAt(10)
+        // Write results first, then lookedUpAt.
 
         WriteCborTextString( writer, "results" );
         writer.WriteStartArray( null );
@@ -112,11 +111,6 @@ internal static class TestCarBuilder {
             BuildProviderResultBlock( writer, r );
         }
         writer.WriteEndArray( );
-
-        if (record.IsPartial) {
-            WriteCborTextString( writer, "isPartial" );
-            writer.WriteBoolean( true );
-        }
 
         WriteCborTextString( writer, "lookedUpAt" );
         WriteCborTextString( writer, record.LookedUpAt.ToString( "O" ) );

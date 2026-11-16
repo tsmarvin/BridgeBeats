@@ -85,7 +85,7 @@ public class SagaPollingIntegrationTests {
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task GetCompletedButUnfinalizedAsync_ReturnsCompleteSagasWithNoFinalUri( ) {
+    public async Task GetPendingReconciliationAsync_ReturnsCompleteSagasWithNoFinalUri( ) {
         // Arrange - Create a saga that is complete but not finalized
         string lookupKey = "isrc:USRC12345678";
         string sagaId = ISagaStateManager.GenerateSagaId( lookupKey );
@@ -117,7 +117,7 @@ public class SagaPollingIntegrationTests {
         );
 
         // Act - Query for unfinalized sagas with minimum age of 0 seconds
-        IReadOnlyList<LookupSagaState> results = await _sagaManager.GetCompletedButUnfinalizedAsync(
+        IReadOnlyList<LookupSagaState> results = await _sagaManager.GetPendingReconciliationAsync(
             minimumAge: TimeSpan.Zero,
             limit: 100,
             cancellationToken: TestContext.CancellationToken
@@ -136,7 +136,7 @@ public class SagaPollingIntegrationTests {
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task GetCompletedButUnfinalizedAsync_ExcludesSagasWithFinalUri( ) {
+    public async Task GetPendingReconciliationAsync_IncludesFinalizedSagaUntilWaitersAreReleased( ) {
         // Arrange - Create a finalized saga
         string lookupKey = "isrc:USRC12345678";
         string sagaId = ISagaStateManager.GenerateSagaId( lookupKey );
@@ -153,18 +153,20 @@ public class SagaPollingIntegrationTests {
             SupportedProviders.Spotify, true, true, "{}", DateTimeOffset.UtcNow, null
         ), TestContext.CancellationToken );
 
-        // Set final result URI - this should exclude it from polling
+        // Final URI persistence deliberately keeps the saga indexed until waiter release succeeds.
         await _sagaManager.SetFinalResultUriAsync( sagaId, "at://did:plc:test/link/abc", TestContext.CancellationToken );
 
         // Act
-        IReadOnlyList<LookupSagaState> results = await _sagaManager.GetCompletedButUnfinalizedAsync(
+        IReadOnlyList<LookupSagaState> results = await _sagaManager.GetPendingReconciliationAsync(
             minimumAge: TimeSpan.Zero,
             limit: 100,
             cancellationToken: TestContext.CancellationToken
         );
 
-        // Assert - Should be empty since saga was finalized
-        Assert.IsEmpty( results );
+        Assert.HasCount( 1, results );
+        LookupSagaState result = results[0];
+        Assert.AreEqual( sagaId, result.SagaId );
+        Assert.AreEqual( "at://did:plc:test/link/abc", result.FinalResultUri );
     }
 
     /// <summary>
@@ -173,7 +175,7 @@ public class SagaPollingIntegrationTests {
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task GetCompletedButUnfinalizedAsync_ExcludesIncompleteSagas( ) {
+    public async Task GetPendingReconciliationAsync_ExcludesIncompleteSagas( ) {
         // Arrange - Create an incomplete saga
         string lookupKey = "isrc:USRC12345678";
         string sagaId = ISagaStateManager.GenerateSagaId( lookupKey );
@@ -192,7 +194,7 @@ public class SagaPollingIntegrationTests {
         ), TestContext.CancellationToken );
 
         // Act
-        IReadOnlyList<LookupSagaState> results = await _sagaManager.GetCompletedButUnfinalizedAsync(
+        IReadOnlyList<LookupSagaState> results = await _sagaManager.GetPendingReconciliationAsync(
             minimumAge: TimeSpan.Zero,
             limit: 100,
             cancellationToken: TestContext.CancellationToken
@@ -208,7 +210,7 @@ public class SagaPollingIntegrationTests {
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task GetCompletedButUnfinalizedAsync_RespectsMinimumAge( ) {
+    public async Task GetPendingReconciliationAsync_RespectsMinimumAge( ) {
         // Arrange - Create a saga that was just created
         string lookupKey = "isrc:USRC12345678";
         string sagaId = ISagaStateManager.GenerateSagaId( lookupKey );
@@ -226,7 +228,7 @@ public class SagaPollingIntegrationTests {
         ), TestContext.CancellationToken );
 
         // Act - Query with 15-second minimum age (saga is too young)
-        IReadOnlyList<LookupSagaState> results = await _sagaManager.GetCompletedButUnfinalizedAsync(
+        IReadOnlyList<LookupSagaState> results = await _sagaManager.GetPendingReconciliationAsync(
             minimumAge: TimeSpan.FromSeconds( 15 ),
             limit: 100,
             cancellationToken: TestContext.CancellationToken
@@ -242,7 +244,7 @@ public class SagaPollingIntegrationTests {
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task GetCompletedButUnfinalizedAsync_RespectsLimit( ) {
+    public async Task GetPendingReconciliationAsync_RespectsLimit( ) {
         // Arrange - Create multiple sagas
         for (int i = 0; i < 5; i++) {
             string lookupKey = $"isrc:USRC{i:D10}";
@@ -270,7 +272,7 @@ public class SagaPollingIntegrationTests {
         }
 
         // Act - Query with limit of 3
-        IReadOnlyList<LookupSagaState> results = await _sagaManager.GetCompletedButUnfinalizedAsync(
+        IReadOnlyList<LookupSagaState> results = await _sagaManager.GetPendingReconciliationAsync(
             minimumAge: TimeSpan.Zero,
             limit: 3,
             cancellationToken: TestContext.CancellationToken
@@ -286,7 +288,7 @@ public class SagaPollingIntegrationTests {
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task GetCompletedButUnfinalizedAsync_CleansUpExpiredSagasFromIndex( ) {
+    public async Task GetPendingReconciliationAsync_CleansUpExpiredSagasFromIndex( ) {
         // Arrange - Add a saga ID to the pending index but don't create the saga itself
         IDatabase db = s_redis!.GetDatabase( );
         _ = await db.SetAddAsync( "saga:pending", "expired-saga-id" );
@@ -296,7 +298,7 @@ public class SagaPollingIntegrationTests {
         Assert.Contains<RedisValue>( v => v.ToString( ) == "expired-saga-id", pendingBefore );
 
         // Act - Query should clean up the orphaned index entry
-        _ = await _sagaManager.GetCompletedButUnfinalizedAsync(
+        _ = await _sagaManager.GetPendingReconciliationAsync(
             minimumAge: TimeSpan.Zero,
             limit: 100,
             cancellationToken: TestContext.CancellationToken
@@ -305,6 +307,36 @@ public class SagaPollingIntegrationTests {
         // Assert - Orphaned entry should be removed from index
         RedisValue[] pendingAfter = await db.SetMembersAsync( "saga:pending" );
         Assert.DoesNotContain<RedisValue>( v => v.ToString( ) == "expired-saga-id", pendingAfter );
+    }
+
+    /// <summary>A malformed indexed saga is pruned without preventing healthy sagas from reconciling.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task GetPendingReconciliationAsync_UnreadableSaga_DoesNotAbortSweep( ) {
+        const string HealthySagaId = "healthy-reconciliation-saga";
+        LookupSagaState healthy = await _sagaManager.GetOrCreateAsync(
+            HealthySagaId, "isrc:HEALTHY000001", LookupRequestType.IsrcLookup, "HEALTHY000001",
+            cancellationToken: TestContext.CancellationToken );
+        _ = await _sagaManager.TryInitializeProviderStatesAsync(
+            HealthySagaId, [SupportedProviders.Spotify], healthy.InstanceToken!, TestContext.CancellationToken );
+        _ = await _sagaManager.TryUpdateProviderStateAsync(
+            HealthySagaId,
+            new ProviderLookupState( SupportedProviders.Spotify, true, true, "{}", DateTimeOffset.UtcNow, null ),
+            healthy.InstanceToken!, TestContext.CancellationToken );
+
+        IDatabase db = s_redis!.GetDatabase( );
+        const string PoisonSagaId = "poison-reconciliation-saga";
+        await db.HashSetAsync( $"saga:{PoisonSagaId}", [
+            new HashEntry( "lookupKey", "isrc:POISON000001" ),
+            new HashEntry( "instanceToken", "poison-token" )
+        ] );
+        _ = await db.SetAddAsync( "saga:pending", PoisonSagaId );
+
+        IReadOnlyList<LookupSagaState> results = await _sagaManager.GetPendingReconciliationAsync(
+            TimeSpan.Zero, cancellationToken: TestContext.CancellationToken );
+
+        Assert.Contains( HealthySagaId, results.Select( saga => saga.SagaId ) );
+        Assert.IsFalse( await db.SetContainsAsync( "saga:pending", PoisonSagaId ) );
     }
 
     /// <summary>
@@ -370,11 +402,11 @@ public class SagaPollingIntegrationTests {
     }
 
     /// <summary>
-    /// Verifies setting a saga's final result URI removes it from the pending index.
+    /// Verifies final URI persistence retains the reconciliation entry until waiter release removes it.
     /// </summary>
     [TestMethod]
     [Timeout( 30000, CooperativeCancellation = true )]
-    public async Task SetFinalResultUriAsync_RemovesFromPendingIndex( ) {
+    public async Task SetFinalResultUriAsync_RetainsPendingIndexUntilExplicitRemoval( ) {
         // Arrange
         string lookupKey = "isrc:USRC12345678";
         string sagaId = ISagaStateManager.GenerateSagaId( lookupKey );
@@ -395,9 +427,13 @@ public class SagaPollingIntegrationTests {
         // Act
         await _sagaManager.SetFinalResultUriAsync( sagaId, "at://did:plc:test/link/abc", TestContext.CancellationToken );
 
-        // Assert - Should be removed from pending index
+        // Finalized-but-unnotified sagas remain discoverable by the polling backstop.
         RedisValue[] membersAfter = await db.SetMembersAsync( "saga:pending" );
-        Assert.DoesNotContain<RedisValue>( m => m.ToString( ) == sagaId, membersAfter );
+        Assert.Contains<RedisValue>( m => m.ToString( ) == sagaId, membersAfter );
+
+        await _sagaManager.RemoveFromPendingIndexAsync( sagaId, TestContext.CancellationToken );
+        RedisValue[] membersAfterRelease = await db.SetMembersAsync( "saga:pending" );
+        Assert.DoesNotContain<RedisValue>( m => m.ToString( ) == sagaId, membersAfterRelease );
     }
 
     /// <summary>

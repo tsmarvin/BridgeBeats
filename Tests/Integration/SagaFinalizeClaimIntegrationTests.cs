@@ -92,7 +92,7 @@ public class SagaFinalizeClaimIntegrationTests {
     [Timeout( 30000, CooperativeCancellation = true )]
     public async Task Finalize_UnderConcurrentTriggers_WritesExactlyOnce( ) {
         // Arrange - seed one complete, finalizable saga
-        _ = await _sagaManager.GetOrCreateAsync(
+        LookupSagaState seededSaga = await _sagaManager.GetOrCreateAsync(
             TestSagaId, TestLookupKey, LookupRequestType.IsrcLookup, "USRC99999001",
             QueuePriority.Interactive, TestContext.CancellationToken
         );
@@ -128,7 +128,8 @@ public class SagaFinalizeClaimIntegrationTests {
                 )
             },
             FinalResultUri = null,
-            IsPartial = false
+            IsPartial = false,
+            InstanceToken = seededSaga.InstanceToken
         };
 
         // Build all mocks needed by SagaCoordinatorBackgroundService
@@ -154,28 +155,28 @@ public class SagaFinalizeClaimIntegrationTests {
             .Setup( s => s.GetAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( completeSaga );
         _ = sagaMgrWrapper
-            .Setup( s => s.TryClaimFinalizeAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
-            .Returns( ( string _, CancellationToken ct ) => _sagaManager.TryClaimFinalizeAsync( TestSagaId, ct ) );
+            .Setup( s => s.TryClaimFinalizeAsync( TestSagaId, seededSaga.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
+            .Returns( ( string _, string _, CancellationToken ct ) => _sagaManager.TryClaimFinalizeAsync( TestSagaId, seededSaga.InstanceToken!, ct ) );
         _ = sagaMgrWrapper
-            .Setup( s => s.ReleaseFinalizeClaimAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
-            .Returns( ( string _, CancellationToken ct ) => _sagaManager.ReleaseFinalizeClaimAsync( TestSagaId, ct ) );
+            .Setup( s => s.TryReleaseFinalizeClaimAsync( TestSagaId, seededSaga.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
+            .Returns( ( string _, string _, CancellationToken ct ) => _sagaManager.TryReleaseFinalizeClaimAsync( TestSagaId, seededSaga.InstanceToken!, ct ) );
         _ = sagaMgrWrapper
-            .Setup( s => s.TryAdvanceWriteGenerationAsync( TestSagaId, It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ) )
-            .Returns( ( string _, int gen, CancellationToken ct ) => _sagaManager.TryAdvanceWriteGenerationAsync( TestSagaId, gen, ct ) );
+            .Setup( s => s.TryAdvanceWriteGenerationAsync( TestSagaId, It.IsAny<int>( ), seededSaga.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
+            .Returns( ( string _, int gen, string _, CancellationToken ct ) => _sagaManager.TryAdvanceWriteGenerationAsync( TestSagaId, gen, seededSaga.InstanceToken!, ct ) );
         _ = sagaMgrWrapper
-            .Setup( s => s.ResetWriteGenerationAsync( TestSagaId, It.IsAny<int>( ), It.IsAny<int>( ), It.IsAny<CancellationToken>( ) ) )
-            .Returns( ( string _, int advTo, int prior, CancellationToken ct ) => _sagaManager.ResetWriteGenerationAsync( TestSagaId, advTo, prior, ct ) );
-        _ = sagaMgrWrapper
-            .Setup( s => s.SetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
-            .Returns( Task.CompletedTask );
-        _ = sagaMgrWrapper
-            .Setup( s => s.SetIsPartialAsync( It.IsAny<string>( ), It.IsAny<bool>( ), It.IsAny<CancellationToken>( ) ) )
-            .Returns( Task.CompletedTask );
-        _ = sagaMgrWrapper
-            .Setup( s => s.DeleteAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Setup( s => s.TryResetWriteGenerationAsync( TestSagaId, It.IsAny<int>( ), It.IsAny<int>( ), seededSaga.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( true );
         _ = sagaMgrWrapper
-            .Setup( s => s.TryMarkSecondariesQueuedAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Setup( s => s.TrySetFinalResultUriAsync( It.IsAny<string>( ), It.IsAny<string>( ), seededSaga.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( SagaFinalResultWriteOutcome.Stored );
+        _ = sagaMgrWrapper
+            .Setup( s => s.TrySetIsPartialAsync( It.IsAny<string>( ), It.IsAny<bool>( ), seededSaga.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = sagaMgrWrapper
+            .Setup( s => s.TryDeleteAsync( It.IsAny<string>( ), seededSaga.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = sagaMgrWrapper
+            .Setup( s => s.TryMarkSecondariesQueuedAsync( It.IsAny<string>( ), seededSaga.InstanceToken!, It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( false ); // ISRC saga: secondaries guard returns false (no fan-out)
 
         // N = 8 concurrent acquirers through a release gate
@@ -195,7 +196,8 @@ public class SagaFinalizeClaimIntegrationTests {
                 resultCombiner,
                 queueResolverMock.Object,
                 enabledProviders,
-                loggerMock.Object
+                loggerMock.Object,
+                Mock.Of<IRefreshReviewStore>( )
             );
 
             // All paths converge on WriteFinalResultAsync internally; invoke via polling path

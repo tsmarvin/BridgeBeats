@@ -165,6 +165,8 @@ namespace BridgeBeats.Core.Domain.Extensions {
             } )
             .ConfigurePrimaryHttpMessageHandler( ( ) => SsrfSocketsHttpHandlerFactory.Create(
                 connectTimeout: TimeSpan.FromSeconds( 10 ) ) )
+            .ConfigureAdditionalHttpMessageHandlers( ( handlers, _ ) =>
+                handlers.Insert( 0, new TerminalProviderRateLimitHandler( SupportedProviders.AppleMusic ) ) )
             .AddHttpMessageHandler( CreateRetryAfterLimitHandlerFactory( maxRetryAfterSeconds ) )
             .AddHttpMessageHandler( ( ) => new ProviderMetricsHandler( "applemusic" ) );
 
@@ -215,6 +217,8 @@ namespace BridgeBeats.Core.Domain.Extensions {
             } )
             .ConfigurePrimaryHttpMessageHandler( ( ) => SsrfSocketsHttpHandlerFactory.Create(
                 connectTimeout: TimeSpan.FromSeconds( 10 ) ) )
+            .ConfigureAdditionalHttpMessageHandlers( ( handlers, _ ) =>
+                handlers.Insert( 0, new TerminalProviderRateLimitHandler( SupportedProviders.Spotify ) ) )
             .AddHttpMessageHandler( handlerFactory )
             .AddHttpMessageHandler( ( ) => new ProviderMetricsHandler( "spotify" ) );
 
@@ -269,6 +273,8 @@ namespace BridgeBeats.Core.Domain.Extensions {
             } )
             .ConfigurePrimaryHttpMessageHandler( ( ) => SsrfSocketsHttpHandlerFactory.Create(
                 connectTimeout: TimeSpan.FromSeconds( 10 ) ) )
+            .ConfigureAdditionalHttpMessageHandlers( ( handlers, _ ) =>
+                handlers.Insert( 0, new TerminalProviderRateLimitHandler( SupportedProviders.Tidal ) ) )
             .AddHttpMessageHandler( handlerFactory )
             .AddHttpMessageHandler( ( ) => new ProviderMetricsHandler( "tidal" ) );
 

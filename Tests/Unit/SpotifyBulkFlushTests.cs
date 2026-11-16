@@ -1,11 +1,16 @@
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Globalization;
+using System.Reflection;
 using BridgeBeats.Contracts.Constants;
 using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Enums;
+using BridgeBeats.Contracts.Exceptions;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
 using BridgeBeats.Core.Domain.Providers.Spotify;
 using BridgeBeats.Core.Infrastructure.Queue;
+using BridgeBeats.Core.Infrastructure.Utilities;
 using BridgeBeats.Worker.Spotify;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -25,6 +30,7 @@ namespace BridgeBeats.Tests.Unit;
 /// as approved bulk callers.
 /// </summary>
 [TestClass]
+[DoNotParallelize]
 public class SpotifyBulkFlushTests {
 
     /// <summary>Mock Redis multiplexer supplying the database and subscriber to the service under test.</summary>
@@ -100,6 +106,10 @@ public class SpotifyBulkFlushTests {
                 It.IsAny<StreamTrimMode>( ),
                 It.IsAny<CommandFlags>( ) ) )
             .ReturnsAsync( (RedisValue)"1234567890-0" );
+        _ = _dbMock.Setup( d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
+                It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( (RedisResult)RedisResult.Create( (RedisValue)"1234567890-1" ) );
 
         // StreamLength returns 0 by default
         _ = _dbMock.Setup( d => d.StreamLengthAsync( It.IsAny<RedisKey>( ), It.IsAny<CommandFlags>( ) ) )
@@ -192,41 +202,38 @@ public class SpotifyBulkFlushTests {
                 SagaId = TestSagaId,
                 LookupKey = $"{LookupRequestType.SongIdLookup}:{SupportedProviders.Spotify}:{TestTrackId}",
                 LookupType = LookupRequestType.SongIdLookup,
-                LookupValue = TestTrackId
+                LookupValue = TestTrackId,
+                InstanceToken = "test-instance"
             } );
         _ = _sagaManagerMock.Setup( m => m.GetAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( new LookupSagaState {
                 SagaId = TestSagaId,
                 LookupKey = $"{LookupRequestType.SongIdLookup}:{SupportedProviders.Spotify}:{TestTrackId}",
                 LookupType = LookupRequestType.SongIdLookup,
-                LookupValue = TestTrackId
+                LookupValue = TestTrackId,
+                InstanceToken = "test-instance"
             } );
-        _ = _sagaManagerMock.Setup( m => m.InitializeProviderStatesAsync(
-                It.IsAny<string>( ),
-                It.IsAny<IEnumerable<SupportedProviders>>( ),
-                It.IsAny<CancellationToken>( ) ) )
-            .Returns( Task.CompletedTask );
-        _ = _sagaManagerMock.Setup( m => m.UpdateProviderStateAsync(
-                It.IsAny<string>( ),
-                It.IsAny<ProviderLookupState>( ),
-                It.IsAny<CancellationToken>( ) ) )
-            .Returns( Task.CompletedTask );
-        _ = _sagaManagerMock.Setup( m => m.SetIsPartialAsync(
-                It.IsAny<string>( ),
-                It.IsAny<bool>( ),
-                It.IsAny<CancellationToken>( ) ) )
-            .Returns( Task.CompletedTask );
-        _ = _sagaManagerMock.Setup( m => m.SetRateLimitInfoAsync(
-                It.IsAny<string>( ),
-                It.IsAny<List<ProviderRateLimitInfo>>( ),
-                It.IsAny<CancellationToken>( ) ) )
-            .Returns( Task.CompletedTask );
+        _ = _sagaManagerMock.Setup( m => m.TryInitializeProviderStatesAsync(
+                It.IsAny<string>( ), It.IsAny<IEnumerable<SupportedProviders>>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _sagaManagerMock.Setup( m => m.TrySetIsPartialAsync(
+                It.IsAny<string>( ), It.IsAny<bool>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _sagaManagerMock.Setup( m => m.TrySetRateLimitInfoAsync(
+                It.IsAny<string>( ), It.IsAny<List<ProviderRateLimitInfo>>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
+        _ = _sagaManagerMock.Setup( m => m.TryUpdateProviderStateAsync(
+                It.IsAny<string>( ), It.IsAny<ProviderLookupState>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( true );
     }
 
     /// <summary>
     /// Verifies that a song-id lookup at interactive priority is delegated to the inner queue and is
     /// never written to a bulk stream.
     /// </summary>
+    /// <remarks>
+    /// Interactive requests stay on the generic single-item path and are never batch-routed.
+    /// </remarks>
     [TestMethod]
     public async Task Decorator_SongIdLookup_WithInteractivePriority_DelegatesToInnerQueue( ) {
         // Arrange — SongIdLookup with explicitly Interactive priority
@@ -262,9 +269,92 @@ public class SpotifyBulkFlushTests {
     }
 
     /// <summary>
+    /// Verifies that a missing Redis consumer group is repaired and that the bulk worker continues
+    /// into a subsequent polling cycle instead of remaining in the error path.
+    /// </summary>
+    [TestMethod]
+    public async Task ExecuteAsync_WhenNoGroupError_RecreatesGroupsAndContinuesLoop( ) {
+        // Arrange — the first flush-decision read simulates Redis returning NOGROUP. The third
+        // read is the album check in the next polling cycle (the second read is the first cycle's
+        // album check), proving the loop resumed after EnsureConsumerGroupsAsync completed.
+        TaskCompletionSource<bool> resumed = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        int stateCalls = 0;
+        _ = _rateLimitTrackerMock.Setup( t => t.GetStateAsync(
+                It.IsAny<SupportedProviders>( ),
+                It.IsAny<string>( ),
+                It.IsAny<CancellationToken>( ) ) )
+            .Returns( ( SupportedProviders _, string _, CancellationToken _ ) => {
+                int call = Interlocked.Increment( ref stateCalls );
+                if (call == 1) {
+                    return Task.FromException<RateLimitState>(
+                        new RedisServerException( "NOGROUP No such key 'spotify:bulk:tracks'" ) );
+                }
+
+                if (call >= 3) {
+                    _ = resumed.TrySetResult( true );
+                }
+
+                return Task.FromResult( new RateLimitState( false, null, null ) );
+            } );
+
+        SpotifyBulkProcessorService service = CreateService( );
+
+        // Act — start the hosted loop, wait until it reaches the next cycle, then stop it cleanly.
+        await service.StartAsync( TestContext.CancellationToken );
+        Task completed = await Task.WhenAny( resumed.Task, Task.Delay( TimeSpan.FromSeconds( 5 ), TestContext.CancellationToken ) );
+        await service.StopAsync( TestContext.CancellationToken );
+
+        // Assert — startup and the NOGROUP recovery each ensure both bulk consumer groups.
+        Assert.AreSame( resumed.Task, completed, "The worker did not resume polling after NOGROUP recovery." );
+        Assert.IsGreaterThanOrEqualTo( 3, stateCalls, "The worker did not enter a subsequent polling cycle." );
+        _dbMock.Verify( d => d.StreamCreateConsumerGroupAsync(
+                It.IsAny<RedisKey>( ),
+                It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue>( ),
+                It.IsAny<bool>( ),
+                It.IsAny<CommandFlags>( ) ), Times.Exactly( 4 ) );
+    }
+
+    /// <summary>Failed Spotify group repair is delayed and retried without terminating the loop.</summary>
+    [TestMethod]
+    [Timeout( 30000, CooperativeCancellation = true )]
+    public async Task ExecuteAsync_WhenGroupRepairFails_RetriesOnLaterNoGroup( ) {
+        TaskCompletionSource<bool> resumed = new( TaskCreationOptions.RunContinuationsAsynchronously );
+        int stateCalls = 0;
+        _ = _rateLimitTrackerMock.Setup( t => t.GetStateAsync(
+                It.IsAny<SupportedProviders>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Returns( ( SupportedProviders _, string _, CancellationToken _ ) => {
+                int call = Interlocked.Increment( ref stateCalls );
+                if (call <= 2) return Task.FromException<RateLimitState>( new RedisServerException( "NOGROUP" ) );
+                _ = resumed.TrySetResult( true );
+                return Task.FromResult( new RateLimitState( false, null, null ) );
+            } );
+        int groupCalls = 0;
+        _ = _dbMock.Setup( d => d.StreamCreateConsumerGroupAsync(
+                It.IsAny<RedisKey>( ), It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<bool>( ), It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( ( RedisKey _, RedisValue _, RedisValue _, bool _, CommandFlags _ ) => {
+                int call = Interlocked.Increment( ref groupCalls );
+                if (call == 3) throw new RedisServerException( "repair failed" );
+                return true;
+            } );
+
+        SpotifyBulkProcessorService service = CreateService( );
+        await service.StartAsync( TestContext.CancellationToken );
+        Task completed = await Task.WhenAny( resumed.Task, Task.Delay( TimeSpan.FromSeconds( 12 ), TestContext.CancellationToken ) );
+        await service.StopAsync( TestContext.CancellationToken );
+
+        Assert.AreSame( resumed.Task, completed );
+        Assert.IsGreaterThanOrEqualTo( 5, groupCalls );
+    }
+
+    /// <summary>
     /// Verifies that an album-id lookup at interactive priority is delegated to the inner queue and
     /// is never written to a bulk stream.
     /// </summary>
+    /// <remarks>
+    /// Interactive requests stay on the generic single-item path and are never batch-routed.
+    /// </remarks>
     [TestMethod]
     public async Task Decorator_AlbumIdLookup_WithInteractivePriority_DelegatesToInnerQueue( ) {
         // Arrange
@@ -322,7 +412,21 @@ public class SpotifyBulkFlushTests {
                 It.IsAny<QueuePriority>( ),
                 It.IsAny<CancellationToken>( ) ),
             Times.Never,
-            "Decorator must not materialize a saga at enqueue time — sagas are created at flush in ProcessBulkResultAsync" );
+            "Decorator must not materialize a saga; the upstream producer owns saga creation" );
+    }
+
+    /// <summary>A bulk-routed enqueue fails when Redis does not return an accepted entry id.</summary>
+    [TestMethod]
+    public async Task Decorator_BulkEnqueueWithoutMessageId_Throws( ) {
+        _ = _dbMock.Setup( d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
+                It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( (RedisResult)RedisResult.Create( RedisValue.Null ) );
+
+        SpotifyBulkQueueDecorator decorator = CreateDecorator( );
+
+        _ = await Assert.ThrowsExactlyAsync<InvalidOperationException>( ( ) => decorator.EnqueueAsync(
+            MakeTrackRequest( TestTrackId ), QueuePriority.Bulk, TestContext.CancellationToken ) );
     }
 
     /// <summary>
@@ -500,14 +604,15 @@ public class SpotifyBulkFlushTests {
     }
 
     /// <summary>
-    /// Verifies the ordering guarantee in rate-limit handling: <c>HandleBulkRateLimitAsync</c> calls
-    /// <c>GetOrCreateAsync</c> to ensure the saga core hash exists before <c>SetIsPartialAsync</c>
-    /// writes provider state, so partial state is never written against a missing saga.
+    /// A rate-limited delivery whose producer saga is gone is acknowledged as stale and never
+    /// recreates state from an old delivery.
     /// </summary>
     [TestMethod]
-    public async Task HandleBulkRateLimitAsync_CallsGetOrCreateAsync_BeforeWritingProviderState( ) {
-        // Arrange — a JetStream-style fire-and-forget message (saga not pre-created)
-        QueuedLookupRequest request = MakeTrackRequest( TestTrackId, QueuePriority.Bulk );
+    public async Task HandleBulkRateLimitAsync_MissingSaga_AcknowledgesStaleWithoutMutation( ) {
+        QueuedLookupRequest request = MakeTrackRequest( TestTrackId, QueuePriority.Bulk ) with {
+            SagaId = ISagaStateManager.GenerateSagaId( LookupKeyBuilder.TypedKey(
+                LookupRequestType.SongIdLookup, SupportedProviders.Spotify, TestTrackId ) )
+        };
         List<QueuedMessage<QueuedLookupRequest>> messages = [
             new QueuedMessage<QueuedLookupRequest>(
                 $"{TrackStream}:1234567890-0",
@@ -521,53 +626,78 @@ public class SpotifyBulkFlushTests {
             requestUri: null,
             provider: SupportedProviders.Spotify );
 
-        bool getOrCreateCalledBeforeSetPartial = false;
-        bool setPartialCalled = false;
-
-        _ = _sagaManagerMock.Setup( m => m.GetOrCreateAsync(
-                It.IsAny<string>( ),
-                It.IsAny<string>( ),
-                It.IsAny<LookupRequestType>( ),
-                It.IsAny<string>( ),
-                It.IsAny<QueuePriority?>( ),
-                It.IsAny<CancellationToken>( ) ) )
-            .Callback( ( string _, string _, LookupRequestType _, string _, QueuePriority? _, CancellationToken _ ) => {
-                getOrCreateCalledBeforeSetPartial = !setPartialCalled;
-            } )
-            .ReturnsAsync( new LookupSagaState {
-                SagaId = TestSagaId,
-                LookupKey = $"{LookupRequestType.SongIdLookup}:{SupportedProviders.Spotify}:{TestTrackId}",
-                LookupType = LookupRequestType.SongIdLookup,
-                LookupValue = TestTrackId
-            } );
-
-        _ = _sagaManagerMock.Setup( m => m.SetIsPartialAsync(
-                It.IsAny<string>( ),
-                It.IsAny<bool>( ),
-                It.IsAny<CancellationToken>( ) ) )
-            .Callback( ( string _, bool _, CancellationToken _ ) => setPartialCalled = true )
-            .Returns( Task.CompletedTask );
+        _ = _sagaManagerMock.Setup( m => m.GetAsync( request.SagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( (LookupSagaState?)null );
 
         SpotifyBulkProcessorService service = CreateService( );
 
         // Act
         await service.HandleBulkRateLimitAsync( messages, SpotifyConstants.BulkTracksEndpoint, ex, TestContext.CancellationToken );
 
-        // Assert (a): GetOrCreateAsync was called
-        _sagaManagerMock.Verify(
-            m => m.GetOrCreateAsync(
-                TestSagaId,
-                It.IsAny<string>( ),
-                It.IsAny<LookupRequestType>( ),
-                It.IsAny<string>( ),
-                It.IsAny<QueuePriority?>( ),
-                It.IsAny<CancellationToken>( ) ),
-            Times.Once,
-            "HandleBulkRateLimitAsync must call GetOrCreateAsync to ensure the core hash exists before writing provider state" );
+        _sagaManagerMock.Verify( m => m.GetAsync( request.SagaId, It.IsAny<CancellationToken>( ) ), Times.AtLeastOnce );
+        _sagaManagerMock.Verify( m => m.TrySetIsPartialAsync(
+            It.IsAny<string>( ), It.IsAny<bool>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( m => m.GetOrCreateAsync(
+            It.IsAny<string>( ), It.IsAny<string>( ), It.IsAny<LookupRequestType>( ), It.IsAny<string>( ),
+            It.IsAny<QueuePriority?>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+    }
 
-        // Assert (b): GetOrCreateAsync was called BEFORE SetIsPartialAsync
-        Assert.IsTrue( getOrCreateCalledBeforeSetPartial,
-            "GetOrCreateAsync must be called before SetIsPartialAsync so the core hash exists before provider state is written" );
+    /// <summary>
+    /// Verifies rate-limit handling emits one end-to-end wall sample and span for both an admitted
+    /// message and a stale identity that is quarantined before admission.
+    /// </summary>
+    [TestMethod]
+    public async Task HandleBulkRateLimitAsync_MixedAdmittedAndStaleMessages_RecordsWallOncePerMessage( ) {
+        QueuedMessage<QueuedLookupRequest> admitted = new(
+            $"{TrackStream}:admitted",
+            MakeTrackRequest( TestTrackId, QueuePriority.Bulk ),
+            DateTimeOffset.UtcNow );
+        QueuedMessage<QueuedLookupRequest> stale = new(
+            $"{TrackStream}:stale",
+            MakeTrackRequest( TestTrackId, QueuePriority.Bulk ),
+            DateTimeOffset.UtcNow );
+        List<QueuedMessage<QueuedLookupRequest>> messages = [admitted, stale];
+        Contracts.Exceptions.RetryAfterExceededException ex = new(
+            retryAfterValue: TimeSpan.FromSeconds( 60 ),
+            threshold: TimeSpan.FromSeconds( 120 ),
+            requestUri: null,
+            provider: SupportedProviders.Spotify );
+
+        int partialCalls = 0;
+        _ = _sagaManagerMock.Setup( m => m.TrySetIsPartialAsync(
+                It.IsAny<string>( ), It.IsAny<bool>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( string _, bool _, string _, CancellationToken _ ) => Interlocked.Increment( ref partialCalls ) == 1 );
+
+        int wallSamples = 0;
+        List<Activity> wallSpans = [];
+        using ActivityListener activityListener = new( ) {
+            ShouldListenTo = source => source.Name == QueueMetrics.MeterName,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+            ActivityStopped = activity => {
+                if (activity.OperationName == "queue.spotify.message.wall") wallSpans.Add( activity );
+            }
+        };
+        ActivitySource.AddActivityListener( activityListener );
+        using MeterListener meterListener = new( );
+        meterListener.InstrumentPublished = ( instrument, listener ) => {
+            if (instrument.Name == "bridgebeats.queue.message.wall.duration") listener.EnableMeasurementEvents( instrument );
+        };
+        meterListener.SetMeasurementEventCallback<double>( ( _, _, _, _ ) => wallSamples++ );
+        meterListener.Start( );
+
+        await CreateService( ).HandleBulkRateLimitAsync( messages, SpotifyConstants.BulkTracksEndpoint, ex, TestContext.CancellationToken );
+
+        Assert.AreEqual( 2, wallSamples );
+        Assert.HasCount( 2, wallSpans );
+        _innerQueueMock.Verify( q => q.EnqueueAsync(
+            It.IsAny<QueuedLookupRequest>( ), It.IsAny<QueuePriority>( ), It.IsAny<CancellationToken>( ) ), Times.Never );
+        _sagaManagerMock.Verify( m => m.TrySetIsPartialAsync(
+            admitted.Payload.SagaId, true, "test-instance", It.IsAny<CancellationToken>( ) ), Times.Exactly( 2 ) );
+        _sagaManagerMock.Verify( m => m.TrySetRateLimitInfoAsync(
+            admitted.Payload.SagaId,
+            It.IsAny<List<ProviderRateLimitInfo>>( ),
+            "test-instance",
+            It.IsAny<CancellationToken>( ) ), Times.Once );
     }
 
     /// <summary>
@@ -580,7 +710,10 @@ public class SpotifyBulkFlushTests {
     public async Task RequeueSingle_CapReached_CallsGetOrCreateAsync_BeforeUpdateProviderState( ) {
         // Arrange — message at retry cap
         QueuedLookupRequest request = MakeTrackRequest( TestTrackId, QueuePriority.Bulk,
-            attemptCount: LookupConstants.MaxQueueRetryAttempts );
+            attemptCount: LookupConstants.MaxQueueRetryAttempts ) with {
+            SagaId = ISagaStateManager.GenerateSagaId( LookupKeyBuilder.TypedKey(
+                    LookupRequestType.SongIdLookup, SupportedProviders.Spotify, TestTrackId ) )
+        };
         StreamEntry capEntry = BuildStreamEntry( request );
 
         // StreamRangeAsync returns the at-cap entry so RequeueAsync sees AttemptCount == cap
@@ -613,56 +746,49 @@ public class SpotifyBulkFlushTests {
         _ = _lookupServiceMock.Setup( s => s.GetTracksByIdsAsync( It.IsAny<IEnumerable<string>>( ) ) )
             .ReturnsAsync( new Dictionary<string, MusicLookupResult?> { ["someOtherId"] = null } );
 
-        bool getOrCreateCalledBeforeUpdateProvider = false;
         bool updateProviderCalled = false;
 
-        _ = _sagaManagerMock.Setup( m => m.GetOrCreateAsync(
-                It.IsAny<string>( ),
-                It.IsAny<string>( ),
-                It.IsAny<LookupRequestType>( ),
-                It.IsAny<string>( ),
-                It.IsAny<QueuePriority?>( ),
-                It.IsAny<CancellationToken>( ) ) )
-            .Callback( ( string _, string _, LookupRequestType _, string _, QueuePriority? _, CancellationToken _ ) => {
-                // Only set the flag if this is the CapReached call (updateProvider not yet called)
-                if (!updateProviderCalled) {
-                    getOrCreateCalledBeforeUpdateProvider = true;
-                }
-            } )
+        _ = _sagaManagerMock.Setup( m => m.TryUpdateProviderStateAsync(
+                It.IsAny<string>( ), It.IsAny<ProviderLookupState>( ), It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
+            .Callback( ( string _, ProviderLookupState _, string _, CancellationToken _ ) => updateProviderCalled = true )
+            .ReturnsAsync( true );
+        _ = _sagaManagerMock.Setup( m => m.GetAsync( It.IsAny<string>( ), It.IsAny<CancellationToken>( ) ) )
             .ReturnsAsync( new LookupSagaState {
                 SagaId = TestSagaId,
                 LookupKey = $"{LookupRequestType.SongIdLookup}:{SupportedProviders.Spotify}:{TestTrackId}",
                 LookupType = LookupRequestType.SongIdLookup,
-                LookupValue = TestTrackId
+                LookupValue = TestTrackId,
+                InstanceToken = "test-instance",
+                ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                    [SupportedProviders.Spotify] = new( SupportedProviders.Spotify, false, false, null, null, null )
+                }
             } );
 
-        _ = _sagaManagerMock.Setup( m => m.UpdateProviderStateAsync(
-                It.IsAny<string>( ),
-                It.IsAny<ProviderLookupState>( ),
-                It.IsAny<CancellationToken>( ) ) )
-            .Callback( ( string _, ProviderLookupState _, CancellationToken _ ) => updateProviderCalled = true )
-            .Returns( Task.CompletedTask );
-
         SpotifyBulkProcessorService service = CreateService( );
+        int completedLegs = 0;
+        string? completedState = null;
+        using MeterListener meterListener = new( );
+        meterListener.InstrumentPublished = ( instrument, sub ) => {
+            if (instrument.Name == "bridgebeats.queue.saga.leg.completed.total") sub.EnableMeasurementEvents( instrument );
+        };
+        meterListener.SetMeasurementEventCallback<long>( ( _, value, tags, _ ) => {
+            completedLegs += (int)value;
+            foreach (KeyValuePair<string, object?> tag in tags) {
+                if (tag.Key == "saga_state") completedState = tag.Value?.ToString( );
+            }
+        } );
+        meterListener.Start( );
 
         // Act — drives the absent-key → RequeueSingleAsync → CapReached path
         await service.ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
 
-        // Assert (a): GetOrCreateAsync was called in the CapReached branch
-        _sagaManagerMock.Verify(
-            m => m.GetOrCreateAsync(
-                TestSagaId,
-                It.IsAny<string>( ),
-                It.IsAny<LookupRequestType>( ),
-                It.IsAny<string>( ),
-                It.IsAny<QueuePriority?>( ),
-                It.IsAny<CancellationToken>( ) ),
-            Times.AtLeastOnce,
-            "RequeueSingleAsync CapReached branch must call GetOrCreateAsync to ensure the core hash exists before writing provider state" );
-
-        // Assert (b): GetOrCreateAsync preceded UpdateProviderStateAsync
-        Assert.IsTrue( getOrCreateCalledBeforeUpdateProvider,
-            "GetOrCreateAsync must be called before UpdateProviderStateAsync in the CapReached branch" );
+        // Assert: the cap path reads and fences the saga before writing terminal state.
+        _sagaManagerMock.Verify( m => m.GetAsync( request.SagaId, It.IsAny<CancellationToken>( ) ), Times.AtLeastOnce );
+        _sagaManagerMock.Verify( m => m.TryUpdateProviderStateAsync(
+            request.SagaId, It.IsAny<ProviderLookupState>( ), "test-instance", It.IsAny<CancellationToken>( ) ), Times.Once );
+        Assert.IsTrue( updateProviderCalled, "The CapReached branch must write terminal state through the token-aware CAS." );
+        Assert.AreEqual( 1, completedLegs );
+        Assert.AreEqual( "committed_failure", completedState );
     }
 
     /// <summary>
@@ -826,6 +952,7 @@ public class SpotifyBulkFlushTests {
             _rateLimitTrackerMock.Object,
             _sagaManagerMock.Object,
             _lookupServiceMock.Object,
+            _innerQueueMock.Object,
             _serviceLoggerMock.Object,
             options );
     }
@@ -836,6 +963,621 @@ public class SpotifyBulkFlushTests {
     /// <returns>A helper under test.</returns>
     private SpotifyBatchQueueHelper CreateHelper( ) =>
         new( _redisMock.Object, _helperLoggerMock.Object );
+
+    /// <summary>Spotify dequeue emits scoped dequeue, PEL, and read-group spans on the real helper path.</summary>
+    [TestMethod]
+    public async Task SpotifyBulkDequeue_EmitsScopedTelemetryForPelAndReadGroup( ) {
+        List<Activity> observed = [];
+        using ActivityListener listener = new( ) {
+            ShouldListenTo = source => source.Name == QueueMetrics.MeterName,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+            ActivityStarted = activity => observed.Add( activity )
+        };
+        ActivitySource.AddActivityListener( listener );
+        _ = await CreateHelper( ).DequeueTrackIdBatchAsync( 1, TestContext.CancellationToken );
+        Assert.Contains( activity => activity.OperationName == "queue.spotify.dequeue", observed );
+        Activity pel = observed.Single( activity => activity.OperationName == "queue.spotify.dequeue.pel_scan" );
+        Activity read = observed.Single( activity => activity.OperationName == "queue.spotify.dequeue.read_group" );
+        Assert.AreEqual( "spotify", pel.GetTagItem( QueueMetricTags.Provider ) );
+        Assert.AreEqual( "bulk", pel.GetTagItem( QueueMetricTags.Priority ) );
+        Assert.IsGreaterThan( TimeSpan.Zero, pel.Duration );
+        Assert.IsGreaterThan( TimeSpan.Zero, read.Duration );
+    }
+
+    /// <summary>One valid bulk message produces exactly one wall sample and one missing-state leg sample.</summary>
+    [TestMethod]
+    public async Task SpotifyBulkResult_RecordsWallAndMissingSagaLegExactlyOnce( ) {
+        QueuedLookupRequest request = MakeTrackRequest( TestTrackId, QueuePriority.Bulk );
+        StreamEntry entry = BuildStreamEntry( request );
+        _ = _dbMock.Setup( d => d.StreamLengthAsync( (RedisKey)TrackStream, It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( SpotifyConstants.MaxTracksPerBatchLookup );
+        _ = _dbMock.Setup( d => d.StreamReadGroupAsync(
+                (RedisKey)TrackStream, It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue?>( ), It.IsAny<int?>( ), It.IsAny<bool>( ),
+                It.IsAny<TimeSpan?>( ), It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( [entry] );
+        _ = _lookupServiceMock.Setup( service => service.GetTracksByIdsAsync( It.IsAny<IEnumerable<string>>( ) ) )
+            .ReturnsAsync( new Dictionary<string, MusicLookupResult?> {
+                [TestTrackId] = new MusicLookupResult { Artist = "Artist", Title = "Title", ExternalId = "ISRC" }
+            } );
+
+        Dictionary<string, int> counts = [];
+        using MeterListener meterListener = new( );
+        meterListener.InstrumentPublished = ( instrument, listener ) => {
+            if (instrument.Meter.Name == QueueMetrics.MeterName
+                && (instrument.Name == "bridgebeats.queue.message.wall.duration"
+                    || instrument.Name == "bridgebeats.queue.saga.leg.completed.total")) {
+                listener.EnableMeasurementEvents( instrument );
+            }
+        };
+        meterListener.SetMeasurementEventCallback<double>( ( instrument, _, _, _ ) =>
+            counts[instrument.Name] = counts.GetValueOrDefault( instrument.Name ) + 1 );
+        meterListener.SetMeasurementEventCallback<long>( ( instrument, _, _, _ ) =>
+            counts[instrument.Name] = counts.GetValueOrDefault( instrument.Name ) + 1 );
+        meterListener.Start( );
+
+        await CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
+
+        Assert.AreEqual( 1, counts.GetValueOrDefault( "bridgebeats.queue.message.wall.duration" ) );
+        Assert.AreEqual( 1, counts.GetValueOrDefault( "bridgebeats.queue.saga.leg.completed.total" ) );
+    }
+
+    /// <summary>A two-message returned batch emits exactly one wall sample per message.</summary>
+    [TestMethod]
+    public async Task SpotifyBulkResult_TwoReturnedMessages_EmitsExactlyTwoWallSamples( ) {
+        QueuedLookupRequest first = MakeTrackRequest( TestTrackId, QueuePriority.Bulk );
+        QueuedLookupRequest second = MakeTrackRequest( TestTrackId + "2", QueuePriority.Bulk );
+        StreamEntry firstEntry = BuildStreamEntry( first );
+        StreamEntry secondEntry = BuildStreamEntry( second, "1234567891-0" );
+        _ = _dbMock.Setup( d => d.StreamLengthAsync( (RedisKey)TrackStream, It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( SpotifyConstants.MaxTracksPerBatchLookup );
+        _ = _dbMock.Setup( d => d.StreamReadGroupAsync(
+                (RedisKey)TrackStream, It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue?>( ), It.IsAny<int?>( ), It.IsAny<bool>( ),
+                It.IsAny<TimeSpan?>( ), It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( [firstEntry, secondEntry] );
+        _ = _lookupServiceMock.Setup( service => service.GetTracksByIdsAsync( It.IsAny<IEnumerable<string>>( ) ) )
+            .ReturnsAsync( new Dictionary<string, MusicLookupResult?> {
+                [TestTrackId] = new MusicLookupResult { Artist = "Artist", Title = "Title", ExternalId = "ISRC" },
+                [TestTrackId + "2"] = new MusicLookupResult { Artist = "Artist 2", Title = "Title 2", ExternalId = "ISRC2" }
+            } );
+
+        int wallSamples = 0;
+        List<double> wallDurations = [];
+        List<Activity> wallSpans = [];
+        using ActivityListener activityListener = new( ) {
+            ShouldListenTo = source => source.Name == QueueMetrics.MeterName,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+            ActivityStopped = activity => {
+                if (activity.OperationName == "queue.spotify.message.wall") wallSpans.Add( activity );
+            }
+        };
+        ActivitySource.AddActivityListener( activityListener );
+        using MeterListener listener = new( );
+        listener.InstrumentPublished = ( instrument, sub ) => {
+            if (instrument.Name == "bridgebeats.queue.message.wall.duration") sub.EnableMeasurementEvents( instrument );
+        };
+        listener.SetMeasurementEventCallback<double>( ( instrument, value, _, _ ) => {
+            wallSamples++;
+            wallDurations.Add( value );
+        } );
+        listener.Start( );
+
+        await CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
+
+        Assert.AreEqual( 2, wallSamples );
+        Assert.HasCount( 2, wallSpans );
+        for (int index = 0; index < wallSpans.Count; index++) {
+            Assert.IsLessThan( 0.5, Math.Abs( wallSpans[index].Duration.TotalSeconds - wallDurations[index] ) );
+        }
+    }
+
+    /// <summary>
+    /// A bulk result whose post-commit XACK fails remains pending without entering the retry-cap
+    /// mutation path, even at the terminal attempt boundary.
+    /// </summary>
+    [TestMethod]
+    public async Task SpotifyBulkResult_AckFailureAfterCommittedSuccess_LeavesPelPendingWithoutRetryMutation( ) {
+        QueuedLookupRequest request = MakeTrackRequest(
+            TestTrackId,
+            QueuePriority.Bulk,
+            LookupConstants.MaxQueueRetryAttempts - 1 );
+        StreamEntry entry = BuildStreamEntry( request );
+        _ = _dbMock.Setup( d => d.StreamLengthAsync( (RedisKey)TrackStream, It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( SpotifyConstants.MaxTracksPerBatchLookup );
+        _ = _dbMock.Setup( d => d.StreamReadGroupAsync(
+                (RedisKey)TrackStream, It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue?>( ), It.IsAny<int?>( ), It.IsAny<bool>( ),
+                It.IsAny<TimeSpan?>( ), It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( [entry] );
+        _ = _lookupServiceMock.Setup( service => service.GetTracksByIdsAsync( It.IsAny<IEnumerable<string>>( ) ) )
+            .ReturnsAsync( new Dictionary<string, MusicLookupResult?> {
+                [TestTrackId] = new MusicLookupResult { Artist = "Artist", Title = "Title", ExternalId = "ISRC" }
+            } );
+        _ = _dbMock.Setup( d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ),
+                It.Is<RedisKey[]?>( keys => keys != null && keys.Length == 1 && keys[0] == TrackStream ),
+                It.Is<RedisValue[]?>( arguments => arguments != null && arguments.Length == 2 ),
+                It.IsAny<CommandFlags>( ) ) )
+            .ThrowsAsync( new RedisServerException( "atomic acknowledgement unavailable" ) );
+
+        SpotifyBulkProcessorService service = CreateService( );
+
+        _ = await Assert.ThrowsAsync<Exception>(
+            ( ) => service.ProcessBulkTrackLookupsAsync( TestContext.CancellationToken ) );
+
+        _sagaManagerMock.Verify( manager => manager.TryUpdateProviderStateAsync(
+            request.SagaId,
+            It.Is<ProviderLookupState>( state => state.IsComplete && state.IsSuccess ),
+            "test-instance",
+            It.IsAny<CancellationToken>( ) ), Times.Once );
+        _dbMock.Verify( d => d.StreamAddAsync(
+            It.IsAny<RedisKey>( ), It.IsAny<NameValueEntry[]>( ), It.IsAny<RedisValue?>( ),
+            It.IsAny<long?>( ), It.IsAny<bool>( ), It.IsAny<long?>( ), It.IsAny<StreamTrimMode>( ),
+            It.IsAny<CommandFlags>( ) ), Times.Never );
+    }
+
+    /// <summary>Completed-leg redelivery is dropped while the first delivery emits its pending state.</summary>
+    [TestMethod]
+    public async Task SpotifyBulkResult_RecordsPendingAndCompleteSagaStatesOncePerMessage( ) {
+        QueuedLookupRequest request = MakeTrackRequest( TestTrackId, QueuePriority.Bulk );
+        StreamEntry entry = BuildStreamEntry( request );
+        _ = _dbMock.Setup( d => d.StreamLengthAsync( (RedisKey)TrackStream, It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( SpotifyConstants.MaxTracksPerBatchLookup );
+        _ = _dbMock.Setup( d => d.StreamReadGroupAsync(
+                (RedisKey)TrackStream, It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue?>( ), It.IsAny<int?>( ), It.IsAny<bool>( ),
+                It.IsAny<TimeSpan?>( ), It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( [entry] );
+        _ = _lookupServiceMock.Setup( service => service.GetTracksByIdsAsync( It.IsAny<IEnumerable<string>>( ) ) )
+            .ReturnsAsync( new Dictionary<string, MusicLookupResult?> {
+                [TestTrackId] = new MusicLookupResult { Artist = "Artist", Title = "Title", ExternalId = "ISRC" }
+            } );
+        int sagaRead = 0;
+        _ = _sagaManagerMock.Setup( manager => manager.GetAsync(
+                TestSagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( ( ) => sagaRead++ switch {
+                0 => new LookupSagaState { SagaId = TestSagaId, LookupKey = $"{LookupRequestType.SongIdLookup}:{SupportedProviders.Spotify}:{TestTrackId}", LookupType = LookupRequestType.SongIdLookup, LookupValue = TestTrackId, InstanceToken = "test-instance" },
+                1 or 2 => new LookupSagaState {
+                    SagaId = TestSagaId,
+                    LookupKey = $"{LookupRequestType.SongIdLookup}:{SupportedProviders.Spotify}:{TestTrackId}",
+                    LookupType = LookupRequestType.SongIdLookup,
+                    LookupValue = TestTrackId,
+                    InstanceToken = "test-instance",
+                    ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                        [SupportedProviders.Spotify] = new( SupportedProviders.Spotify, false, false, null, null, "pending" )
+                    }
+                },
+                3 or 4 or 5 or 6 => new LookupSagaState {
+                    SagaId = TestSagaId,
+                    LookupKey = $"{LookupRequestType.SongIdLookup}:{SupportedProviders.Spotify}:{TestTrackId}",
+                    LookupType = LookupRequestType.SongIdLookup,
+                    LookupValue = TestTrackId,
+                    InstanceToken = "test-instance",
+                    ProviderStates = new Dictionary<SupportedProviders, ProviderLookupState> {
+                        [SupportedProviders.Spotify] = new( SupportedProviders.Spotify, true, true, "{}", DateTimeOffset.UtcNow, null )
+                    }
+                },
+                _ => null
+            } );
+
+        List<string> states = [];
+        int wallSamples = 0;
+        using MeterListener meterListener = new( );
+        meterListener.InstrumentPublished = ( instrument, listener ) => {
+            if (instrument.Meter.Name == QueueMetrics.MeterName
+                && (instrument.Name == "bridgebeats.queue.message.wall.duration"
+                    || instrument.Name == "bridgebeats.queue.saga.leg.completed.total")) {
+                listener.EnableMeasurementEvents( instrument );
+            }
+        };
+        meterListener.SetMeasurementEventCallback<double>( ( instrument, _, _, _ ) => {
+            if (instrument.Name == "bridgebeats.queue.message.wall.duration") { wallSamples++; }
+        } );
+        meterListener.SetMeasurementEventCallback<long>( ( instrument, _, tags, _ ) => {
+            if (instrument.Name == "bridgebeats.queue.saga.leg.completed.total") {
+                foreach (KeyValuePair<string, object?> tag in tags) {
+                    if (tag.Key == "saga_state") { states.Add( tag.Value?.ToString( ) ?? string.Empty ); }
+                }
+            }
+        } );
+        meterListener.Start( );
+
+        await CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
+        await CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
+        await CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
+
+        Assert.AreEqual( 3, wallSamples );
+        CollectionAssert.AreEquivalent( new[] { "committed", "committed", "committed" }, states );
+    }
+
+    /// <summary>Spotify observation listeners do not change saga, queue, or acknowledgment calls.</summary>
+    [TestMethod]
+    public async Task SpotifyLeg_MetricsListenerOnAndOff_HasIdenticalBusinessCallCounts( ) {
+        QueuedLookupRequest request = MakeTrackRequest( TestTrackId, QueuePriority.Bulk );
+        StreamEntry entry = BuildStreamEntry( request );
+        _ = _dbMock.Setup( d => d.StreamLengthAsync( (RedisKey)TrackStream, It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( SpotifyConstants.MaxTracksPerBatchLookup );
+        _ = _dbMock.Setup( d => d.StreamReadGroupAsync(
+                (RedisKey)TrackStream, It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue?>( ), It.IsAny<int?>( ), It.IsAny<bool>( ),
+                It.IsAny<TimeSpan?>( ), It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( [entry] );
+        _ = _lookupServiceMock.Setup( service => service.GetTracksByIdsAsync( It.IsAny<IEnumerable<string>>( ) ) )
+            .ReturnsAsync( new Dictionary<string, MusicLookupResult?> {
+                [TestTrackId] = new MusicLookupResult { Artist = "Artist", Title = "Title", ExternalId = "ISRC" }
+            } );
+        _ = _sagaManagerMock.Setup( manager => manager.GetAsync( TestSagaId, It.IsAny<CancellationToken>( ) ) )
+            .ReturnsAsync( new LookupSagaState {
+                SagaId = TestSagaId,
+                LookupKey = $"{LookupRequestType.SongIdLookup}:{SupportedProviders.Spotify}:{TestTrackId}",
+                LookupType = LookupRequestType.SongIdLookup,
+                LookupValue = TestTrackId,
+                InstanceToken = "test-instance"
+            } );
+
+        static int Count( Mock mock, string method ) => mock.Invocations.Count( invocation => invocation.Method.Name == method );
+        static int CountAtomicAcks( Mock mock ) => mock.Invocations.Count( invocation =>
+            invocation.Method.Name == nameof( IDatabase.ScriptEvaluateAsync )
+            && invocation.Arguments[2] is RedisValue[] arguments
+            && arguments.Length == 2 );
+        async Task<(int Gets, int Updates, int Acks)> RunAsync( bool listen ) {
+            using MeterListener? listener = listen ? new MeterListener( ) : null;
+            if (listener is not null) {
+                listener.InstrumentPublished = ( instrument, consumer ) => {
+                    if (instrument.Meter.Name == QueueMetrics.MeterName
+                        && instrument.Name == "bridgebeats.queue.saga.leg.completed.total") {
+                        consumer.EnableMeasurementEvents( instrument );
+                    }
+                };
+                listener.Start( );
+            }
+            int gets = Count( _sagaManagerMock, nameof( ISagaStateManager.GetAsync ) );
+            int updates = Count( _sagaManagerMock, nameof( ISagaStateManager.TryUpdateProviderStateAsync ) );
+            int acks = CountAtomicAcks( _dbMock );
+            await CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
+            return (Count( _sagaManagerMock, nameof( ISagaStateManager.GetAsync ) ) - gets,
+                Count( _sagaManagerMock, nameof( ISagaStateManager.TryUpdateProviderStateAsync ) ) - updates,
+                CountAtomicAcks( _dbMock ) - acks);
+        }
+
+        (int Gets, int Updates, int Acks) disabled = await RunAsync( false );
+        (int Gets, int Updates, int Acks) enabled = await RunAsync( true );
+        Assert.AreEqual( disabled, enabled );
+        Assert.AreEqual( 1, disabled.Gets );
+        Assert.AreEqual( 1, disabled.Updates );
+        Assert.AreEqual( 1, disabled.Acks );
+    }
+
+    /// <summary>Transient provider failure after dequeue requeues and produces one wall sample without a completed leg.</summary>
+    [TestMethod]
+    public async Task SpotifyBulkTransientFailure_EmitsNoCompletedLegOrWallSample( ) {
+        QueuedLookupRequest request = MakeTrackRequest( TestTrackId, QueuePriority.Bulk );
+        StreamEntry entry = BuildStreamEntry( request );
+        _ = _dbMock.Setup( d => d.StreamLengthAsync( (RedisKey)TrackStream, It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( SpotifyConstants.MaxTracksPerBatchLookup );
+        _ = _dbMock.Setup( d => d.StreamReadGroupAsync(
+                (RedisKey)TrackStream, It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue?>( ), It.IsAny<int?>( ), It.IsAny<bool>( ),
+                It.IsAny<TimeSpan?>( ), It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( [entry] );
+        _ = _dbMock.Setup( d => d.StreamRangeAsync(
+                (RedisKey)TrackStream, It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<int?>( ), It.IsAny<Order>( ), It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( [entry] );
+        _ = _dbMock.Setup( d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
+                It.IsAny<CommandFlags>( ) ) )
+            .ThrowsAsync( new RedisServerException( "XADD failed" ) );
+        _ = _lookupServiceMock.Setup( service => service.GetTracksByIdsAsync( It.IsAny<IEnumerable<string>>( ) ) )
+            .ThrowsAsync( new HttpRequestException( "transient" ) );
+        int legSamples = 0;
+        int wallSamples = 0;
+        long enqueued = 0;
+        using MeterListener meterListener = new( );
+        meterListener.InstrumentPublished = ( instrument, listener ) => {
+            if (instrument.Meter.Name == QueueMetrics.MeterName
+                && (instrument.Name == "bridgebeats.queue.message.wall.duration"
+                    || instrument.Name == "bridgebeats.queue.saga.leg.completed.total"
+                    || instrument.Name == "bridgebeats.queue.enqueued.total")) {
+                listener.EnableMeasurementEvents( instrument );
+            }
+        };
+        meterListener.SetMeasurementEventCallback<double>( ( instrument, _, _, _ ) => {
+            if (instrument.Name == "bridgebeats.queue.message.wall.duration") { wallSamples++; }
+        } );
+        meterListener.SetMeasurementEventCallback<long>( ( instrument, _, _, _ ) => {
+            if (instrument.Name == "bridgebeats.queue.saga.leg.completed.total") { legSamples++; }
+            if (instrument.Name == "bridgebeats.queue.enqueued.total") { enqueued++; }
+        } );
+        meterListener.Start( );
+
+        await CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
+
+        Assert.AreEqual( 0, legSamples );
+        Assert.AreEqual( 1, wallSamples );
+        meterListener.RecordObservableInstruments( );
+        Assert.AreEqual( 0, enqueued, "A failed replacement XADD is not an accepted enqueue" );
+        _dbMock.Verify( d => d.StreamAcknowledgeAsync(
+            It.IsAny<RedisKey>( ), It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ), It.IsAny<CommandFlags>( ) ), Times.Never );
+    }
+
+    /// <summary>An atomic replacement failure emits exactly one wall sample and no acceptance metrics.</summary>
+    [TestMethod]
+    public async Task SpotifyBulkAtomicRequeueFailure_EmitsExactlyOneWallSample( ) {
+        QueuedLookupRequest request = MakeTrackRequest( TestTrackId, QueuePriority.Bulk );
+        StreamEntry entry = BuildStreamEntry( request );
+        _ = _dbMock.Setup( d => d.StreamLengthAsync( (RedisKey)TrackStream, It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( SpotifyConstants.MaxTracksPerBatchLookup );
+        _ = _dbMock.Setup( d => d.StreamReadGroupAsync(
+                (RedisKey)TrackStream, It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue?>( ), It.IsAny<int?>( ), It.IsAny<bool>( ),
+                It.IsAny<TimeSpan?>( ), It.IsAny<CommandFlags>( ) ) ).ReturnsAsync( [entry] );
+        _ = _dbMock.Setup( d => d.StreamRangeAsync(
+                (RedisKey)TrackStream, It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<int?>( ), It.IsAny<Order>( ), It.IsAny<CommandFlags>( ) ) ).ReturnsAsync( [entry] );
+        _ = _lookupServiceMock.Setup( service => service.GetTracksByIdsAsync( It.IsAny<IEnumerable<string>>( ) ) )
+            .ThrowsAsync( new HttpRequestException( "transient" ) );
+        _ = _dbMock.Setup( d => d.ScriptEvaluateAsync(
+                It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
+                It.IsAny<CommandFlags>( ) ) )
+            .ThrowsAsync( new RedisServerException( "atomic move failed" ) );
+        int wallSamples = 0;
+        long enqueued = 0;
+        long requeued = 0;
+        using MeterListener listener = new( );
+        listener.InstrumentPublished = ( instrument, sub ) => {
+            if (instrument.Name is "bridgebeats.queue.message.wall.duration"
+                or "bridgebeats.queue.enqueued.total"
+                or "bridgebeats.queue.requeued.total") sub.EnableMeasurementEvents( instrument );
+        };
+        listener.SetMeasurementEventCallback<double>( ( _, _, _, _ ) => wallSamples++ );
+        listener.SetMeasurementEventCallback<long>( ( instrument, measurement, _, _ ) => {
+            if (instrument.Name == "bridgebeats.queue.enqueued.total") _ = Interlocked.Add( ref enqueued, measurement );
+            if (instrument.Name == "bridgebeats.queue.requeued.total") _ = Interlocked.Add( ref requeued, measurement );
+        } );
+        listener.Start( );
+
+        await CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
+
+        Assert.AreEqual( 1, wallSamples );
+        listener.RecordObservableInstruments( );
+        Assert.AreEqual( 0, enqueued, "A failed atomic move has no accepted replacement" );
+        Assert.AreEqual( 0, requeued, "A failed atomic move must not report successful cleanup" );
+    }
+
+    /// <summary>A replacement enqueue/XADD failure still emits exactly one wall sample.</summary>
+    [TestMethod]
+    public async Task SpotifyBulkRejectionReplacementEnqueueFailure_EmitsExactlyOneWallSample( ) {
+        QueuedLookupRequest request = MakeTrackRequest( TestTrackId, QueuePriority.Bulk );
+        StreamEntry entry = BuildStreamEntry( request );
+        _ = _dbMock.Setup( d => d.StreamLengthAsync( (RedisKey)TrackStream, It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( SpotifyConstants.MaxTracksPerBatchLookup );
+        _ = _dbMock.Setup( d => d.StreamReadGroupAsync(
+                (RedisKey)TrackStream, It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue?>( ), It.IsAny<int?>( ), It.IsAny<bool>( ),
+                It.IsAny<TimeSpan?>( ), It.IsAny<CommandFlags>( ) ) ).ReturnsAsync( [entry] );
+        _ = _lookupServiceMock.Setup( service => service.GetTracksByIdsAsync( It.IsAny<IEnumerable<string>>( ) ) )
+            .ThrowsAsync( new SpotifyBulkRejectedException( 400, null, SupportedProviders.Spotify ) );
+        _ = _dbMock.Setup( database => database.ScriptEvaluateAsync(
+                It.IsAny<string>( ), It.IsAny<RedisKey[]?>( ), It.IsAny<RedisValue[]?>( ),
+                It.IsAny<CommandFlags>( ) ) )
+            .ThrowsAsync( new RedisServerException( "XADD failed" ) );
+
+        int wallSamples = 0;
+        using MeterListener listener = new( );
+        listener.InstrumentPublished = ( instrument, sub ) => {
+            if (instrument.Name == "bridgebeats.queue.message.wall.duration") sub.EnableMeasurementEvents( instrument );
+        };
+        listener.SetMeasurementEventCallback<double>( ( _, _, _, _ ) => wallSamples++ );
+        listener.Start( );
+
+        await CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
+
+        Assert.AreEqual( 1, wallSamples );
+        _dbMock.Verify( d => d.StreamAcknowledgeAsync(
+            It.IsAny<RedisKey>( ), It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ), It.IsAny<CommandFlags>( ) ), Times.Never );
+    }
+
+    /// <summary>A fallback single-id HTTP call emits its own provider duration in addition to the bulk call.</summary>
+    [TestMethod]
+    public async Task SpotifyBulkFallback_EmitsIndividualProviderHttpDuration( ) {
+        QueuedLookupRequest request = MakeTrackRequest( TestTrackId, QueuePriority.Bulk ) with {
+            FallbackLookupType = LookupRequestType.IsrcLookup,
+            FallbackLookupValue = "US-FALLBACK"
+        };
+        _ = _dbMock.Setup( d => d.StreamLengthAsync( (RedisKey)TrackStream, It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( SpotifyConstants.MaxTracksPerBatchLookup );
+        _ = _dbMock.Setup( d => d.StreamReadGroupAsync(
+                (RedisKey)TrackStream, It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue?>( ), It.IsAny<int?>( ), It.IsAny<bool>( ),
+                It.IsAny<TimeSpan?>( ), It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( [BuildStreamEntry( request )] );
+        _ = _lookupServiceMock.Setup( service => service.GetTracksByIdsAsync( It.IsAny<IEnumerable<string>>( ) ) )
+            .ReturnsAsync( new Dictionary<string, MusicLookupResult?> { [TestTrackId] = null } );
+        _ = _lookupServiceMock.Setup( service => service.GetInfoByISRCAsync( "US-FALLBACK" ) )
+            .ReturnsAsync( new MusicLookupResult { Artist = "Fallback", Title = "Track", ExternalId = "US-FALLBACK" } );
+
+        int providerHttpSamples = 0;
+        using MeterListener listener = new( );
+        listener.InstrumentPublished = ( instrument, sub ) => {
+            if (instrument.Name == "bridgebeats.queue.provider_http.duration") sub.EnableMeasurementEvents( instrument );
+        };
+        listener.SetMeasurementEventCallback<double>( ( _, _, _, _ ) => providerHttpSamples++ );
+        listener.Start( );
+
+        await CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken );
+
+        Assert.AreEqual( 2, providerHttpSamples );
+    }
+
+    /// <summary>A dequeue exception before any message is returned emits no message wall sample.</summary>
+    [TestMethod]
+    public async Task SpotifyBulkDequeueFailure_EmitsNoWallSample( ) {
+        _ = _dbMock.Setup( d => d.StreamAutoClaimAsync(
+                It.IsAny<RedisKey>( ), It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<long>( ), It.IsAny<RedisValue>( ), It.IsAny<int?>( ), It.IsAny<CommandFlags>( ) ) )
+            .ThrowsAsync( new RedisServerException( "NOGROUP No such key" ) );
+        int wallSamples = 0;
+        using MeterListener listener = new( );
+        listener.InstrumentPublished = ( instrument, sub ) => {
+            if (instrument.Name == "bridgebeats.queue.message.wall.duration") sub.EnableMeasurementEvents( instrument );
+        };
+        listener.SetMeasurementEventCallback<double>( ( _, _, _, _ ) => wallSamples++ );
+        listener.Start( );
+
+        _ = await Assert.ThrowsAsync<RedisServerException>(
+            ( ) => CreateService( ).ProcessBulkTrackLookupsAsync( TestContext.CancellationToken ) );
+
+        Assert.AreEqual( 0, wallSamples );
+    }
+
+    /// <summary>Bulk dequeue rethrows NOGROUP from XAUTOCLAIM so the worker can repair groups.</summary>
+    [TestMethod]
+    public async Task BulkDequeue_WhenAutoClaimReportsNoGroup_RethrowsForWorkerRecovery( ) {
+        _ = _dbMock.Setup( d => d.StreamAutoClaimAsync(
+                It.IsAny<RedisKey>( ), It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<long>( ), It.IsAny<RedisValue>( ), It.IsAny<int?>( ), It.IsAny<CommandFlags>( ) ) )
+            .ThrowsAsync( new RedisServerException( "NOGROUP No such key" ) );
+        SpotifyBatchQueueHelper helper = CreateHelper( );
+        _ = await Assert.ThrowsAsync<RedisServerException>(
+            ( ) => helper.DequeueTrackIdBatchAsync( 10, TestContext.CancellationToken ) );
+    }
+
+    /// <summary>Unknown-command XAUTOCLAIM errors degrade to own-PEL/new-entry recovery.</summary>
+    [TestMethod]
+    public async Task BulkDequeue_WhenAutoClaimIsUnsupported_FallsBackToOwnPelAndNewEntries( ) {
+        _ = _dbMock.Setup( d => d.StreamAutoClaimAsync(
+                It.IsAny<RedisKey>( ), It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<long>( ), It.IsAny<RedisValue>( ), It.IsAny<int?>( ), It.IsAny<CommandFlags>( ) ) )
+            .ThrowsAsync( new RedisServerException( "ERR unknown command 'XAUTOCLAIM'" ) );
+        _ = _dbMock.Setup( d => d.StreamReadGroupAsync(
+                It.IsAny<RedisKey>( ), It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue?>( ), It.IsAny<int?>( ), It.IsAny<bool>( ),
+                It.IsAny<TimeSpan?>( ), It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( Array.Empty<StreamEntry>( ) );
+
+        IReadOnlyList<QueuedMessage<QueuedLookupRequest>> result =
+            await CreateHelper( ).DequeueTrackIdBatchAsync( 10, TestContext.CancellationToken );
+
+        Assert.IsEmpty( result );
+    }
+
+    /// <summary>Permission errors from XAUTOCLAIM propagate instead of being mislabeled unsupported.</summary>
+    [TestMethod]
+    public async Task BulkDequeue_WhenAutoClaimIsForbidden_PropagatesRedisError( ) {
+        _ = _dbMock.Setup( d => d.StreamAutoClaimAsync(
+                It.IsAny<RedisKey>( ), It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<long>( ), It.IsAny<RedisValue>( ), It.IsAny<int?>( ), It.IsAny<CommandFlags>( ) ) )
+            .ThrowsAsync( new RedisServerException( "NOPERM this user has no permissions" ) );
+
+        _ = await Assert.ThrowsAsync<RedisServerException>(
+            ( ) => CreateHelper( ).DequeueTrackIdBatchAsync( 10, TestContext.CancellationToken ) );
+    }
+
+    /// <summary>XAUTOCLAIM receives only the budget left after own-consumer PEL recovery.</summary>
+    [TestMethod]
+    public async Task BulkDequeue_AutoClaimCountUsesRemainingBudget( ) {
+        StreamEntry ownPending = BuildStreamEntry( MakeTrackRequest( TestTrackId ) );
+        _ = _dbMock.Setup( d => d.StreamReadGroupAsync(
+                (RedisKey)TrackStream, It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.Is<RedisValue?>( position => position.HasValue && position.Value == "0-0" ),
+                It.IsAny<int?>( ), It.IsAny<bool>( ), It.IsAny<TimeSpan?>( ), It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( [ownPending] );
+
+        _ = await CreateHelper( ).DequeueTrackIdBatchAsync( 5, TestContext.CancellationToken );
+
+        _dbMock.Verify( d => d.StreamAutoClaimAsync(
+            (RedisKey)TrackStream,
+            It.IsAny<RedisValue>( ),
+            It.IsAny<RedisValue>( ),
+            It.IsAny<long>( ),
+            It.IsAny<RedisValue>( ),
+            4,
+            It.IsAny<CommandFlags>( ) ), Times.Once );
+    }
+
+    /// <summary>Redis read failures propagate while closing the specialized dequeue span.</summary>
+    [TestMethod]
+    public async Task SpotifyBulkDequeue_ReadGroupFailure_EmitsScopedErrorTelemetry( ) {
+        _ = _dbMock.Setup( d => d.StreamReadGroupAsync(
+                It.IsAny<RedisKey>( ), It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<RedisValue?>( ), It.IsAny<int?>( ), It.IsAny<bool>( ),
+                It.IsAny<TimeSpan?>( ), It.IsAny<CommandFlags>( ) ) )
+            .ThrowsAsync( new RedisServerException( "READONLY" ) );
+        List<Activity> spans = [];
+        using ActivityListener listener = new( ) {
+            ShouldListenTo = source => source.Name == QueueMetrics.MeterName,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+            ActivityStopped = activity => spans.Add( activity )
+        };
+        ActivitySource.AddActivityListener( listener );
+
+        _ = await Assert.ThrowsAsync<RedisServerException>(
+            ( ) => CreateHelper( ).DequeueTrackIdBatchAsync( 10, TestContext.CancellationToken ) );
+
+        Assert.Contains( activity => activity.OperationName == "queue.spotify.dequeue.pel_scan", spans );
+        Assert.IsGreaterThan( TimeSpan.Zero,
+            spans.Single( activity => activity.OperationName == "queue.spotify.dequeue.pel_scan" ).Duration );
+    }
+
+    /// <summary>XAUTOCLAIM deleted IDs are counted once as missing PEL entries.</summary>
+    [TestMethod]
+    public async Task SpotifyBulkDequeue_DeletedAutoClaimIds_EmitMissingPelCount( ) {
+        ConstructorInfo ctor = typeof( StreamAutoClaimResult )
+            .GetConstructors( BindingFlags.NonPublic | BindingFlags.Instance )[0];
+        StreamAutoClaimResult result = (StreamAutoClaimResult)ctor.Invoke(
+            [(RedisValue)"0-0", Array.Empty<StreamEntry>( ), new[] { (RedisValue)"1-0", (RedisValue)"2-0" } ] );
+        _ = _dbMock.Setup( d => d.StreamAutoClaimAsync(
+                It.IsAny<RedisKey>( ), It.IsAny<RedisValue>( ), It.IsAny<RedisValue>( ),
+                It.IsAny<long>( ), It.IsAny<RedisValue>( ), It.IsAny<int?>( ), It.IsAny<CommandFlags>( ) ) )
+            .ReturnsAsync( result );
+
+        int missing = 0;
+        using MeterListener listener = new( );
+        listener.InstrumentPublished = ( instrument, sub ) => {
+            if (instrument.Name == "bridgebeats.queue.dequeue.pel_scan.entries") sub.EnableMeasurementEvents( instrument );
+        };
+        listener.SetMeasurementEventCallback<long>( ( _, _, tags, _ ) => {
+            foreach (KeyValuePair<string, object?> tag in tags) {
+                if (tag.Key == "outcome" && tag.Value?.ToString( ) == "missing") missing++;
+            }
+        } );
+        listener.Start( );
+
+        _ = await CreateHelper( ).DequeueTrackIdBatchAsync( 10, TestContext.CancellationToken );
+
+        Assert.AreEqual( 2, missing );
+    }
+
+    /// <summary>Verifies decorated Spotify queues expose the generic consumer-group repair capability.</summary>
+    [TestMethod]
+    public async Task Decorator_EnsureConsumerGroups_DelegatesToInnerCapability( ) {
+        AssuringQueue inner = new( );
+        SpotifyBulkQueueDecorator decorator = new( inner, _redisMock.Object, _decoratorLoggerMock.Object );
+
+        await decorator.EnsureConsumerGroupsAsync( TestContext.CancellationToken );
+
+        Assert.AreEqual( 1, inner.EnsureCalls );
+    }
+
+    private sealed class AssuringQueue : IRequestQueue<QueuedLookupRequest>, IConsumerGroupAssurance {
+        public int EnsureCalls { get; private set; }
+        public Task EnsureConsumerGroupsAsync( CancellationToken cancellationToken = default ) {
+            EnsureCalls++;
+            return Task.CompletedTask;
+        }
+        public Task EnqueueAsync( QueuedLookupRequest request, QueuePriority priority, CancellationToken cancellationToken = default ) => Task.CompletedTask;
+        public Task<QueuedMessage<QueuedLookupRequest>?> DequeueAsync( CancellationToken cancellationToken = default ) => Task.FromResult<QueuedMessage<QueuedLookupRequest>?>( null );
+        public Task<QueuedMessage<QueuedLookupRequest>?> DequeueAsync( IRateLimitTracker rateLimitTracker, CancellationToken cancellationToken = default ) => Task.FromResult<QueuedMessage<QueuedLookupRequest>?>( null );
+        public Task AcknowledgeAsync( string messageId, CancellationToken cancellationToken = default ) => Task.CompletedTask;
+        public Task RequeueAsync( string messageId, TimeSpan? delay = null, CancellationToken cancellationToken = default ) => Task.CompletedTask;
+        public Task<QueueDepth> GetDepthAsync( CancellationToken cancellationToken = default ) => Task.FromResult( new QueueDepth( 0, 0, 0, 0 ) );
+        public Task<IReadOnlyList<QueuedMessage<QueuedLookupRequest>>> GetDlqMessagesAsync( int limit, CancellationToken cancellationToken = default ) => Task.FromResult<IReadOnlyList<QueuedMessage<QueuedLookupRequest>>>( [] );
+        public Task RequeueFromDlqAsync( string messageId, QueuePriority priority, CancellationToken cancellationToken = default ) => Task.CompletedTask;
+        public Task MoveToDlqAsync( string messageId, string reason, CancellationToken cancellationToken = default ) => Task.CompletedTask;
+        public Task<bool> DeleteFromDlqAsync( string messageId, CancellationToken cancellationToken = default ) => Task.FromResult( true );
+    }
 
     /// <summary>
     /// Builds a Spotify song-id <c>QueuedLookupRequest</c> for the given track id, priority, and
@@ -855,6 +1597,7 @@ public class SpotifyBulkFlushTests {
         LookupType = LookupRequestType.SongIdLookup,
         LookupValue = trackId,
         SagaId = TestSagaId,
+        SagaInstanceToken = "test-instance",
         IsAlbum = false,
         OriginPriority = priority,
         AttemptCount = attemptCount
@@ -878,6 +1621,7 @@ public class SpotifyBulkFlushTests {
         LookupType = LookupRequestType.AlbumIdLookup,
         LookupValue = albumId,
         SagaId = TestSagaId,
+        SagaInstanceToken = "test-instance",
         IsAlbum = true,
         OriginPriority = priority,
         AttemptCount = attemptCount
@@ -889,13 +1633,14 @@ public class SpotifyBulkFlushTests {
     /// dequeue and requeue paths.
     /// </summary>
     /// <param name="request">The request to embed as the entry payload.</param>
+    /// <param name="id">The Redis stream entry id.</param>
     /// <returns>A stream entry carrying the serialized request and an enqueue timestamp.</returns>
-    private static StreamEntry BuildStreamEntry( QueuedLookupRequest request ) {
+    private static StreamEntry BuildStreamEntry( QueuedLookupRequest request, string id = "1234567890-0" ) {
         string payload = System.Text.Json.JsonSerializer.Serialize( request, s_jsonOptions );
         NameValueEntry[] fields = [
             new NameValueEntry( "payload", payload ),
             new NameValueEntry( "enqueuedAt", DateTimeOffset.UtcNow.ToString( "O" ) )
         ];
-        return new StreamEntry( (RedisValue)"1234567890-0", fields );
+        return new StreamEntry( (RedisValue)id, fields );
     }
 }

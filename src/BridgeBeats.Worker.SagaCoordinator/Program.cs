@@ -31,11 +31,32 @@ public static class Program {
 
         IHost app = builder.Build( );
 
+        LogEnabledProviders( app );
+
         try {
             app.Run( );
         } finally {
             Log.CloseAndFlush( );
         }
+    }
+
+    /// <summary>
+    /// Logs the set of providers enabled for secondary lookups once the logging pipeline is live.
+    /// Must run after <c>builder.Build()</c>: <see cref="AspireServiceExtensions.ConfigureFileLogging(IHostApplicationBuilder, string)"/>
+    /// defers Serilog logger construction to <c>Build()</c>, so a pre-Build log call would silently
+    /// hit Serilog's no-op logger instead of reaching the configured sinks.
+    /// </summary>
+    /// <param name="app">The built host whose logger factory and enabled-provider set are resolved.</param>
+    private static void LogEnabledProviders( IHost app ) {
+        ILoggerFactory loggerFactory = app.Services.GetRequiredService<ILoggerFactory>( );
+        Microsoft.Extensions.Logging.ILogger logger = loggerFactory.CreateLogger( "SagaCoordinator.Startup" );
+
+        HashSet<SupportedProviders> enabledProviders = app.Services.GetRequiredService<HashSet<SupportedProviders>>( );
+        string providersStr = enabledProviders.Count > 0
+            ? string.Join( ", ", enabledProviders )
+            : "(none)";
+
+        ProgramLog.LogEnabledProviders( logger, providersStr );
     }
 
     /// <summary>
@@ -58,7 +79,7 @@ public static class Program {
         builder.AddRedisClient( "redis" );
 
         // Lane B: Data Protection — must use the same app name and key path as Web so
-        // values encrypted in one process (Web, SagaCoordinator, CacheBootstrap) can be
+        // values encrypted in one process (Web, SagaCoordinator, Maintenance) can be
         // decrypted by any other.
         string dataProtectionKeyPath = builder.Configuration["BridgeBeats:DataProtectionKeyPath"] ?? DataProtectionExtensions.DefaultKeyPath;
         _ = builder.Services.AddBridgeBeatsDataProtection( dataProtectionKeyPath );
@@ -69,12 +90,6 @@ public static class Program {
 
         // Determine which providers are enabled based on configuration
         HashSet<SupportedProviders> enabledProviders = DetectEnabledProviders(builder);
-
-        // Log enabled providers at startup
-        string providersStr = enabledProviders.Count > 0
-            ? string.Join( ", ", enabledProviders )
-            : "(none)";
-        Log.Information( "Enabled providers for secondary lookups: {EnabledProviders}", providersStr );
 
         // Register enabled providers as a singleton
         _ = builder.Services.AddSingleton( enabledProviders );
@@ -116,7 +131,8 @@ public static class Program {
             sp.GetRequiredService<SagaResultCombiner>( ),
             sp.GetRequiredService<IProviderQueueResolver<QueuedLookupRequest>>( ),
             sp.GetRequiredService<HashSet<SupportedProviders>>( ),
-            sp.GetRequiredService<ILogger<SagaCoordinatorBackgroundService>>( )
+            sp.GetRequiredService<ILogger<SagaCoordinatorBackgroundService>>( ),
+            sp.GetRequiredService<IRefreshReviewStore>( )
         ) );
     }
 

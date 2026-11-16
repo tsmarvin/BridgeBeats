@@ -5,7 +5,6 @@ using idunno.Bluesky;
 using idunno.Bluesky.AspNet.Authentication;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
-using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Options;
 
 namespace BridgeBeats.Web.Authentication;
@@ -28,9 +27,10 @@ internal sealed class BridgeBeatsBlueskyAuthenticationHandler(
         string? cookie = Options.CookieManager.GetRequestCookie( Context, Options.Cookie.Name! );
         if (string.IsNullOrEmpty( cookie )) { return; }
 
-        byte[]? binding = Context.Features.Get<ITlsTokenBindingFeature>( )?.GetProvidedTokenBindingId( );
-        AuthenticationTicket? ticket = Options.TicketDataFormat.Unprotect( cookie,
-            binding is null ? null : Convert.ToBase64String( binding ) );
+        // RFC 8471 TLS token binding was never adopted by browsers. The ITlsTokenBindingFeature
+        // it keys on is absent on the application's current hosting path, so both this pre-check
+        // and the pinned SDK pass null as the data-protection purpose for the auth cookie.
+        AuthenticationTicket? ticket = Options.TicketDataFormat.Unprotect( cookie, null );
         DateTimeOffset now = (Options.TimeProvider ?? TimeProvider.System).GetUtcNow( );
         if (ticket is not null && ticket.Properties.ExpiresUtc is { } expires && expires > now &&
             await accountEvents.HasCurrentAccountBindingAsync( ticket, Context )) {

@@ -61,7 +61,7 @@ services:
           memory: 256M
 
   redis:
-    image: redis:8.10.2-alpine@sha256:0bf6577d7774e592b29d093e3ac9390eb91e13d72c21e506afce736de5e0eeb0
+    image: redis:8.10.3-alpine@sha256:7958cfbb9d152f87dadfbc89f1b0b15938f0b81ff8982feb327476f4911935c3
     container_name: bridgebeats-redis
     restart: unless-stopped
     networks:
@@ -104,7 +104,7 @@ services:
           memory: 64M
 
   bridgebeats-pds:
-    image: ghcr.io/bluesky-social/pds:latest@sha256:048b1ca076907bf7f271fc4ac13d4804cdf5f04ad56939bfec3fef1a18bfc757
+    image: ghcr.io/bluesky-social/pds:latest@sha256:8e58b79746da8a0e85698aa7ba9b53e508b94db2021d963653b6d1bfc14889c6
     container_name: bridgebeats-pds
     restart: unless-stopped
     networks:

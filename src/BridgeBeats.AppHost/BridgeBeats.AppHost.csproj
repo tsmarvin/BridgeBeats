@@ -5,7 +5,7 @@
     <AspireUseCliBundle>false</AspireUseCliBundle>
     <NoWarn>$(NoWarn);ASPIRE010</NoWarn>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net11.0</TargetFramework>
     <UserSecretsId>bridgebeats-apphost</UserSecretsId>
     <RepositoryUrl>https://github.com/tsmarvin/BridgeBeats</RepositoryUrl>
     <Nullable>enable</Nullable>
@@ -21,8 +21,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Aspire.Hosting.AppHost" Version="13.6.3" />
-    <PackageReference Include="Aspire.Hosting.Redis" Version="13.6.3" />
+    <PackageReference Include="Aspire.Hosting.AppHost" Version="13.6.5" />
+    <PackageReference Include="Aspire.Hosting.Redis" Version="13.6.4" />
     <PackageReference Include="MessagePack" Version="3.1.12" />
 
     <ProjectReference Include="..\BridgeBeats.Web\BridgeBeats.Web.csproj" />

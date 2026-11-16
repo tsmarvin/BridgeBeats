@@ -325,7 +325,7 @@ public class RateLimitingMiddlewareTests {
 
         // Act — run the same recovery SQL used by InitializeDatabaseAsync
         DateTime windowFloor = DateTime.UtcNow.AddHours( -1 );
-        _ = await _dbContext.Database.ExecuteSqlInterpolatedAsync(
+        _ = await _dbContext.Database.ExecuteSqlAsync(
             $@"UPDATE AspNetUsers
                SET RequestCount = 0,
                    RateLimitWindowStart = NULL
@@ -349,7 +349,7 @@ public class RateLimitingMiddlewareTests {
         Assert.IsNotNull( activeAfter.RateLimitWindowStart );
 
         // Assert — idempotency: running again produces the same result (no error, no thrash)
-        _ = await _dbContext.Database.ExecuteSqlInterpolatedAsync(
+        _ = await _dbContext.Database.ExecuteSqlAsync(
             $@"UPDATE AspNetUsers
                SET RequestCount = 0,
                    RateLimitWindowStart = NULL

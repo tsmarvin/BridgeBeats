@@ -69,16 +69,12 @@ public class PlaylistXssRenderTests : IDisposable {
     /// </summary>
     /// <param name="title">The playlist title to return from the mock service.</param>
     private void SetupFactory( string title ) {
-        Dictionary<string, string?> configData = new( ) {
-            ["BridgeBeats:DiscordToken"] = string.Empty,
-            ["BridgeBeats:Workers:UseWorkerServices"] = "false",
-            ["BridgeBeats:ATProtoIdentifier"] = string.Empty,
-            ["BridgeBeats:ATProtoPassword"] = string.Empty,
-            ["BridgeBeats:ATProtoUserDID"] = string.Empty,
-            ["BridgeBeats:Domain"] = "bridgebeats.link",
-            ["BridgeBeats:SpotifyClientId"] = "test",
-            ["BridgeBeats:SpotifyClientSecret"] = "test",
-        };
+        // The playlist service is replaced with a mock below, so the host needs a domain and one
+        // enabled provider but no real credential.
+        Dictionary<string, string?> configData = TestHostConfiguration.Isolated( );
+        configData["BridgeBeats:Domain"] = "bridgebeats.link";
+        configData["BridgeBeats:SpotifyClientId"] = "test";
+        configData["BridgeBeats:SpotifyClientSecret"] = "test";
 
         PlaylistEntryDto playlistDto = new( ) {
             PlaylistId = TestPlaylistId,

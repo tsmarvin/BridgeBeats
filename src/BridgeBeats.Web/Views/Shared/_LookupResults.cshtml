@@ -23,7 +23,7 @@
                             @if (!string.IsNullOrWhiteSpace(item.CardUrl)) {
                                 <div class="share-dropdown">
                                     <button class="share-button" type="button" aria-expanded="false" aria-haspopup="true" title="Share">
-                                        <img src="/public/Share_arrow.png" alt="Share" class="share-arrow-icon" />
+                                        <img src="~/public/Share_arrow.png" asp-append-version="true" alt="Share" class="share-arrow-icon" />
                                     </button>
                                     <ul class="dropdown-menu dropdown-menu-end">
                                         <li>
@@ -72,7 +72,7 @@
                         @foreach (var providerResult in item.Result.Results) {
                             <a href="@(ViewSecurityHelpers.IsHttpOrHttps(providerResult.Value.URL) ? providerResult.Value.URL : "#")" target="_blank" rel="noopener noreferrer" class="provider-button">
                                 <span class="provider-icon provider-icon-@providerResult.Key.ToString().ToLowerInvariant()">
-                                    @providerResult.Key.GetProviderLogo( )
+                                    @providerResult.Key.GetProviderLogo(path => FileVersionProvider.AddFileVersionToPath(Context.Request.PathBase, Url.Content("~" + path)))
                                 </span>
                                 <span class="visually-hidden">@providerResult.Key.GetDescription( )</span>
                             </a>

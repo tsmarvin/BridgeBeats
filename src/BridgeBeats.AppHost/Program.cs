@@ -84,6 +84,9 @@ IResourceBuilder<ParameterResource> internalServiceKey = builder.AddParameter( "
 // Additional configuration parameters.
 IResourceBuilder<ParameterResource> nodeNumber               = builder.AddParameter( "NodeNumber" );
 IResourceBuilder<ParameterResource> domain                   = builder.AddParameter( "Domain" );
+string? oauthSigningKeyPath = config["Parameters:ATProtoOAuthSigningKeyPath"];
+IResourceBuilder<ParameterResource> oauthTrustedProxyHost    = builder.AddParameter( "OAuthTrustedProxyHost",
+    () => config["Parameters:OAuthTrustedProxyHost"] ?? "" );
 IResourceBuilder<ParameterResource> rateLimitRequestsPerHour = builder.AddParameter( "RateLimitRequestsPerHour" );
 IResourceBuilder<ParameterResource> cacheDays                = builder.AddParameter( "CacheDays" );
 IResourceBuilder<ParameterResource> identityConnectionString = builder.AddParameter( "IdentityConnectionString" );
@@ -373,6 +376,9 @@ IResourceBuilder<ProjectResource>? bridgebeatsWebProject = null;
 
 if (isProduction) {
     bridgebeatsWebExe = AddProductionExecutable( "bridgebeats", "BridgeBeats.Web", workingDirectory: "/src/BridgeBeats.Web" );
+    if (!string.IsNullOrWhiteSpace( oauthSigningKeyPath )) {
+        _ = bridgebeatsWebExe.WithEnvironment( "BridgeBeats__ATProtoOAuthSigningKeyPath", oauthSigningKeyPath );
+    }
     _ = bridgebeatsWebExe
         .WithHttpEndpoint( port: 10000, targetPort: 10000, name: "bridgebeats-http", isProxied: false )
         .WithEnvironment( "ASPNETCORE_HTTP_PORTS", "10000" )
@@ -387,6 +393,7 @@ if (isProduction) {
         .WithEnvironment( "BridgeBeats__ApiKeySalt", apiKeySalt )
         .WithEnvironment( "BridgeBeats__InternalServiceKey", internalServiceKey )
         .WithEnvironment( "BridgeBeats__Domain", domain )
+        .WithEnvironment( "BridgeBeats__OAuthTrustedProxyHost", oauthTrustedProxyHost )
         .WithEnvironment( "BridgeBeats__RateLimitRequestsPerHour", rateLimitRequestsPerHour )
         .WithEnvironment( "BridgeBeats__CacheDays", cacheDays )
         .WithEnvironment( "BridgeBeats__IdentityConnectionString", identityConnectionString )
@@ -402,6 +409,9 @@ if (isProduction) {
 } else {
     bridgebeatsWebProject = builder.AddProject<Projects.BridgeBeats_Web>( "bridgebeats" )
         .WithHttpEndpoint( port: 10000, targetPort: 10000, name: "bridgebeats-http", isProxied: false );
+    if (!string.IsNullOrWhiteSpace( oauthSigningKeyPath )) {
+        _ = bridgebeatsWebProject.WithEnvironment( "BridgeBeats__ATProtoOAuthSigningKeyPath", oauthSigningKeyPath );
+    }
     _ = bridgebeatsWebProject
         .WithReference( redis )
         .WithEnvironment( "ASPNETCORE_HTTP_PORTS", "10000" )
@@ -416,6 +426,7 @@ if (isProduction) {
         .WithEnvironment( "BridgeBeats__ApiKeySalt", apiKeySalt )
         .WithEnvironment( "BridgeBeats__InternalServiceKey", internalServiceKey )
         .WithEnvironment( "BridgeBeats__Domain", domain )
+        .WithEnvironment( "BridgeBeats__OAuthTrustedProxyHost", oauthTrustedProxyHost )
         .WithEnvironment( "BridgeBeats__RateLimitRequestsPerHour", rateLimitRequestsPerHour )
         .WithEnvironment( "BridgeBeats__CacheDays", cacheDays )
         .WithEnvironment( "BridgeBeats__IdentityConnectionString", identityConnectionString )

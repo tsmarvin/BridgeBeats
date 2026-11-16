@@ -1,17 +1,15 @@
 using System.Security.Cryptography;
-using System.Text.Json;
 using BridgeBeats.Core.Infrastructure.Identity;
 
 namespace BridgeBeats.Tests.Unit;
 
 /// <summary>
 /// Tests <see cref="ATProtoSigningKeyProvider"/>, which loads a P-256 ECDSA client-assertion signing
-/// key from a JWK, validates it, and exposes the key plus its public JWKS projection.
+/// key from a JWK and validates it.
 /// </summary>
 /// <remarks>
 /// The tests cover JWK validation (key type must be EC, curve P-256, with the private <c>d</c>
-/// parameter and a <c>kid</c> present), the public JWKS output (which advertises ES256 for signing and
-/// must omit the private <c>d</c> parameter), key generation, signing round-trips, and idempotent
+/// parameter and a <c>kid</c> present), key generation, signing round-trips, and idempotent
 /// disposal.
 /// </remarks>
 [TestClass]
@@ -28,7 +26,7 @@ public class ATProtoSigningKeyProviderTests {
 
     /// <summary>
     /// Verifies that constructing the provider from a valid JWK exposes a non-null signing key, key id,
-    /// and public <c>x</c>/<c>y</c> coordinates.
+    /// and a usable public key.
     /// </summary>
     [TestMethod]
     public void Constructor_WithValidJwk_ShouldCreateInstance( ) {
@@ -41,8 +39,9 @@ public class ATProtoSigningKeyProviderTests {
         // Assert
         Assert.IsNotNull( provider.SigningKey );
         Assert.IsNotNull( provider.KeyId );
-        Assert.IsNotNull( provider.PublicKeyX );
-        Assert.IsNotNull( provider.PublicKeyY );
+        ECParameters publicKey = provider.SigningKey.ExportParameters( false );
+        Assert.IsNotNull( publicKey.Q.X );
+        Assert.IsNotNull( publicKey.Q.Y );
     }
 
     /// <summary>Verifies that a null JWK argument throws <see cref="ArgumentNullException"/>.</summary>
@@ -95,65 +94,6 @@ public class ATProtoSigningKeyProviderTests {
     public void Constructor_WithMissingKid_ShouldThrow( ) {
         string invalidJwk = """{"kty":"EC","crv":"P-256","x":"abc","y":"def","d":"ghi"}""";
         _ = Assert.ThrowsExactly<ArgumentException>( ( ) => new ATProtoSigningKeyProvider( invalidJwk ) );
-    }
-
-    /// <summary>
-    /// Verifies that <see cref="ATProtoSigningKeyProvider.GetPublicJwks"/> returns a JWKS containing a
-    /// single EC/P-256 key advertised for ES256 signing (<c>use=sig</c>) with <c>x</c>/<c>y</c>/<c>kid</c>
-    /// present, and crucially that the private <c>d</c> parameter is absent from the published key.
-    /// </summary>
-    [TestMethod]
-    public void GetPublicJwks_ShouldReturnValidJson_WithoutPrivateKey( ) {
-        // Arrange
-        string jwk = CreateTestSigningKeyJwk( );
-        using ATProtoSigningKeyProvider provider = new( jwk );
-
-        // Act
-        string jwksJson = provider.GetPublicJwks( );
-
-        // Assert
-        Assert.IsNotNull( jwksJson );
-
-        using JsonDocument doc = JsonDocument.Parse( jwksJson );
-        JsonElement root = doc.RootElement;
-
-        // Verify it has the 'keys' array
-        Assert.IsTrue( root.TryGetProperty( "keys", out JsonElement keysArray ) );
-        Assert.AreEqual( JsonValueKind.Array, keysArray.ValueKind );
-        Assert.AreEqual( 1, keysArray.GetArrayLength( ) );
-
-        // Verify the key properties
-        JsonElement key = keysArray[0];
-        Assert.AreEqual( "EC", key.GetProperty( "kty" ).GetString( ) );
-        Assert.AreEqual( "P-256", key.GetProperty( "crv" ).GetString( ) );
-        Assert.AreEqual( "ES256", key.GetProperty( "alg" ).GetString( ) );
-        Assert.AreEqual( "sig", key.GetProperty( "use" ).GetString( ) );
-        Assert.IsNotNull( key.GetProperty( "x" ).GetString( ) );
-        Assert.IsNotNull( key.GetProperty( "y" ).GetString( ) );
-        Assert.IsNotNull( key.GetProperty( "kid" ).GetString( ) );
-
-        // CRITICAL: Verify no private key 'd' parameter is present
-        Assert.IsFalse( key.TryGetProperty( "d", out _ ), "Public JWKS must not contain private key parameter 'd'" );
-    }
-
-    /// <summary>
-    /// Verifies that the <c>kid</c> in the published JWKS matches the provider's
-    /// <see cref="ATProtoSigningKeyProvider.KeyId"/>, so consumers can correlate the published key with
-    /// the one used to sign.
-    /// </summary>
-    [TestMethod]
-    public void GetPublicJwks_Kid_ShouldMatchProviderKeyId( ) {
-        // Arrange
-        string jwk = CreateTestSigningKeyJwk( );
-        using ATProtoSigningKeyProvider provider = new( jwk );
-
-        // Act
-        string jwksJson = provider.GetPublicJwks( );
-
-        // Assert
-        using JsonDocument doc = JsonDocument.Parse( jwksJson );
-        string? kid = doc.RootElement.GetProperty( "keys" )[0].GetProperty( "kid" ).GetString( );
-        Assert.AreEqual( provider.KeyId, kid );
     }
 
     /// <summary>

@@ -10,19 +10,20 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>@title - BridgeBeats</title>
-    <link rel="stylesheet" href="~/public/docfx.min.css">
-    <link rel="stylesheet" href="~/public/main.css">
-    <link rel="stylesheet" href="~/public/BridgeBeats.styles.css">
-    <script src="~/public/bootstrap.bundle.min.js" defer></script>
-    <script src="~/public/antiforgery.js"></script>
-    <script src="~/public/share-buttons.js"></script>
+    <link rel="icon" href="~/favicon.ico" asp-append-version="true" />
+    <link rel="stylesheet" href="~/public/docfx.min.css" asp-append-version="true">
+    <link rel="stylesheet" href="~/public/main.css" asp-append-version="true">
+    <link rel="stylesheet" href="~/public/BridgeBeats.styles.css" asp-append-version="true">
+    <script src="~/public/bootstrap.bundle.min.js" asp-append-version="true" defer></script>
+    <script src="~/public/antiforgery.js" asp-append-version="true"></script>
+    <script src="~/public/share-buttons.js" asp-append-version="true"></script>
     <script nonce="@cspNonce">
         // FOUC mitigation: Apply theme before page render
         // Keep this theme resolution synchronized with _Header.cshtml.
         const theme = localStorage.getItem('theme') || 'auto'
         document.documentElement.setAttribute('data-bs-theme', theme === 'auto' ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : theme)
     </script>
-    <script src="~/public/playlist-manager.js"></script>
+    <script src="~/public/playlist-manager.js" asp-append-version="true"></script>
 </head>
 
 <body class="tex2jax_ignore" data-layout="">

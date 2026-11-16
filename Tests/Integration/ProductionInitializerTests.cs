@@ -297,7 +297,12 @@ public class ProductionInitializerTests {
         // lower-level entry point: genre cache + Redis client + the internal service-graph overload.
         _ = builder.Services.AddGenreCache( );
         builder.AddRedisClient( "redis" );
-        _ = builder.WebHost.ConfigureBridgeBeatsServices( builder.Services, builder.Configuration );
+        _ = builder.WebHost.ConfigureBridgeBeatsServices(
+            builder.Services,
+            builder.Configuration,
+            // Testing environment uses relaxed authentication configuration, mirroring
+            // StartupExtensions.RequiresStrictAuthConfiguration.
+            failFastOnInvalidAuthConfiguration: false );
 
         return builder.Build( );
     }

@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Security.Claims;
 using System.Text.Encodings.Web;
+using BridgeBeats.Contracts.Enums;
 using BridgeBeats.Contracts.Records;
 using BridgeBeats.Core.Infrastructure.Identity;
 using Microsoft.AspNetCore.Authentication;
@@ -35,6 +36,8 @@ public class AppleMusicPlaylistValidationTests : IDisposable {
     private AppleMusicTestWebApplicationFactory? _factory;
     /// <summary>The HTTP client connected to the test host.</summary>
     private HttpClient? _client;
+    /// <summary>The generated Apple Music signing key enabling provider registration; deleted on cleanup.</summary>
+    private TestHostConfiguration.GeneratedAppleSigningKey? _appleSigningKey;
 
     /// <summary>The MSTest-injected test context.</summary>
     public TestContext TestContext { get; set; } = null!;
@@ -45,25 +48,20 @@ public class AppleMusicPlaylistValidationTests : IDisposable {
     /// </summary>
     [TestInitialize]
     public async Task Setup( ) {
-        IConfigurationRoot configuration = new ConfigurationBuilder()
-            .AddJsonFile( Path.Combine( "src", "BridgeBeats.Web", "appsettings.json" ), optional: true )
-            .AddUserSecrets<Web.Program>( optional: true )
-            .AddEnvironmentVariables()
-            .Build();
-
-        Dictionary<string, string?> configData = configuration
-            .AsEnumerable()
-            .Where( kv => kv.Value is not null )
-            .Where( kv => !kv.Key.EndsWith( "ConnectionString", StringComparison.OrdinalIgnoreCase ) )
-            .ToDictionary();
-
-        configData["BridgeBeats:DiscordToken"] = string.Empty;
-        configData["BridgeBeats:Workers:UseWorkerServices"] = "false";
-        configData["BridgeBeats:ATProtoIdentifier"] = string.Empty;
-        configData["BridgeBeats:ATProtoPassword"] = string.Empty;
-        configData["BridgeBeats:ATProtoUserDID"] = string.Empty;
+        // These tests assert request validation, authorization, and the absence of an outbound Apple
+        // call — never an authenticated Apple request. They therefore need Apple Music registered, not
+        // an Apple account: a locally generated signing key enables the provider through the same
+        // registration path a production key uses, so the security assertions run everywhere instead
+        // of being skipped on machines without Apple credentials.
+        Dictionary<string, string?> configData = TestHostConfiguration.Isolated( );
+        _appleSigningKey = new TestHostConfiguration.GeneratedAppleSigningKey( configData );
 
         _factory = new AppleMusicTestWebApplicationFactory( configData );
+        // The settings above are supplied by this fixture, so the provider must register. A host that
+        // does not register it fails here rather than skipping: this class carries the injection
+        // validation assertions for the token-bearing playlist URL, and a silently not-run suite would
+        // report that coverage as present.
+        TestHostConfiguration.RequireRegistered( _factory.Services, SupportedProviders.AppleMusic );
         _factory.SetTestUser( "test-user-id", "appleMusicTest@example.com" );
         _client = _factory.CreateClient( );
         _client.DefaultRequestHeaders.Authorization =
@@ -95,6 +93,9 @@ public class AppleMusicPlaylistValidationTests : IDisposable {
             _factory.Dispose( );
             _factory = null;
         }
+
+        _appleSigningKey?.Dispose( );
+        _appleSigningKey = null;
 
         GC.SuppressFinalize( this );
     }

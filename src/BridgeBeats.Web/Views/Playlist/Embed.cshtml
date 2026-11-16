@@ -12,6 +12,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>@Model.Title</title>
+    <link rel="icon" href="~/favicon.ico" asp-append-version="true" />
 
     <script nonce="@cspNonce">
         (function () {
@@ -353,7 +354,7 @@
                                    rel="noopener noreferrer"
                                    class="provider-button provider-@provider.ToString().ToLowerInvariant()"
                                    title="@provider.GetDescription()">
-                                    @provider.GetProviderIcon()
+                                    @provider.GetProviderIcon(path => FileVersionProvider.AddFileVersionToPath(Context.Request.PathBase, Url.Content("~" + path)))
                                     <span class="visually-hidden">@provider.GetDescription()</span>
                                 </a>
                             }

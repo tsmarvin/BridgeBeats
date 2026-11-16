@@ -1,4 +1,3 @@
-using System.Net;
 using System.Security.Cryptography;
 using System.Text.Json;
 using AspNetCore.Authentication.ApiKey;
@@ -13,8 +12,9 @@ using BridgeBeats.Core.Infrastructure.Storage;
 using BridgeBeats.Web.Authentication;
 using BridgeBeats.Web.Middleware;
 using BridgeBeats.Web.Services;
-using idunno.Security;
+using idunno.Bluesky.AspNet.Authentication;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.FileProviders;
@@ -63,11 +63,23 @@ namespace BridgeBeats.Web.Configuration {
 
             _ = builder.WebHost.ConfigureBridgeBeatsServices(
                 builder.Services,
-                builder.Configuration
+                builder.Configuration,
+                RequiresStrictAuthConfiguration( builder.Environment )
             );
 
             return builder;
         }
+
+        /// <summary>
+        /// Reports whether the environment must fail fast on invalid authentication configuration.
+        /// Only Development and Testing may start with a relaxed authentication configuration; every
+        /// other deployed environment name, including Staging, fails fast so a deployment cannot
+        /// silently ship without Bluesky sign-in.
+        /// </summary>
+        /// <param name="environment">The host environment being configured.</param>
+        /// <returns><c>true</c> when invalid authentication configuration stops startup.</returns>
+        internal static bool RequiresStrictAuthConfiguration( IHostEnvironment environment ) =>
+            !environment.IsDevelopment( ) && environment.EnvironmentName != "Testing";
 
         /// <summary>
         /// Registers the BridgeBeats service graph against the supplied service collection from within a
@@ -77,13 +89,15 @@ namespace BridgeBeats.Web.Configuration {
         /// <param name="builder">The web host builder being configured.</param>
         /// <param name="services">The service collection to populate.</param>
         /// <param name="config">The configuration used to bind settings.</param>
+        /// <param name="failFastOnInvalidAuthConfiguration">Whether invalid authentication configuration stops startup.</param>
         /// <returns>The same <paramref name="builder"/> instance, to allow call chaining.</returns>
         internal static TBuilder ConfigureBridgeBeatsServices<TBuilder>(
             this TBuilder builder,
             IServiceCollection services,
-            IConfiguration config
+            IConfiguration config,
+            bool failFastOnInvalidAuthConfiguration
         ) where TBuilder : IWebHostBuilder {
-            _ = AddBridgeBeatsServices( services, config );
+            _ = AddBridgeBeatsServices( services, config, failFastOnInvalidAuthConfiguration );
             return builder;
         }
 
@@ -94,11 +108,13 @@ namespace BridgeBeats.Web.Configuration {
         /// </summary>
         /// <param name="services">The service collection to populate.</param>
         /// <param name="config">The configuration used to bind the <c>BridgeBeats</c> settings section.</param>
+        /// <param name="failFastOnInvalidAuthConfiguration">Whether invalid authentication configuration stops startup.</param>
         /// <returns>The same <paramref name="services"/> instance, to allow call chaining.</returns>
         /// <exception cref="InvalidOperationException">Thrown when no music providers can be enabled from the configured settings.</exception>
         internal static IServiceCollection AddBridgeBeatsServices(
             this IServiceCollection services,
-            IConfiguration config
+            IConfiguration config,
+            bool failFastOnInvalidAuthConfiguration = false
         ) {
             // Add services to the container.
             _ = services
@@ -111,6 +127,24 @@ namespace BridgeBeats.Web.Configuration {
 
             AppSettings settings = new( );
             config.GetRequiredSection( "BridgeBeats" ).Bind( settings );
+            AuthenticationOrigin? origin;
+            string? disabledReason = null;
+            try {
+                origin = AuthenticationOrigin.Parse( settings.Domain );
+            } catch (InvalidOperationException ex) when (!failFastOnInvalidAuthConfiguration) {
+                origin = null;
+                disabledReason = ex.Message;
+            }
+            bool blueskyEnabled = origin is not null &&
+                                  !string.IsNullOrWhiteSpace( settings.ATProtoOAuthSigningKeyPath );
+            if (failFastOnInvalidAuthConfiguration && origin is not null && !blueskyEnabled) {
+                throw new InvalidOperationException(
+                    "BridgeBeats:ATProtoOAuthSigningKeyPath is required when Bluesky sign-in is enabled in production." );
+            }
+            if (origin is not null && !blueskyEnabled) {
+                disabledReason = "BridgeBeats:ATProtoOAuthSigningKeyPath is not configured.";
+            }
+            _ = services.AddSingleton( new AuthenticationFeatureState( origin, blueskyEnabled, disabledReason ) );
 
             // Common singletons and caching
             _ = services.AddSingleton( new JsonSerializerOptions { WriteIndented = true } );
@@ -128,12 +162,12 @@ namespace BridgeBeats.Web.Configuration {
             } );
 
             ConfigureDatabases( services, settings );
-            ConfigureIdentity( services, settings );
-            ConfigureApiKeyAuth( services, settings );
+            ConfigureIdentity( services, settings, origin );
+            ConfigureApiKeyAuth( services, settings, blueskyEnabled );
             ConfigureSwagger( services );
 
             // Optional ATProto storage and cache services
-            ConfigureATProtoIfEnabled( services, settings );
+            ConfigureATProtoIfEnabled( services, settings, origin, blueskyEnabled );
 
             // Provider registrations (Apple/Spotify/Tidal)
             HashSet<SupportedProviders> enabledProviders = RegisterMusicProviders( services, settings );
@@ -177,6 +211,10 @@ namespace BridgeBeats.Web.Configuration {
 
             AppSettings settings = new( );
             config.GetRequiredSection( "BridgeBeats" ).Bind( settings );
+            AuthenticationFeatureState authentication = app.Services.GetRequiredService<AuthenticationFeatureState>( );
+            if (!app.Environment.IsProduction( ) && authentication.DisabledReason is { } reason) {
+                app.Logger.LogWarning( "Bluesky sign-in is disabled: {Reason}", reason );
+            }
 
             // Skip database initialization in Testing environment - tests will configure their own databases
             // via WebApplicationFactory.ConfigureServices which replaces the DbContext factories
@@ -192,6 +230,10 @@ namespace BridgeBeats.Web.Configuration {
             if (!app.Environment.IsDevelopment( )) {
                 _ = app.UseExceptionHandler( "/Home/Error" );
                 _ = app.UseHsts( );
+            }
+
+            if (authentication.BlueskyEnabled) {
+                _ = app.UseBlueskyOAuthClientMetadata( );
             }
 
             _ = app.UseHttpsRedirection( );
@@ -267,8 +309,12 @@ namespace BridgeBeats.Web.Configuration {
                 await next( );
             } );
 
-            _ = app.UseStaticFiles( ); // Serve static files from wwwroot
+            _ = app.UseStaticFiles( );
             _ = app.UseRouting( );
+            if (authentication.BlueskyEnabled) {
+                _ = app.UseCanonicalAuthenticationOrigin( authentication.Origin );
+                _ = app.UseRateLimiter( );
+            }
 
             // Restrict liveness endpoint access to internal requests only
             // NOTE: This middleware is intentionally placed before authentication because it uses IP-based authorization
@@ -304,8 +350,15 @@ namespace BridgeBeats.Web.Configuration {
 
         /// <summary>
         /// Layers the configuration sources in precedence order: the required <c>appsettings.json</c> file,
-        /// optional user secrets, command-line arguments, and environment variables.
+        /// optional user secrets, environment variables, and finally command-line arguments.
         /// </summary>
+        /// <remarks>
+        /// Command-line arguments are added last so they take precedence over the environment. The
+        /// in-memory test host supplies the entries it needs the application to honor as host
+        /// configuration, which the test infrastructure replays as command-line arguments; if the
+        /// environment were layered on top instead, a developer's own machine-level credentials would
+        /// silently override them. Explicit command-line arguments still win over everything else.
+        /// </remarks>
         /// <param name="config">The configuration builder to populate.</param>
         /// <param name="args">The command-line arguments to add as a configuration source.</param>
         /// <returns>The same <paramref name="config"/> instance, to allow call chaining.</returns>
@@ -319,14 +372,13 @@ namespace BridgeBeats.Web.Configuration {
                 reloadOnChange: false
             );
 
-            // Always load user secrets in non-production environments
-            // Tests use WebApplicationFactory.ConfigureAppConfiguration to inject test config
-            // which overrides user secrets values for test-specific settings
+            // Always load user secrets in non-production environments. Command-line arguments are
+            // layered above them so a deployment or a test host can override a machine's secrets.
             _ = config.AddUserSecrets<Program>( optional: true );
 
             return config
-                .AddCommandLine( args )
-                .AddEnvironmentVariables( );
+                .AddEnvironmentVariables( )
+                .AddCommandLine( args );
         }
 
         /// <summary>
@@ -423,7 +475,7 @@ namespace BridgeBeats.Web.Configuration {
 
         /// <summary>
         /// Singleton factory that injects the token protector into every <see cref="ApplicationDbContext"/>
-        /// it creates, enabling the EF value converter for the four credential columns at rest.
+        /// it creates, enabling the EF value converter for the Apple Music credential column at rest.
         /// Thread-safe: <c>CreateDbContext</c> allocates a new context per call; the shared options and
         /// protector are immutable.
         /// </summary>
@@ -450,15 +502,12 @@ namespace BridgeBeats.Web.Configuration {
         /// </summary>
         /// <param name="services">The service collection to populate.</param>
         /// <param name="settings">The settings supplying the Data Protection key path and domain.</param>
-        private static void ConfigureIdentity( IServiceCollection services, AppSettings settings ) {
-            // Use the centralized Identity configuration from Infrastructure project.
-            // This registers Data Protection (shared with workers), Identity Core, and
-            // AddPersonalDataProtection — which makes IPersonalDataProtector available for the ATProto
-            // OAuth service's OAuth-state encrypt/decrypt path. The four credential columns
-            // (AppleMusicUserToken, AtProtoAccessToken, AtProtoRefreshToken, AtProtoDPoPKey) are
-            // encrypted separately via the EF value converter in ApplicationDbContext.OnModelCreating
-            // using a dedicated IDataProtector with purpose BridgeBeats.ApplicationUser.Tokens.v1 —
-            // not via [ProtectedPersonalData], which has been removed from those fields.
+        internal static void ConfigureIdentity( IServiceCollection services, AppSettings settings ) =>
+            ConfigureIdentity( services, settings, AuthenticationOrigin.Parse( settings.Domain ) );
+
+        private static void ConfigureIdentity( IServiceCollection services, AppSettings settings, AuthenticationOrigin? origin ) {
+            // Identity and SDK OAuth stores share the persisted Data Protection key ring.
+            // ApplicationDbContext separately encrypts the Apple Music user token.
             _ = services.AddBridgeBeatsIdentity( settings.DataProtectionKeyPath );
 
             _ = services.ConfigureApplicationCookie( options => {
@@ -466,46 +515,36 @@ namespace BridgeBeats.Web.Configuration {
                 options.Cookie.SameSite = SameSiteMode.Lax;
                 options.Cookie.HttpOnly = true;
 
-                string domain = settings.Domain.Trim().TrimStart('.').TrimEnd('.');
-                if (ShouldSetCookieDomain( domain )) {
-                    options.Cookie.Domain = $".{domain}";
+                options.Cookie.Domain = origin?.CookieDomain;
+                // A scheme, port or trailing slash made the previous release issue host-only cookies. Give these
+                // installations a new cookie name so old tickets on alias hosts cannot survive logout.
+                if (origin?.CookieDomain is not null &&
+                    (settings.Domain?.Contains( ':' ) == true || settings.Domain?.Contains( '/' ) == true)) {
+                    options.Cookie.Name = BlueskyAuthenticationConfiguration.UpgradedIdentityCookieName;
                 }
             } );
         }
 
         /// <summary>
-        /// Determines whether the application cookie should be scoped to a parent domain. Returns
-        /// <c>false</c> for empty values, values containing scheme, path, or port characters, <c>localhost</c>,
-        /// and bare IP addresses.
-        /// </summary>
-        /// <param name="domain">The candidate cookie domain.</param>
-        /// <returns><c>true</c> when the domain is a registrable host suitable for cookie scoping; otherwise <c>false</c>.</returns>
-        private static bool ShouldSetCookieDomain( string domain ) {
-            if (string.IsNullOrWhiteSpace( domain )) {
-                return false;
-            }
-
-            // Cookie domains must be host-only (no scheme, path, or port)
-            if (domain.Contains( "://", StringComparison.OrdinalIgnoreCase ) ||
-                domain.Contains( '/', StringComparison.Ordinal ) ||
-                domain.Contains( ':', StringComparison.Ordinal )) {
-                return false;
-            }
-
-            // Avoid forcing Domain on localhost/IPs; let the browser use host-only cookies
-            return !string.Equals( domain, "localhost", StringComparison.OrdinalIgnoreCase ) &&
-!IPAddress.TryParse( domain, out _ );
-        }
-
-        /// <summary>
         /// Registers the API-key hasher and the multi-scheme authentication policy. The policy forwards to
-        /// internal-service-key authentication when the service-key header is present, to API-key
-        /// authentication when the <c>X-API-Key</c> header is present, and otherwise to the Identity cookie.
+        /// internal-service-key authentication when its header is present, to API-key authentication when
+        /// the <c>X-API-Key</c> header is present, to Bluesky when that integration is enabled and its cookie
+        /// is present, and otherwise to the Identity cookie.
         /// </summary>
         /// <param name="services">The service collection to populate.</param>
         /// <param name="settings">The settings supplying the API-key salt and internal-service key.</param>
         /// <exception cref="InvalidOperationException">Thrown when the API-key salt is missing.</exception>
-        private static void ConfigureApiKeyAuth( IServiceCollection services, AppSettings settings ) {
+        internal static void ConfigureApiKeyAuth( IServiceCollection services, AppSettings settings ) =>
+            ConfigureApiKeyAuth(
+                services,
+                settings,
+                // Must match the enablement the host computes, including the signing key: a domain alone
+                // does not enable Bluesky, so the helper cannot drift from production behavior.
+                AuthenticationOrigin.Parse( settings.Domain ) is not null &&
+                !string.IsNullOrWhiteSpace( settings.ATProtoOAuthSigningKeyPath ) );
+
+        private static void ConfigureApiKeyAuth( IServiceCollection services, AppSettings settings, bool blueskyEnabled ) {
+
             // Configure API Key hashing
             if (string.IsNullOrWhiteSpace( settings.ApiKeySalt )) {
                 throw new InvalidOperationException( "ApiKeySalt is required in configuration for secure API key storage." );
@@ -524,7 +563,10 @@ namespace BridgeBeats.Web.Configuration {
                         ? InternalServiceDefaults.AuthenticationScheme
                         : context.Request.Headers.ContainsKey( "X-API-Key" )
                             ? ApiKeyDefaults.AuthenticationScheme
-                            : IdentityConstants.ApplicationScheme;
+                            : blueskyEnabled &&
+                              context.Request.Cookies.ContainsKey( BlueskyAuthenticationConfiguration.CookieName )
+                                ? BlueskyAuthenticationDefaults.AuthenticationScheme
+                                : IdentityConstants.ApplicationScheme;
             } )
             .AddApiKeyInHeader<ApiKeyProvider>( options => {
                 options.Realm = "BridgeBeats API";
@@ -577,51 +619,22 @@ namespace BridgeBeats.Web.Configuration {
 
         /// <summary>
         /// Wires the ATProto integration when configured. When a domain is set, registers the OAuth signing
-        /// key (if its JWK file exists and is non-empty), the SSRF-guarded OAuth HTTP client, the OAuth
-        /// service, and the OAuth state cleanup hosted service. When service-account credentials are also
-        /// present, validates the user DID and registers the session manager, storage, media-link cache,
+        /// keys, SDK authentication handler, persistent SQLite stores and generated client metadata.
+        /// When service-account credentials are also present, validates the user DID and registers the session manager, storage, media-link cache,
         /// statistics services, and queue infrastructure.
         /// </summary>
         /// <param name="services">The service collection to populate.</param>
         /// <param name="settings">The settings supplying the domain, signing key path, and ATProto credentials.</param>
-        private static void ConfigureATProtoIfEnabled( IServiceCollection services, AppSettings settings ) {
-            // Register ATProto OAuth service (available even without server ATProto credentials)
-            // This allows users to log in with Bluesky for playlist management
-            string? domainWithScheme = AppSettings.NormalizeDomain( settings.Domain );
-            if (!string.IsNullOrWhiteSpace( domainWithScheme )) {
-                string clientId = $"{domainWithScheme}/.well-known/client-metadata.json";
+        /// <param name="origin">The parsed authentication origin, when configured.</param>
+        /// <param name="blueskyEnabled">Whether Bluesky OAuth is configured.</param>
+        private static void ConfigureATProtoIfEnabled( IServiceCollection services, AppSettings settings,
+            AuthenticationOrigin? origin, bool blueskyEnabled ) {
+            // Register Bluesky sign-in even when the separate ATProto service account is not configured.
+            if (blueskyEnabled && origin is not null) {
+                string domainWithScheme = origin.Origin.GetLeftPart( UriPartial.Authority );
+                string clientId = $"{domainWithScheme}{BlueskyAuthenticationConfiguration.ClientMetadataPath}";
 
-                // Load the OAuth signing key for confidential client authentication if configured
-                ATProtoSigningKeyProvider? signingKeyProvider = null;
-                if (!string.IsNullOrWhiteSpace( settings.ATProtoOAuthSigningKeyPath ) &&
-                    File.Exists( settings.ATProtoOAuthSigningKeyPath )) {
-                    string jwkJson = File.ReadAllText( settings.ATProtoOAuthSigningKeyPath );
-                    if (!string.IsNullOrWhiteSpace( jwkJson ) && jwkJson.Trim( ) != "{}") {
-                        signingKeyProvider = new ATProtoSigningKeyProvider( jwkJson );
-                    }
-                }
-
-                // Register the signing key provider as a singleton (used by WellKnownController for JWKS endpoint)
-                if (signingKeyProvider is not null) {
-                    _ = services.AddSingleton( signingKeyProvider );
-                }
-
-                // Register HTTP client for OAuth token endpoint with standard resilience
-                _ = services.AddATProtoOAuthHttpClient( );
-
-                _ = services.AddScoped<IATProtoOAuthService>( sp =>
-                    new ATProtoOAuthService(
-                        sp.GetRequiredService<IDbContextFactory<ApplicationDbContext>>( ),
-                        sp.GetRequiredService<ILogger<ATProtoOAuthService>>( ),
-                        clientId,
-                        sp.GetRequiredService<IHttpClientFactory>( ),
-                        sp.GetRequiredService<IPersonalDataProtector>( ),
-                        signingKeyProvider
-                    )
-                );
-
-                // Register background service for cleaning up expired OAuth states
-                _ = services.AddHostedService<OAuthStateCleanupService>( );
+                _ = services.AddBridgeBeatsBluesky( settings, clientId, domainWithScheme, origin );
             }
 
             if (string.IsNullOrWhiteSpace( settings.ATProtoIdentifier ) ||
@@ -656,23 +669,6 @@ namespace BridgeBeats.Web.Configuration {
             _ = services.AddAllProviderQueues<QueuedLookupRequest>( );
             _ = services.AddScoped<IRefreshReviewDispositionService, RefreshReviewDispositionService>( );
 
-        }
-
-        // SSRF guard (default block-list): auth-server metadata + token-endpoint hosts are
-        // derived from an attacker-supplied handle on the anonymous POST account/login-atproto
-        // path, so gate outbound connects at the socket layer.
-        /// <summary>
-        /// Registers the named <c>ATProtoOAuth</c> HTTP client with an SSRF-guarded primary handler (10-second
-        /// connect timeout) and the standard resilience pipeline.
-        /// </summary>
-        /// <param name="services">The service collection to populate.</param>
-        /// <returns>The HTTP client builder for the registered client.</returns>
-        internal static IHttpClientBuilder AddATProtoOAuthHttpClient( this IServiceCollection services ) {
-            IHttpClientBuilder builder = services.AddHttpClient( "ATProtoOAuth" )
-                .ConfigurePrimaryHttpMessageHandler( ( ) =>
-                    SsrfSocketsHttpHandlerFactory.Create( connectTimeout: TimeSpan.FromSeconds( 10 ) ) );
-            _ = builder.AddStandardResilienceHandler( );
-            return builder;
         }
 
         /// <summary>
@@ -717,4 +713,6 @@ namespace BridgeBeats.Web.Configuration {
         }
 
     }
+
+    internal sealed record AuthenticationFeatureState( AuthenticationOrigin? Origin, bool BlueskyEnabled, string? DisabledReason );
 }

@@ -15,8 +15,8 @@
   <!-- Shared package dependency for ATProto records - provides AtProtoRecord base class -->
   <ItemGroup>
     <PackageReference Include="System.Formats.Cbor" Version="10.0.15" />
-    <PackageReference Include="idunno.AtProto" Version="8.0.0" />
-    <PackageReference Include="idunno.Bluesky" Version="8.0.0" />
+    <PackageReference Include="idunno.AtProto" Version="[8.0.0]" />
+    <PackageReference Include="idunno.Bluesky" Version="[8.0.0]" />
     <!-- idunno.AtProto 8.0.0 pulls Microsoft.AspNetCore.WebUtilities 10.0.0 transitively,
          which is affected by GHSA-x33c-w48q-qrgc (CVE-2026-114149, high severity DoS).
          Direct reference lifts it to the patched 10.0.15 release. -->

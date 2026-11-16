@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Reflection;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using BridgeBeats.Contracts.DTOs;
@@ -110,8 +111,9 @@ public static class ServiceExtensions {
     /// provider description.
     /// </summary>
     /// <param name="provider">The provider whose logo to render.</param>
+    /// <param name="resolveAssetUrl">An optional resolver for versioned asset URLs.</param>
     /// <returns>The logo markup as <see cref="IHtmlContent"/>.</returns>
-    public static IHtmlContent GetProviderLogo( this SupportedProviders provider ) {
+    public static IHtmlContent GetProviderLogo( this SupportedProviders provider, Func<string, string>? resolveAssetUrl = null ) {
         // Dark backgrounds need LIGHT logos, light backgrounds need DARK logos
         string darkThemeLogo = provider switch {
             SupportedProviders.AppleMusic => "/public/providerIcons/US-UK_Apple_Music_Listen_on_Lockup_RGB_wht_072720.svg",
@@ -128,6 +130,9 @@ public static class ServiceExtensions {
         };
         string alt = provider.GetDescription() + " logo";
 
+        lightThemeLogo = HtmlEncoder.Default.Encode( resolveAssetUrl?.Invoke( lightThemeLogo ) ?? lightThemeLogo );
+        darkThemeLogo = HtmlEncoder.Default.Encode( resolveAssetUrl?.Invoke( darkThemeLogo ) ?? darkThemeLogo );
+
         // Return both images with classes for CSS-based theme switching
         return new HtmlString(
             $@"<img src=""{lightThemeLogo}"" alt=""{alt}"" class=""provider-logo provider-logo-light"" />" +
@@ -141,8 +146,9 @@ public static class ServiceExtensions {
     /// description.
     /// </summary>
     /// <param name="provider">The provider whose icon to render.</param>
+    /// <param name="resolveAssetUrl">An optional resolver for versioned asset URLs.</param>
     /// <returns>The icon markup as <see cref="IHtmlContent"/>.</returns>
-    public static IHtmlContent GetProviderIcon( this SupportedProviders provider ) {
+    public static IHtmlContent GetProviderIcon( this SupportedProviders provider, Func<string, string>? resolveAssetUrl = null ) {
         // Dark backgrounds need LIGHT logos, light backgrounds need DARK logos
         string darkThemeIcon = provider switch {
             SupportedProviders.AppleMusic => "/public/providerIcons/Apple_Music_Icon_RGB_sm_073120.svg",
@@ -158,6 +164,9 @@ public static class ServiceExtensions {
             _ => "🎧"
         };
         string alt = provider.GetDescription() + " icon";
+
+        lightThemeIcon = HtmlEncoder.Default.Encode( resolveAssetUrl?.Invoke( lightThemeIcon ) ?? lightThemeIcon );
+        darkThemeIcon = HtmlEncoder.Default.Encode( resolveAssetUrl?.Invoke( darkThemeIcon ) ?? darkThemeIcon );
 
         // Return both images with classes for CSS-based theme switching
         return new HtmlString(

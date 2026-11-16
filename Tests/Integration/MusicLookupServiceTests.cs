@@ -37,33 +37,13 @@ public class MusicLookupServiceTests {
     /// <param name="_">The MSTest class context (unused).</param>
     [ClassInitialize]
     public static async Task ClassInitialize( TestContext _ ) {
-        IConfigurationRoot configuration = new ConfigurationBuilder()
-                            .AddJsonFile( Path.Combine( "src", "BridgeBeats.Web", "appsettings.json" ), optional: true )
-                                            .AddUserSecrets<Web.Program>( optional: true )
-                                            .AddEnvironmentVariables()
-                                            .Build();
-
-        // Use the same factory pattern as controller E2E tests, but feed it appsettings.json
-        Dictionary<string, string?> overrides = configuration
-         .AsEnumerable()
-         .Where(kv => kv.Value is not null) // filter nulls from section placeholders
-         .Where(kv => !kv.Key.EndsWith( "ConnectionString", StringComparison.OrdinalIgnoreCase ))
-         .ToDictionary();
-
-        // ============================================================================
-        // CRITICAL: Configure for direct provider mode (not queue-based)
-        // ============================================================================
-
-        // Disable Discord in tests
-        overrides["BridgeBeats:DiscordToken"] = string.Empty;
-
-        // Disable worker services mode - use direct provider implementations
-        overrides["BridgeBeats:Workers:UseWorkerServices"] = "false";
-
-        // Disable ATProto caching/queue mode - forces DefaultMediaLinkService (direct calls)
-        overrides["BridgeBeats:ATProtoIdentifier"] = string.Empty;
-        overrides["BridgeBeats:ATProtoPassword"] = string.Empty;
-        overrides["BridgeBeats:ATProtoUserDID"] = string.Empty;
+        // These tests resolve the real service against the live provider APIs, so the host registers
+        // providers from whatever real credentials this machine supplies. Only provider credential
+        // keys are carried over; the ambient configuration is not copied, so no unrelated setting —
+        // a stale key path, an exported worker flag — can change which providers register. When no
+        // credential is usable the deterministic settings keep the host startable, and each live test
+        // reports the missing credential before running.
+        Dictionary<string, string?> overrides = TestHostConfiguration.LiveProvidersOrDeterministic( );
 
         s_factory = new CustomWebApplicationFactory( overrides );
         s_serviceProvider = s_factory.Services;
@@ -96,6 +76,8 @@ public class MusicLookupServiceTests {
     [Timeout( 30000, CooperativeCancellation = true )] // 30 second timeout for simple ISRC lookup
     public async Task GetInfoByISRC_WithValidISRC_ShouldReturnResult( ) {
         // Arrange
+        TestHostConfiguration.RequireAnyLiveCredentials(
+            SupportedProviders.Spotify, SupportedProviders.AppleMusic, SupportedProviders.Tidal );
         IMediaLinkService mediaLinkService = s_serviceProvider.GetRequiredService<IMediaLinkService>();
         // Using a well-known ISRC for "Bohemian Rhapsody" by Queen
         string isrc = "GBUM71029604";
@@ -132,6 +114,8 @@ public class MusicLookupServiceTests {
     [Timeout( 30000, CooperativeCancellation = true )] // 30 second timeout for simple UPC lookup
     public async Task GetInfoByUPC_WithValidUPC_ShouldReturnResult( ) {
         // Arrange
+        TestHostConfiguration.RequireAnyLiveCredentials(
+            SupportedProviders.Spotify, SupportedProviders.AppleMusic, SupportedProviders.Tidal );
         IMediaLinkService mediaLinkService = s_serviceProvider.GetRequiredService<IMediaLinkService>();
         // Using a well-known UPC for "A Night at the Opera" by Queen
         string upc = "00602547202307";
@@ -168,6 +152,8 @@ public class MusicLookupServiceTests {
     [Timeout( 30000, CooperativeCancellation = true )] // 30 second timeout for title/artist search
     public async Task GetInfoByTitle_WithValidTitleAndArtist_ShouldReturnResult( ) {
         // Arrange
+        TestHostConfiguration.RequireAnyLiveCredentials(
+            SupportedProviders.Spotify, SupportedProviders.AppleMusic, SupportedProviders.Tidal );
         IMediaLinkService mediaLinkService = s_serviceProvider.GetRequiredService<IMediaLinkService>();
         string title = "Bohemian Rhapsody";
         string artist = "Queen";
@@ -202,6 +188,7 @@ public class MusicLookupServiceTests {
     [Timeout( 30000, CooperativeCancellation = true )] // 30 second timeout for URL lookup
     public async Task GetInfoByUrl_WithAppleMusicUrl_ShouldReturnResult( ) {
         // Arrange
+        TestHostConfiguration.RequireLiveCredentials( SupportedProviders.AppleMusic );
         IMediaLinkService mediaLinkService = s_serviceProvider.GetRequiredService<IMediaLinkService>();
         // Using the same Bohemian Rhapsody track but with album-only URL format
         string appleUrl = "https://music.apple.com/us/album/a-night-at-the-opera-deluxe-remastered-version/1440806041";
@@ -238,6 +225,7 @@ public class MusicLookupServiceTests {
     [Timeout( 30000, CooperativeCancellation = true )] // 30 second timeout for URL lookup
     public async Task GetInfoByUrl_WithSpotifyUrl_ShouldReturnResult( ) {
         // Arrange
+        TestHostConfiguration.RequireLiveCredentials( SupportedProviders.Spotify );
         IMediaLinkService mediaLinkService = s_serviceProvider.GetRequiredService<IMediaLinkService>();
         // Using Bohemian Rhapsody album URL
         string spotifyUrl = "https://open.spotify.com/album/6i6folBtxKV28WX3msQ4FE";
@@ -300,6 +288,7 @@ public class MusicLookupServiceTests {
     [Timeout( 30000, CooperativeCancellation = true )] // 30 second timeout for URL lookup
     public async Task GetInfoByUrl_WithTidalUrl_ShouldReturnResult( ) {
         // Arrange
+        TestHostConfiguration.RequireLiveCredentials( SupportedProviders.Tidal );
         IMediaLinkService mediaLinkService = s_serviceProvider.GetRequiredService<IMediaLinkService>();
         // Using Bohemian Rhapsody track URL on Tidal
         string tidalUrl = "https://tidal.com/track/96572657";
@@ -340,6 +329,7 @@ public class MusicLookupServiceTests {
     [Timeout( 30000, CooperativeCancellation = true )] // 30 second timeout for URL lookup
     public async Task GetInfoByUrl_WithAppleMusicChironTrack_ShouldFindOnSpotify( ) {
         // Arrange
+        TestHostConfiguration.RequireLiveCredentials( SupportedProviders.AppleMusic );
         IMediaLinkService mediaLinkService = s_serviceProvider.GetRequiredService<IMediaLinkService>();
         string appleUrl = "https://music.apple.com/us/album/chiron/1695231829?i=1695231831";
 

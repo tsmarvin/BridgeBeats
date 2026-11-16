@@ -9,13 +9,12 @@ namespace BridgeBeats.Core.Infrastructure.Identity;
 
 /// <summary>
 /// Entity Framework Core database context for the application, extending the ASP.NET Core
-/// Identity context with playlist and ATProto OAuth-state entities.
+/// Identity context with playlist entities.
 /// </summary>
 /// <param name="options">The options used to configure the context.</param>
 /// <param name="tokenProtector">
-/// An optional <see cref="IDataProtector"/> applied as an EF value converter to the four credential
-/// columns (<c>AppleMusicUserToken</c>, <c>AtProtoAccessToken</c>, <c>AtProtoRefreshToken</c>,
-/// <c>AtProtoDPoPKey</c>) so they are stored encrypted at rest. When <see langword="null"/> the
+/// An optional <see cref="IDataProtector"/> applied as an EF value converter to the Apple Music credential
+/// column (<c>AppleMusicUserToken</c>) so it is stored encrypted at rest. When <see langword="null"/> the
 /// converter is not installed — this is the design-time factory path so <c>dotnet ef migrations</c>
 /// tooling works without a key ring.
 /// </param>
@@ -41,11 +40,6 @@ public class ApplicationDbContext(
     /// Gets or sets the set of stored playlist entries, created by users or anonymously.
     /// </summary>
     public DbSet<PlaylistEntry> Playlists { get; set; }
-
-    /// <summary>
-    /// Gets or sets the set of transient ATProto OAuth state rows held during the authentication flow.
-    /// </summary>
-    public DbSet<AtProtoOAuthState> AtProtoOAuthStates { get; set; }
 
     /// <summary>
     /// Registers the <see cref="ApplicationDbContextModelCacheKeyFactory"/> so that every
@@ -90,7 +84,7 @@ public class ApplicationDbContext(
     protected override void OnModelCreating( ModelBuilder builder ) {
         base.OnModelCreating( builder );
 
-        // Lane B: encrypt the four credential columns at rest via a NULL-transparent value converter.
+        // Lane B: encrypt the Apple Music credential column at rest via a NULL-transparent value converter.
         // Applied only when a protector is supplied; the design-time factory passes null so EF tooling
         // works without a key ring. The converter is string→string (schema-transparent: column type
         // stays TEXT and the snapshot carries only an annotation, no DDL change). The indexed columns
@@ -103,18 +97,6 @@ public class ApplicationDbContext(
 
             _ = builder.Entity<ApplicationUser>( )
                 .Property( u => u.AppleMusicUserToken )
-                .HasConversion( encryptConverter );
-
-            _ = builder.Entity<ApplicationUser>( )
-                .Property( u => u.AtProtoAccessToken )
-                .HasConversion( encryptConverter );
-
-            _ = builder.Entity<ApplicationUser>( )
-                .Property( u => u.AtProtoRefreshToken )
-                .HasConversion( encryptConverter );
-
-            _ = builder.Entity<ApplicationUser>( )
-                .Property( u => u.AtProtoDPoPKey )
                 .HasConversion( encryptConverter );
         }
 
@@ -162,34 +144,6 @@ public class ApplicationDbContext(
 
             _ = entity.HasIndex( e => e.UserId );
             _ = entity.HasIndex( e => e.CreatedAt );
-            _ = entity.HasIndex( e => e.ExpiresAt );
-        } );
-
-        // Configure AtProtoOAuthState for temporary OAuth state storage
-        _ = builder.Entity<AtProtoOAuthState>( entity => {
-            _ = entity.HasKey( e => e.State );
-            _ = entity.Property( e => e.State )
-                .IsRequired( )
-                .HasMaxLength( 128 );
-            _ = entity.Property( e => e.CodeVerifier )
-                .IsRequired( )
-                .HasMaxLength( 512 );
-            _ = entity.Property( e => e.Handle )
-                .IsRequired( )
-                .HasMaxLength( 256 );
-            _ = entity.Property( e => e.Did )
-                .HasMaxLength( 128 );
-            _ = entity.Property( e => e.PdsUri )
-                .HasMaxLength( 512 );
-            _ = entity.Property( e => e.AuthorizationServerUri )
-                .HasMaxLength( 512 );
-            _ = entity.Property( e => e.DPoPKeyJwk )
-                .IsRequired( );
-            _ = entity.Property( e => e.CreatedAt )
-                .IsRequired( );
-            _ = entity.Property( e => e.ExpiresAt )
-                .IsRequired( );
-
             _ = entity.HasIndex( e => e.ExpiresAt );
         } );
     }

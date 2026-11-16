@@ -20,7 +20,7 @@
 
             <div class="share-dropdown">
                 <button class="share-button" type="button" aria-expanded="false" aria-haspopup="true" title="Share">
-                    <img src="/public/Share_arrow.png" alt="Share" class="share-arrow-icon" />
+                    <img src="~/public/Share_arrow.png" asp-append-version="true" alt="Share" class="share-arrow-icon" />
                 </button>
                 <ul class="dropdown-menu dropdown-menu-end">
                     <li>
@@ -57,7 +57,7 @@
                                     </a>
                                     <div class="share-dropdown">
                                         <button class="share-button" type="button" aria-expanded="false" aria-haspopup="true" title="Share">
-                                            <img src="/public/Share_arrow.png" alt="Share" class="share-arrow-icon" />
+                                            <img src="~/public/Share_arrow.png" asp-append-version="true" alt="Share" class="share-arrow-icon" />
                                         </button>
                                         <ul class="dropdown-menu dropdown-menu-end">
                                             <li>
@@ -96,7 +96,7 @@
                             <div class="embed-providers">
                                 @foreach (var provider in item.Result.Results.OrderBy(kv => kv.Key)) {
                                     <a href="@(ViewSecurityHelpers.IsHttpOrHttps(provider.Value.URL) ? provider.Value.URL : "#")" target="_blank" rel="noopener noreferrer" class="provider-button">
-                                        @provider.Key.GetProviderLogo()
+                                        @provider.Key.GetProviderLogo(path => FileVersionProvider.AddFileVersionToPath(Context.Request.PathBase, Url.Content("~" + path)))
                                         <span class="visually-hidden">@provider.Key.GetDescription()</span>
                                     </a>
                                 }

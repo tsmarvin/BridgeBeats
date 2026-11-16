@@ -90,14 +90,14 @@ public class CredentialsAtRestIntegrationTests {
     /// then reuses that cached model and the value converter is silently absent.
     /// </remarks>
     private static async Task<(ApplicationDbContext context, DbContextOptions<ApplicationDbContext> options)>
-        BuildMigratedContextAsync( string dbPath, IDataProtector? protector = null ) {
+        BuildMigratedContextAsync( string dbPath, IDataProtector? protector = null, string? targetMigration = null ) {
         DbContextOptionsBuilder<ApplicationDbContext> builder = new DbContextOptionsBuilder<ApplicationDbContext>( )
             .UseSqlite( $"Data Source={dbPath}" )
             .ReplaceService<IModelCacheKeyFactory, UniqueModelCacheKeyFactory>( );
 
         DbContextOptions<ApplicationDbContext> options = builder.Options;
         ApplicationDbContext context = new( options, protector );
-        await context.Database.MigrateAsync( );
+        await context.GetService<Microsoft.EntityFrameworkCore.Migrations.IMigrator>( ).MigrateAsync( targetMigration );
         return (context, options);
     }
 
@@ -147,7 +147,7 @@ public class CredentialsAtRestIntegrationTests {
                 ApplicationUser user = new( ) {
                     UserName = "raw-read-test@example.com",
                     Email = "raw-read-test@example.com",
-                    AtProtoRefreshToken = PlainRefreshToken
+                    AppleMusicUserToken = PlainRefreshToken
                 };
 
                 PasswordHasher<ApplicationUser> hasher = new( );
@@ -164,7 +164,7 @@ public class CredentialsAtRestIntegrationTests {
                 await using (SqliteConnection conn = new( $"Data Source={dbPath}" )) {
                     await conn.OpenAsync( TestContext.CancellationToken );
                     await using SqliteCommand cmd = conn.CreateCommand( );
-                    cmd.CommandText = "SELECT AtProtoRefreshToken FROM AspNetUsers WHERE Id = $id";
+                    cmd.CommandText = "SELECT AppleMusicUserToken FROM AspNetUsers WHERE Id = $id";
                     _ = cmd.Parameters.AddWithValue( "$id", userId );
                     object? raw = await cmd.ExecuteScalarAsync( TestContext.CancellationToken );
                     rawValue = raw?.ToString( ) ?? string.Empty;
@@ -183,7 +183,7 @@ public class CredentialsAtRestIntegrationTests {
                         [userId], TestContext.CancellationToken );
 
                     Assert.IsNotNull( reloaded, "EF reload must find the user" );
-                    Assert.AreEqual( PlainRefreshToken, reloaded.AtProtoRefreshToken,
+                    Assert.AreEqual( PlainRefreshToken, reloaded.AppleMusicUserToken,
                         "EF read must decrypt ciphertext back to the original plaintext" );
                 }
             }
@@ -370,15 +370,12 @@ public class CredentialsAtRestIntegrationTests {
         string dbPath = TempDbPath( );
         try {
             // Build and migrate; no protector (migration tooling path, columns stay TEXT).
-            (ApplicationDbContext context, _) = await BuildMigratedContextAsync( dbPath );
+            (ApplicationDbContext context, _) = await BuildMigratedContextAsync( dbPath, targetMigration: "20260614235334_NullTokensAndRelink" );
             await using (context) {
                 // Insert a user with all token columns null (the default).
                 ApplicationUser user = new( ) {
                     UserName = "migration-null-test@example.com",
                     Email = "migration-null-test@example.com",
-                    AtProtoAccessToken = null,
-                    AtProtoRefreshToken = null,
-                    AtProtoDPoPKey = null,
                     AppleMusicUserToken = null
                 };
 
@@ -410,8 +407,6 @@ public class CredentialsAtRestIntegrationTests {
                     [userId], TestContext.CancellationToken );
 
                 Assert.IsNotNull( reloaded );
-                Assert.IsNull( reloaded.AtProtoRefreshToken,
-                    "AtProtoRefreshToken must remain null after NullTokensAndRelink is applied to an already-null column" );
                 Assert.IsNull( reloaded.AppleMusicUserToken,
                     "AppleMusicUserToken must remain null after NullTokensAndRelink is applied to an already-null column" );
             }
@@ -444,7 +439,7 @@ public class CredentialsAtRestIntegrationTests {
         string dbPath = TempDbPath( );
         try {
             // Build and migrate to the fully migrated state (no protector; migration tooling path).
-            (ApplicationDbContext context, _) = await BuildMigratedContextAsync( dbPath );
+            (ApplicationDbContext context, _) = await BuildMigratedContextAsync( dbPath, targetMigration: "20260614235334_NullTokensAndRelink" );
             await using (context) {
                 // Insert a bare user shell so we can set the ID, then write non-null token columns
                 // via raw SQLite (bypassing EF and its value converter).
@@ -606,7 +601,7 @@ public class CredentialsAtRestIntegrationTests {
                 ApplicationUser user = new( ) {
                     UserName = "di-path-test@example.com",
                     Email = "di-path-test@example.com",
-                    AtProtoRefreshToken = PlainRefreshToken
+                    AppleMusicUserToken = PlainRefreshToken
                 };
 
                 PasswordHasher<ApplicationUser> hasher = new( );
@@ -623,7 +618,7 @@ public class CredentialsAtRestIntegrationTests {
             await using (SqliteConnection conn = new( $"Data Source={dbPath}" )) {
                 await conn.OpenAsync( TestContext.CancellationToken );
                 await using SqliteCommand cmd = conn.CreateCommand( );
-                cmd.CommandText = "SELECT AtProtoRefreshToken FROM AspNetUsers WHERE Id = $id";
+                cmd.CommandText = "SELECT AppleMusicUserToken FROM AspNetUsers WHERE Id = $id";
                 _ = cmd.Parameters.AddWithValue( "$id", userId );
                 object? raw = await cmd.ExecuteScalarAsync( TestContext.CancellationToken );
                 rawValue = raw?.ToString( ) ?? string.Empty;

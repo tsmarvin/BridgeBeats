@@ -26,6 +26,16 @@ public class HomeControllerTests {
     private static HttpClient? s_client;
     /// <summary>The antiforgery token reused across the class's form-POST tests.</summary>
     private static string? s_antiforgeryToken;
+    /// <summary>
+    /// The second host, built on demand for the tests that perform live provider lookups. It is
+    /// created lazily so that a machine without usable provider credentials, or with a provider
+    /// credential the application cannot use, affects only the live tests rather than the whole class.
+    /// </summary>
+    private static CustomWebApplicationFactory? s_liveFactory;
+    /// <summary>The HTTP client connected to the live-provider host.</summary>
+    private static HttpClient? s_liveClient;
+    /// <summary>The antiforgery token issued by the live-provider host.</summary>
+    private static string? s_liveAntiforgeryToken;
 
     /// <summary>
     /// Builds the test host with worker services disabled and external integrations blanked, creates a
@@ -34,29 +44,10 @@ public class HomeControllerTests {
     /// <param name="context">The MSTest class context, used for its cancellation token.</param>
     [ClassInitialize]
     public static async Task ClassInitialize( TestContext context ) {
-        // Load configuration from appsettings.json and user secrets
-        IConfigurationRoot configuration = new ConfigurationBuilder()
-            .AddJsonFile( Path.Combine( "src", "BridgeBeats.Web", "appsettings.json" ), optional: true )
-            .AddUserSecrets<Web.Program>( optional: true )
-            .AddEnvironmentVariables()
-            .Build();
-
-        // Build config overrides from loaded configuration
-        Dictionary<string, string?> configData = configuration
-            .AsEnumerable()
-            .Where( kv => kv.Value is not null )
-            .Where( kv => !kv.Key.EndsWith( "ConnectionString", StringComparison.OrdinalIgnoreCase ) )
-            .ToDictionary( );
-
-        // Force Discord token to null to prevent Discord service registration
-        configData["BridgeBeats:DiscordToken"] = string.Empty;
-        // Disable worker services mode - use direct provider implementations
-        configData["BridgeBeats:Workers:UseWorkerServices"] = "false";
-        // Force ATProto credentials to empty to disable caching service
-        // The caching service requires background workers that are not running in the test environment
-        configData["BridgeBeats:ATProtoIdentifier"] = string.Empty;
-        configData["BridgeBeats:ATProtoPassword"] = string.Empty;
-        configData["BridgeBeats:ATProtoUserDID"] = string.Empty;
+        // The rendering assertions in this class do not depend on provider credentials, so the host
+        // runs from the isolated test settings. Tests that need a live provider are marked below and
+        // read their credentials from TestConfiguration.
+        Dictionary<string, string?> configData = TestHostConfiguration.Isolated( );
 
         s_factory = new CustomWebApplicationFactory( configData );
         s_client = s_factory.CreateClient( );
@@ -69,11 +60,43 @@ public class HomeControllerTests {
     }
 
     /// <summary>
-    /// Disposes the test host (and its SQLite identity database) after the class completes.
+    /// Disposes the test hosts (and their SQLite identity databases) after the class completes.
     /// </summary>
     [ClassCleanup]
     public static void ClassCleanup( ) {
+        s_liveClient?.Dispose( );
+        s_liveFactory?.Dispose( );
         s_factory?.Dispose( );
+    }
+
+    /// <summary>
+    /// Returns a client connected to a host built with this machine's real provider credentials,
+    /// creating that host on first use, and marks the calling test inconclusive when no provider
+    /// credential is available to perform a live lookup.
+    /// </summary>
+    /// <remarks>
+    /// The live host is separate from the class's deterministic host so that a machine without usable
+    /// provider credentials affects only the tests that genuinely need a live provider. Building it
+    /// here rather than in <c>ClassInitialize</c> keeps an unusable credential tuple from failing the
+    /// class's rendering tests, while still failing fast on the live tests that cannot work without it.
+    /// </remarks>
+    /// <returns>A client connected to the live-provider host.</returns>
+    private static async Task<HttpClient> LiveClientAsync( ) {
+        // Checked before the host is built: a machine without a usable provider credential must report
+        // that, not run a lookup against the deterministic host's placeholder and call the empty
+        // result rate limiting.
+        TestHostConfiguration.RequireAnyLiveCredentials(
+            SupportedProviders.Spotify, SupportedProviders.AppleMusic, SupportedProviders.Tidal );
+
+        if (s_liveFactory is null) {
+            Dictionary<string, string?> configData = TestHostConfiguration.LiveProviders( );
+            s_liveFactory = new CustomWebApplicationFactory( configData );
+            s_liveClient = s_liveFactory.CreateClient( );
+            await s_liveFactory.InitializeDatabasesAsync( );
+            s_liveAntiforgeryToken = await AntiforgeryTestHelper.GetAntiforgeryTokenAsync( s_liveClient );
+        }
+
+        return s_liveClient!;
     }
 
     /// <summary>
@@ -246,8 +269,9 @@ public class HomeControllerTests {
         } );
 
         // Act
+        HttpClient client = await LiveClientAsync( );
         HttpResponseMessage response = await AntiforgeryTestHelper.PostWithAntiforgeryAsync(
-            s_client!, "/Home/LookupResultsByIsrc", formData, s_antiforgeryToken!, TestContext.CancellationToken );
+            client, "/Home/LookupResultsByIsrc", formData, s_liveAntiforgeryToken!, TestContext.CancellationToken );
         string content = await response.Content.ReadAsStringAsync( TestContext.CancellationToken );
 
         // Assert
@@ -272,8 +296,9 @@ public class HomeControllerTests {
         } );
 
         // Act
+        HttpClient client = await LiveClientAsync( );
         HttpResponseMessage response = await AntiforgeryTestHelper.PostWithAntiforgeryAsync(
-            s_client!, "/Home/LookupResultsByUpc", formData, s_antiforgeryToken!, TestContext.CancellationToken );
+            client, "/Home/LookupResultsByUpc", formData, s_liveAntiforgeryToken!, TestContext.CancellationToken );
         string content = await response.Content.ReadAsStringAsync( TestContext.CancellationToken );
 
         // Assert
@@ -299,8 +324,9 @@ public class HomeControllerTests {
         } );
 
         // Act
+        HttpClient client = await LiveClientAsync( );
         HttpResponseMessage response = await AntiforgeryTestHelper.PostWithAntiforgeryAsync(
-            s_client!, "/Home/LookupResultsByTitle", formData, s_antiforgeryToken!, TestContext.CancellationToken );
+            client, "/Home/LookupResultsByTitle", formData, s_liveAntiforgeryToken!, TestContext.CancellationToken );
         string content = await response.Content.ReadAsStringAsync( TestContext.CancellationToken );
 
         // Assert

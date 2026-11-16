@@ -3,11 +3,17 @@ using BridgeBeats.Contracts.DTOs;
 using BridgeBeats.Contracts.Interfaces;
 using BridgeBeats.Contracts.Records;
 using BridgeBeats.Core.Infrastructure.Identity;
+using BridgeBeats.Web.Authentication;
+using BridgeBeats.Web.Configuration;
+using idunno.AtProto;
+using idunno.Bluesky.AspNet.Authentication;
 using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 
 namespace BridgeBeats.Web.Controllers;
 
@@ -97,6 +103,28 @@ public partial class AccountController(
             CreatedAt = DateTime.UtcNow
         };
 
+        // Validate before ending a live session. CreateAsync validates again after cleanup.
+        bool validationSucceeded = true;
+        foreach (IPasswordValidator<ApplicationUser> validator in userManager.PasswordValidators) {
+            IdentityResult validation = await validator.ValidateAsync( userManager, user, request.Password );
+            validationSucceeded &= validation.Succeeded;
+            foreach (IdentityError error in validation.Errors) {
+                ModelState.AddModelError( string.Empty, error.Description );
+            }
+        }
+        foreach (IUserValidator<ApplicationUser> validator in userManager.UserValidators) {
+            IdentityResult validation = await validator.ValidateAsync( userManager, user );
+            validationSucceeded &= validation.Succeeded;
+            foreach (IdentityError error in validation.Errors) {
+                ModelState.AddModelError( string.Empty, error.Description );
+            }
+        }
+        if (!validationSucceeded) {
+            return BadRequest( ModelState );
+        }
+
+        await SignOutBlueskyAsync( );
+
         IdentityResult result;
         try {
             result = await userManager.CreateAsync( user, request.Password );
@@ -116,6 +144,7 @@ public partial class AccountController(
         }
 
         // Sign in the user automatically with a cookie for web UI
+        HttpContext.Items[BlueskyAuthenticationConfiguration.PasswordSignInKey] = true;
         await signInManager.SignInAsync( user, isPersistent: false );
 
         LogUserRegistered( user.Id );
@@ -162,6 +191,9 @@ public partial class AccountController(
         }
 
         // Sign in the user with a cookie for web UI
+        await SignOutBlueskyAsync( );
+        await ReloadLinkedAccountAsync( user );
+        HttpContext.Items[BlueskyAuthenticationConfiguration.PasswordSignInKey] = true;
         await signInManager.SignInAsync( user, isPersistent: false );
 
         // Generate new API key only if user doesn't have one
@@ -194,6 +226,7 @@ public partial class AccountController(
     [ValidateAntiForgeryToken]
     [Route( "account/logout" )]
     public async Task<IActionResult> Logout( ) {
+        await SignOutBlueskyAsync( );
         await signInManager.SignOutAsync( );
         return Ok( new { message = "Logged out successfully" } );
     }
@@ -332,8 +365,10 @@ public partial class AccountController(
     }
 
     /// <summary>
-    /// Permanently deletes the authenticated user's account. The user is signed out first, then the
-    /// account and its associated identity data are removed.
+    /// Permanently deletes the authenticated user's account. The stored OAuth credential and browser
+    /// rows are deleted in the same transaction as the user row, so a sign-in callback running
+    /// concurrently with the deletion cannot leave credentials behind for a deleted account. The
+    /// credential is revoked after that transaction commits, and the user is signed out.
     /// </summary>
     /// <returns>
     /// HTTP POST <c>account/delete</c>. <c>200 OK</c> with a confirmation message on success;
@@ -350,15 +385,48 @@ public partial class AccountController(
             return Unauthorized( );
         }
 
-        // Sign out the user first
+        // The stored OAuth rows and the local user row go together: a callback that recreates a row
+        // after the user row is gone would otherwise leave credentials behind with no account to
+        // reach them from, and a failed deletion would revoke credentials that are still in use.
+        byte[]? removedCredentials = null;
+        IdentityResult result;
+        await using (ApplicationDbContext db = HttpContext.RequestServices.GetRequiredService<ApplicationDbContext>( )) {
+            await db.Database.OpenConnectionAsync( HttpContext.RequestAborted );
+            await using IDbContextTransaction transaction = await db.Database.BeginTransactionAsync( HttpContext.RequestAborted );
+            // Account deletion must not report success while leaving credentials behind, so a missing
+            // transaction handle fails the request rather than silently skipping the row removal.
+            System.Data.Common.DbTransaction transactionHandle = transaction.GetDbTransaction( )
+                ?? throw new InvalidOperationException( "The account deletion transaction is not available on its connection." );
+            try {
+                // The credential rows go with the user row whether or not the OAuth service is registered
+                // in this host. A linked DID can hold stored credentials from an earlier deployment that
+                // enabled OAuth, and the store's tables exist regardless, so removing the rows cannot be
+                // conditional on the service being resolvable here. Remote revocation stays conditional:
+                // it needs the service, and it runs after the commit.
+                if (user.AtProtoDid is { Length: > 0 } linkedDid) {
+                    removedCredentials = await BridgeBeatsIdentityStore.RemoveAccountAsync( new Did( linkedDid ),
+                        db.Database.GetDbConnection( ), transactionHandle, HttpContext.RequestAborted );
+                }
+                result = await userManager.DeleteAsync( user );
+                if (!result.Succeeded) {
+                    await transaction.RollbackAsync( HttpContext.RequestAborted );
+                    LogDeleteFailed( user.Id );
+                    return BadRequest( new { message = "Failed to delete account. Please try again." } );
+                }
+                await transaction.CommitAsync( HttpContext.RequestAborted );
+            } catch {
+                await transaction.RollbackAsync( HttpContext.RequestAborted );
+                throw;
+            }
+        }
+
         await signInManager.SignOutAsync( );
-
-        // Delete the user
-        IdentityResult result = await userManager.DeleteAsync( user );
-
-        if (!result.Succeeded) {
-            LogDeleteFailed( user.Id );
-            return BadRequest( new { message = "Failed to delete account. Please try again." } );
+        BlueskySessionService? ended = GetBlueskySessions( );
+        if (ended is not null) {
+            ended.ClearBrowserCookie( HttpContext );
+            // Revoke the credential the committed deletion removed, so a callback cannot leave a grant
+            // behind and a rolled-back deletion never revokes credentials still in use.
+            await ended.RevokeRemovedAccountAsync( removedCredentials, user.AtProtoDid );
         }
 
         LogAccountDeleted( user.Id );
@@ -368,164 +436,74 @@ public partial class AccountController(
         } );
     }
 
-    #region ATProto OAuth
-
-    /// <summary>
-    /// Begins ATProto (Bluesky) OAuth sign-in for the supplied handle by starting an authorization request
-    /// and returning the authorization URL the client should redirect the user to, along with an opaque
-    /// state value to correlate the callback.
-    /// </summary>
-    /// <param name="request">The login payload containing the Bluesky handle, bound from the JSON request body.</param>
-    /// <param name="atProtoOAuth">The ATProto OAuth service, resolved from request services; when null, the feature is not configured.</param>
-    /// <returns>
-    /// HTTP POST <c>account/login-atproto</c>. <c>200 OK</c> with the authorization URL and state on success;
-    /// <c>400 Bad Request</c> when OAuth is not configured, the handle is missing, or authorization could not
-    /// be started. Requires a valid anti-forgery token.
-    /// </returns>
+    /// <summary>Starts SDK-managed OAuth and sets its browser correlation cookie.</summary>
     [HttpPost]
     [ValidateAntiForgeryToken]
+    [EnableRateLimiting( BlueskyAuthenticationConfiguration.LoginStartRateLimitPolicy )]
     [Route( "account/login-atproto" )]
-    public async Task<IActionResult> LoginWithAtProto(
-        [FromBody] AtProtoLoginRequest request,
-        [FromServices] IATProtoOAuthService? atProtoOAuth
-    ) {
-        if (atProtoOAuth is null) {
+    public async Task<IActionResult> LoginWithAtProto( [FromBody] AtProtoLoginRequest request ) {
+        BlueskySignInManager? blueskySignInManager = HttpContext.RequestServices.GetService<BlueskySignInManager>( );
+        if (blueskySignInManager is null) {
             return BadRequest( new { message = "ATProto OAuth is not configured on this server." } );
         }
-
         if (string.IsNullOrWhiteSpace( request.Handle )) {
             return BadRequest( new { message = "Please enter your Bluesky handle." } );
         }
-
         try {
-            (Uri authUrl, string state) = await atProtoOAuth.StartAuthorizationAsync(
-                request.Handle
-            );
-
-            LogAtProtoOAuthStarted( request.Handle, authUrl.Host );
-
-            // Return the authorization URL for the client to redirect to
-            return Ok( new {
-                authorizationUrl = authUrl.ToString( ),
-                state
-            } );
-        } catch (Exception ex) {
+            Handle handle = new( request.Handle.Trim( ).TrimStart( '@' ) );
+            using CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource( HttpContext.RequestAborted );
+            deadline.CancelAfter( TimeSpan.FromSeconds( BlueskyAuthenticationConfiguration.LoginStartTimeoutSeconds ) );
+            Uri authorizationUrl = await blueskySignInManager.CreateRedirectUri(
+                handle, cancellationToken: deadline.Token );
+            return Ok( new { authorizationUrl = authorizationUrl.ToString( ) } );
+        } catch (Exception ex) when (ex is not OperationCanceledException || !HttpContext.RequestAborted.IsCancellationRequested) {
             LogAtProtoOAuthStartFailed( ex, request.Handle );
-            return BadRequest( new {
-                message = "Failed to start login. Please check your handle and try again."
-            } );
+            return BadRequest( new { message = "Failed to start login. Please check your handle and try again." } );
         }
     }
 
-    /// <summary>
-    /// Handles the ATProto OAuth redirect callback. Completes the authorization exchange, then either
-    /// creates a new user for the returned DID or updates the existing user's stored tokens, and signs the
-    /// user in. On any error the user is redirected back to the login page with an error message.
-    /// </summary>
-    /// <param name="code">The authorization code returned by the provider, from the query string.</param>
-    /// <param name="state">The opaque state value issued at authorization start, used to correlate the callback, from the query string.</param>
-    /// <param name="iss">The issuer identifier returned by the provider, from the query string.</param>
-    /// <param name="error">An OAuth error code, present when authorization failed, from the query string.</param>
-    /// <param name="error_description">A human-readable description of the OAuth error, from the query string.</param>
-    /// <param name="atProtoOAuth">The ATProto OAuth service, resolved from request services; when null, the feature is not configured.</param>
-    /// <returns>
-    /// HTTP GET <c>account/atproto-callback</c>. A redirect to <c>/</c> on successful sign-in, or a redirect
-    /// back to the login page with an <c>error</c> value when the callback is invalid, OAuth is not
-    /// configured, account creation fails, or the exchange throws.
-    /// </returns>
+    /// <summary>Completes SDK-managed OAuth, including correlation, token validation and local account mapping.</summary>
     [HttpGet]
     [Route( "account/atproto-callback" )]
-    public async Task<IActionResult> AtProtoCallback(
-        [FromQuery] string? code,
-        [FromQuery] string? state,
-        [FromQuery] string? iss,
-        [FromQuery] string? error,
-        [FromQuery] string? error_description,
-        [FromServices] IATProtoOAuthService? atProtoOAuth
-    ) {
-        // Handle authorization errors
-        if (!string.IsNullOrEmpty( error )) {
-            LogAtProtoOAuthError( error, error_description );
-            return RedirectToAction( nameof( LoginPage ), new {
-                error = error_description ?? error
-            } );
+    public async Task<IActionResult> AtProtoCallback( [FromServices] BlueskySignInManager? blueskySignInManager ) {
+        if (Request.Query.TryGetValue( "error", out var oauthError )) {
+            string code = oauthError.ToString( );
+            LogAtProtoOAuthServerError( code.Length is > 0 and <= 64 &&
+                code.All( character => char.IsAsciiLetterOrDigit( character ) || character == '_' ) ? code : "invalid_error_code" );
         }
-
-        if (atProtoOAuth is null) {
-            return RedirectToAction( nameof( LoginPage ), new {
-                error = "ATProto OAuth is not configured on this server."
-            } );
-        }
-
-        if (string.IsNullOrEmpty( code ) || string.IsNullOrEmpty( state ) || string.IsNullOrEmpty( iss )) {
-            return RedirectToAction( nameof( LoginPage ), new {
-                error = "Invalid OAuth callback parameters."
-            } );
-        }
-
-        try {
-            // Complete the OAuth flow
-            ATProtoOAuthResult result = await atProtoOAuth.CompleteAuthorizationAsync( state, code, iss );
-
-            // Find or create the user
-            ApplicationUser? user = await userManager.Users
-                .FirstOrDefaultAsync( u => u.AtProtoDid == result.Did );
-
-            if (user is null) {
-                // Create a new user for this ATProto account.
-                // ApiKeyHash is intentionally left null: ATProto users sign in via OAuth and
-                // have no need for an API key at creation time. The plaintext key would be
-                // discarded at the OAuth redirect with no way to surface it to the user.
-                // Keys can be minted later via POST /account/regenerate-api-key ([Authorize]).
-                user = new ApplicationUser {
-                    UserName = result.Handle,
-                    AtProtoDid = result.Did,
-                    AtProtoHandle = result.Handle,
-                    AtProtoAccessToken = result.AccessToken,
-                    AtProtoRefreshToken = result.RefreshToken,
-                    AtProtoDPoPKey = result.DPoPKeyJwk,
-                    AtProtoTokenExpiration = result.TokenExpiration,
-                    CreatedAt = DateTime.UtcNow
-                };
-
-                IdentityResult createResult = await userManager.CreateAsync( user );
-                if (!createResult.Succeeded) {
-                    string errors = string.Join( ", ", createResult.Errors.Select( e => e.Description ) );
-                    LogAtProtoUserCreateFailed( errors );
-                    return RedirectToAction( nameof( LoginPage ), new {
-                        error = "Failed to create account. Please try again."
-                    } );
+        if (blueskySignInManager is not null) {
+            try {
+                idunno.Bluesky.AspNet.Authentication.SignInResult result = await blueskySignInManager.SignIn( );
+                if (result.Succeeded) {
+                    return Redirect( "/" );
                 }
-
-                LogAtProtoUserCreated( result.Did, result.Handle );
-            } else {
-                // Update tokens for existing user
-                user.AtProtoHandle = result.Handle;
-                user.AtProtoAccessToken = result.AccessToken;
-                user.AtProtoRefreshToken = result.RefreshToken;
-                user.AtProtoDPoPKey = result.DPoPKeyJwk;
-                user.AtProtoTokenExpiration = result.TokenExpiration;
-
-                _ = await userManager.UpdateAsync( user );
-
-                LogAtProtoTokensUpdated( result.Did, result.Handle );
+                LogAtProtoCallbackRejected( result.MissingQueryString ? "missing_query" :
+                    result.MissingCorrelationState ? "missing_correlation" :
+                    result.ErrorProcessingOAuth2Response ? "invalid_oauth_response" : "unknown" );
+            } catch (Exception ex) when (ex is not OperationCanceledException || !HttpContext.RequestAborted.IsCancellationRequested) {
+                LogAtProtoCallbackFailed( ex );
             }
+        }
+        return RedirectToAction( nameof( LoginPage ), new { error = "Bluesky login failed. Please try again." } );
+    }
 
-            // Sign in the user
-            await signInManager.SignInAsync( user, isPersistent: false );
-
-            LogAtProtoLoggedIn( user.Id );
-
-            return Redirect( "/" );
-        } catch (Exception ex) {
-            LogAtProtoCallbackFailed( ex );
-            return RedirectToAction( nameof( LoginPage ), new {
-                error = "Login failed. Please try again."
-            } );
+    private async Task SignOutBlueskyAsync( ) {
+        BlueskySessionService? sessions = GetBlueskySessions( );
+        if (sessions is not null) {
+            await sessions.EndSessionAsync( HttpContext, null );
         }
     }
 
-    #endregion
+    private BlueskySessionService? GetBlueskySessions( ) =>
+        HttpContext?.RequestServices?.GetService<BlueskySessionService>( );
+
+    /// <summary>Refreshes tracked account stamps after session removal updates them directly in SQLite.</summary>
+    private async Task ReloadLinkedAccountAsync( ApplicationUser user ) {
+        if (user.AtProtoDid is not null) {
+            ApplicationDbContext db = HttpContext.RequestServices.GetRequiredService<ApplicationDbContext>( );
+            await db.Entry( user ).ReloadAsync( HttpContext.RequestAborted );
+        }
+    }
 
     /// <summary>
     /// Generates a new API key and its stored hash. All three generation sites (Register, Login,

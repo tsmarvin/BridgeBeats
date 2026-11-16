@@ -22,9 +22,10 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>@(primaryResult?.Title ?? "Music Card")</title>
-    <link rel="stylesheet" href="~/public/docfx.min.css">
-    <link rel="stylesheet" href="~/public/main.css">
-    <link rel="stylesheet" href="~/public/BridgeBeats.styles.css">
+    <link rel="icon" href="~/favicon.ico" asp-append-version="true" />
+    <link rel="stylesheet" href="~/public/docfx.min.css" asp-append-version="true">
+    <link rel="stylesheet" href="~/public/main.css" asp-append-version="true">
+    <link rel="stylesheet" href="~/public/BridgeBeats.styles.css" asp-append-version="true">
 
     <script nonce="@cspNonce">
         (function () {
@@ -87,7 +88,7 @@
                 foreach (var providerResult in result.Results) {
                     <a href="@(ViewSecurityHelpers.IsHttpOrHttps(providerResult.Value.URL) ? providerResult.Value.URL : "#")" target="_blank" rel="noopener noreferrer" class="provider-button">
                         <span class="provider-icon provider-icon-@providerResult.Key.ToString().ToLowerInvariant()">
-                            @providerResult.Key.GetProviderLogo( )
+                            @providerResult.Key.GetProviderLogo(path => FileVersionProvider.AddFileVersionToPath(Context.Request.PathBase, Url.Content("~" + path)))
                         </span>
                         <span class="visually-hidden">@providerResult.Key.GetDescription()</span>
                     </a>

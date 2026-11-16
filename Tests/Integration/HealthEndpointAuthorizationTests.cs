@@ -24,28 +24,9 @@ public class HealthEndpointAuthorizationTests {
     /// <param name="_">The MSTest class context (unused).</param>
     [ClassInitialize]
     public static async Task Setup( TestContext _ ) {
-        // Load configuration from appsettings.json and user secrets
-        IConfigurationRoot configuration = new ConfigurationBuilder()
-            .AddJsonFile( Path.Combine( "src", "BridgeBeats.Web", "appsettings.json" ), optional: true )
-            .AddUserSecrets<Web.Program>( optional: true )
-            .AddEnvironmentVariables()
-            .Build();
-
-        // Build config overrides from loaded configuration
-        Dictionary<string, string?> configData = configuration
-            .AsEnumerable()
-            .Where( kv => kv.Value is not null )
-            .Where( kv => !kv.Key.EndsWith( "ConnectionString", StringComparison.OrdinalIgnoreCase ) )
-            .ToDictionary( );
-
-        // Force Discord token to null to prevent Discord service registration
-        configData["BridgeBeats:DiscordToken"] = string.Empty;
-        // Disable worker services mode - use direct provider implementations
-        configData["BridgeBeats:Workers:UseWorkerServices"] = "false";
-        // Force ATProto credentials to empty to disable caching service
-        configData["BridgeBeats:ATProtoIdentifier"] = string.Empty;
-        configData["BridgeBeats:ATProtoPassword"] = string.Empty;
-        configData["BridgeBeats:ATProtoUserDID"] = string.Empty;
+        // These assertions are about endpoint authorization, which does not depend on provider
+        // credentials; only the settings that keep the host deterministic are supplied.
+        Dictionary<string, string?> configData = TestHostConfiguration.Isolated( );
 
         s_factory = new CustomWebApplicationFactory( configData );
         s_client = s_factory.CreateClient( );
